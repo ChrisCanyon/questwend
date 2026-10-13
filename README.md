@@ -4,7 +4,7 @@
 
 A from-scratch inference engine for Qwen3 / Qwen3.5 / Qwen3.6, built on vendored ggml.
 
-- **Architectures**: `qwen3` (dense), `qwen3moe` (MoE), `qwen35` / `qwen35moe` (Gated DeltaNet hybrid), `qwen3next`, `qwen4exp` (Qwen3.8-Flash-Next: hyper-connections + QSA + a PLE n-gram embedding)
+- **Architectures**: `qwen3` (dense), `qwen3moe` (MoE), `qwen35` / `qwen35moe` (Gated DeltaNet hybrid), `qwen3next`, `qwen4exp` (Qwen3.8-Flash-Next: hyper-connections + QSA + a PLE n-gram embedding), `lfm2` / `lfm2moe` (LiquidAI LFM2 / LFM2.5: short-convolution + GQA hybrid; the model always reasons, so `--reasoning off` has no effect on it)
 - **Backends**: CUDA (Windows/Linux), Metal (macOS), HIP/ROCm (AMD, untested), CPU fallback
 - **Features**:
   - MoE expert offloading (**RAM tier** / **SSD tier**) with a dynamic VRAM expert cache

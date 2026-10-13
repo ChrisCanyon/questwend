@@ -35,6 +35,9 @@ struct ContentPart {
 struct ToolCall {
     std::string name;
     std::vector<std::pair<std::string, std::string>> arguments;
+    // The same arguments as Python literals ('x', 3, True, [1, 2]), which is
+    // how lfm2 writes a call. Parallel to `arguments`; empty = not supplied.
+    std::vector<std::string> arg_literals;
 };
 
 struct ChatMessage {
@@ -68,7 +71,16 @@ struct ChatPrompt {
     int gen_prompt_begin = -1;
 };
 
-// Build the full prompt token sequence (Qwen3.6 template semantics).
+// How a model's chat output is marked up, so the server can route it.
+struct ChatFormat {
+    bool        lfm2       = false;          // lfm2 template (see build_lfm2_prompt)
+    std::string tool_open  = "<tool_call>";  // start of a tool-call block
+    std::string tool_close = "</tool_call>";
+};
+ChatFormat chat_format(const Tokenizer & tok);
+
+// Build the full prompt token sequence (Qwen3.6 template semantics; an lfm2
+// vocabulary gets the lfm2 template instead).
 // Throws std::runtime_error on unsupported content (e.g. images on a model
 // without vision tokens, video parts, system message with images).
 ChatPrompt build_qwen_prompt(const Tokenizer & tok,

@@ -44,6 +44,8 @@ const char * arch_name(Arch a) {
         case Arch::QWEN35MOE: return "qwen35moe";
         case Arch::QWEN3NEXT: return "qwen3next";
         case Arch::QWEN4EXP:  return "qwen4exp";
+        case Arch::LFM2:      return "lfm2";
+        case Arch::LFM2MOE:   return "lfm2moe";
         default:              return "unknown";
     }
 }
@@ -55,6 +57,8 @@ static Arch arch_from_string(const std::string & s) {
     if (s == "qwen35moe") return Arch::QWEN35MOE;
     if (s == "qwen3next") return Arch::QWEN3NEXT;
     if (s == "qwen4exp")  return Arch::QWEN4EXP;
+    if (s == "lfm2")      return Arch::LFM2;
+    if (s == "lfm2moe")   return Arch::LFM2MOE;
     return Arch::UNKNOWN;
 }
 
@@ -764,6 +768,17 @@ void Model::load_hparams() {
 
     if (hp_.arch == Arch::QWEN4EXP) load_qwen4exp_hparams(arch);
 
+    // lfm2 / lfm2moe: a layer with no kv heads is a gated short convolution
+    // (in_proj -> B*x -> causal depthwise conv over l_cache taps -> C*() ->
+    // out_proj); the rest are plain GQA attention with QK norm.
+    if (hp_.arch == Arch::LFM2 || hp_.arch == Arch::LFM2MOE) {
+        hp_.shortconv_l_cache = gguf_u32(gguf_, k("shortconv.l_cache"), 0);
+        if (hp_.shortconv_l_cache < 2 || hp_.n_head_kv_l.size() != hp_.n_layer) {
+            throw std::runtime_error(arch + ": expected shortconv.l_cache >= 2 and a per-layer head_count_kv");
+        }
+        hp_.has_shortconv = true;
+    }
+
     // vocab size: prefer output.weight rows, else token_embd
     if (auto * t = tensor("output.weight")) {
         hp_.n_vocab = (uint32_t) t->ne[1];
@@ -829,8 +844,9 @@ void Model::load_vocab() {
     vocab_.bos_id        = gguf_i32(gguf_, "tokenizer.ggml.bos_token_id", 151643);
     vocab_.eos_id        = gguf_i32(gguf_, "tokenizer.ggml.eos_token_id", 151645);
     vocab_.pad_id        = gguf_i32(gguf_, "tokenizer.ggml.padding_token_id", -1);
-    vocab_.add_bos       = gguf_bool(gguf_, "tokenizer.ggml.add_bos_token", false);
     vocab_.pre           = gguf_str(gguf_, "tokenizer.ggml.pre", "");
+    // Absent key: llama.cpp's per-pre-tokenizer default (lfm2 adds BOS).
+    vocab_.add_bos       = gguf_bool(gguf_, "tokenizer.ggml.add_bos_token", vocab_.pre == "lfm2");
     vocab_.chat_template = gguf_str(gguf_, "tokenizer.chat_template", "");
     if (hp_.n_vocab == 0) hp_.n_vocab = (uint32_t) vocab_.tokens.size();
 }
@@ -891,6 +907,12 @@ std::string Model::summary() const {
                << (hp_.expert_weights_norm ? ", normalised" : ", unnormalised")
                << ", " << hp_.n_dense_lead << " leading dense block(s)\n";
         }
+    }
+    if (hp_.has_shortconv) {
+        uint32_t n_conv = 0;
+        for (uint32_t il = 0; il < hp_.n_layer; ++il) n_conv += hp_.is_recurrent(il) ? 1 : 0;
+        os << "shortconv     = " << n_conv << "/" << hp_.n_layer << " layers, l_cache "
+           << hp_.shortconv_l_cache << "\n";
     }
     if (hp_.has_gdn) {
         os << "GDN: d_inner=" << hp_.ssm_d_inner << " n_group=" << hp_.ssm_n_group

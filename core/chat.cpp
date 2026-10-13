@@ -53,11 +53,132 @@ bool has_image(const ChatMessage & m) {
     return false;
 }
 
+// lfm2 / LFM2.5 chat template (hand-coded, like the Qwen one below):
+//   <|startoftext|>[<|im_start|>system\n{system}[\nList of tools: [{t1}, {t2}]]<|im_end|>\n]
+//   <|im_start|>{role}\n{content}<|im_end|>\n ...
+//   <|im_start|>assistant\n
+// An assistant turn is "<think>{reasoning}</think>{content}" (no newlines),
+// its tool calls "<|tool_call_start|>[f(a='x', b=1)]<|tool_call_end|>", and a
+// tool result is an ordinary "tool" role turn. The model opens <think> itself;
+// there is no enable_thinking switch.
+ChatPrompt build_lfm2_prompt(const Tokenizer & tok,
+                             const std::vector<ChatMessage> & messages,
+                             const ChatPromptOptions & opts) {
+    const int32_t im_start    = tok.token_to_id("<|im_start|>");
+    const int32_t im_end      = tok.token_to_id("<|im_end|>");
+    const int32_t think_open  = tok.token_to_id("<think>");
+    const int32_t think_close = tok.token_to_id("</think>");
+    const int32_t call_open   = tok.token_to_id("<|tool_call_start|>");
+    const int32_t call_close  = tok.token_to_id("<|tool_call_end|>");
+
+    ChatPrompt out;
+    auto & ids = out.ids;
+    auto emit_text = [&](const std::string & s) {
+        if (s.empty()) return;
+        const auto v = tok.encode(s, /*add_bos=*/false, /*parse_special=*/false);
+        ids.insert(ids.end(), v.begin(), v.end());
+    };
+    auto emit_tok = [&](int32_t t) { ids.push_back(t); };
+
+    if (tok.chat_wants_bos() && tok.bos() >= 0) emit_tok(tok.bos());
+
+    for (const auto & m : messages)
+        if (has_image(m)) throw std::runtime_error("chat: image input is not supported for lfm2");
+
+    // ---- system prompt, with the tool list appended ----
+    size_t msg_begin = 0;
+    std::string system;
+    if (!messages.empty() && messages[0].role == "system") {
+        system = flat_text(messages[0]);
+        msg_begin = 1;
+    }
+    if (!opts.tools_json.empty()) {
+        if (!system.empty()) system += "\n";
+        system += "List of tools: [";
+        for (size_t k = 0; k < opts.tools_json.size(); ++k)
+            system += (k ? ", " : "") + opts.tools_json[k];
+        system += "]";
+    }
+    if (!system.empty()) {
+        emit_tok(im_start);
+        emit_text("system\n" + system);
+        emit_tok(im_end);
+        emit_text("\n");
+    }
+
+    int last_user = -1;
+    for (size_t i = msg_begin; i < messages.size(); ++i)
+        if (messages[i].role == "user") last_user = (int) i;
+
+    for (size_t i = msg_begin; i < messages.size(); ++i) {
+        const auto & m = messages[i];
+        emit_tok(im_start);
+        emit_text(m.role + "\n");
+        if (m.role == "assistant") {
+            const bool recent = opts.preserve_thinking || (int) i > last_user;
+            if (m.has_reasoning && recent) {
+                emit_tok(think_open);
+                emit_text(m.reasoning_content);
+                emit_tok(think_close);
+            }
+            std::string content = flat_text(m);
+            if (!recent && content.find("</think>") != std::string::npos)
+                content = trim_ws(content.substr(content.rfind("</think>") + 8));
+            emit_text(content);
+            if (!m.tool_calls.empty()) {
+                emit_tok(call_open);
+                std::string calls = "[";
+                for (size_t k = 0; k < m.tool_calls.size(); ++k) {
+                    const auto & tc = m.tool_calls[k];
+                    calls += (k ? ", " : "") + tc.name + "(";
+                    for (size_t a = 0; a < tc.arguments.size(); ++a) {
+                        // the server supplies Python literals; without them a
+                        // value is quoted as a string, which is what it most
+                        // often is
+                        const std::string lit = a < tc.arg_literals.size()
+                            ? tc.arg_literals[a] : "'" + tc.arguments[a].second + "'";
+                        calls += (a ? ", " : "") + tc.arguments[a].first + "=" + lit;
+                    }
+                    calls += ")";
+                }
+                emit_text(calls + "]");
+                emit_tok(call_close);
+            }
+        } else {
+            emit_text(flat_text(m));
+        }
+        emit_tok(im_end);
+        emit_text("\n");
+    }
+
+    if (opts.add_generation_prompt) {
+        out.gen_prompt_begin = (int) ids.size();
+        emit_tok(im_start);
+        emit_text("assistant\n");
+        // opts.reasoning has no effect: the template has no switch, and an
+        // empty <think></think> prefill does not stop LFM2.5 from reasoning
+        // (it reopens the block or emits a stray </think>, llama.cpp too).
+    }
+    return out;
+}
+
 } // namespace
+
+ChatFormat chat_format(const Tokenizer & tok) {
+    ChatFormat f;
+    if (tok.token_to_id("<|tool_call_start|>") >= 0 && tok.token_to_id("<|im_start|>") >= 0) {
+        f.lfm2       = true;
+        f.tool_open  = "<|tool_call_start|>";
+        f.tool_close = "<|tool_call_end|>";
+    }
+    return f;
+}
 
 ChatPrompt build_qwen_prompt(const Tokenizer & tok,
                              const std::vector<ChatMessage> & messages,
                              const ChatPromptOptions & opts) {
+    if (chat_format(tok).lfm2) return build_lfm2_prompt(tok, messages, opts);
+
     const int32_t im_start    = tok.token_to_id("<|im_start|>");
     const int32_t im_end      = tok.token_to_id("<|im_end|>");
     const int32_t think_open  = tok.token_to_id("<think>");

@@ -605,6 +605,15 @@ struct Runtime::Impl {
                              ggml_tensor * mask, int n_tokens, int n_kv, int kv_pos = -1);
     ggml_tensor * build_gdn(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
+    // lfm2 gated short convolution (the conv state is its only memory)
+    ggml_tensor * build_shortconv(ggml_context * ctx, ggml_cgraph * gf, int il,
+                                  ggml_tensor * x, int n_tokens);
+    // the recurrent mixer of whichever hybrid this is
+    ggml_tensor * build_recurrent(ggml_context * ctx, ggml_cgraph * gf, int il,
+                                  ggml_tensor * x, int n_tokens) {
+        return model.hparams().has_shortconv ? build_shortconv(ctx, gf, il, x, n_tokens)
+                                             : build_gdn(ctx, gf, il, x, n_tokens);
+    }
 
     // ---- expert routing (every MoE graph goes through this) ----
     // Qwen ranks on softmax(logits). step35 / lfm2moe squash each logit with a
@@ -1040,7 +1049,11 @@ void Runtime::Impl::init() {
     idx_k_cache.assign(n_layer, nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
-        if (hp.is_recurrent(il)) {
+        if (hp.is_recurrent(il) && hp.has_shortconv) {
+            conv_state[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
+                                                hp.shortconv_l_cache - 1, hp.n_embd);
+            ggml_set_name(conv_state[il], ("conv_" + std::to_string(il)).c_str());
+        } else if (hp.is_recurrent(il)) {
             conv_state[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32, hp.ssm_d_conv - 1, conv_ch);
             ssm_state[il]  = ggml_new_tensor_3d(st_ctx, GGML_TYPE_F32, S, S, H_v);
             ggml_set_name(conv_state[il], ("conv_" + std::to_string(il)).c_str());
@@ -1088,7 +1101,8 @@ void Runtime::Impl::init() {
                 if ((size_t) dev_of(il) != d) continue;
                 if (k_cache[il])    { ts.push_back(k_cache[il]);    ts.push_back(v_cache[il]); }
                 if (idx_k_cache[il]) ts.push_back(idx_k_cache[il]);
-                if (conv_state[il]) { ts.push_back(conv_state[il]); ts.push_back(ssm_state[il]); }
+                if (conv_state[il]) ts.push_back(conv_state[il]);
+                if (ssm_state[il])  ts.push_back(ssm_state[il]);
                 if (ple_conv_state[il]) ts.push_back(ple_conv_state[il]);
             }
             st_bufs[d] = alloc_tensor_list(ggml_backend_get_default_buffer_type(gpus[d]),
@@ -1151,7 +1165,9 @@ void Runtime::Impl::report_compute_buffers() {
 size_t Runtime::Impl::state_bytes(int il) const {
     const auto & hp = model.hparams();
     size_t n = 0;
-    if (hp.is_recurrent(il)) {
+    if (hp.is_recurrent(il) && hp.has_shortconv) {
+        n += (size_t) (hp.shortconv_l_cache - 1) * hp.n_embd * 4;
+    } else if (hp.is_recurrent(il)) {
         const size_t conv_ch = (size_t) hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
         n += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4;
         n += (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
@@ -1404,19 +1420,12 @@ void Runtime::Impl::plan_pools() {
     // device's layer count, so leaving them out skews the ratio a little but not
     // the shape; the placement line below makes the outcome visible.
     const size_t compute = compute_headroom();
-    const int conv_ch    = hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state;
     std::vector<double> surplus(gpus.size(), 0.0);
     double total = 0.0;
     for (size_t d = 0; d < gpus.size(); ++d) {
         size_t kv = 0;
-        for (int il = 0; il < (int) hp.n_layer; ++il) {
-            if ((size_t) dev_of(il) != d) continue;
-            if (hp.is_recurrent(il))
-                kv += (size_t) (hp.ssm_d_conv - 1) * conv_ch * 4
-                    + (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
-            else
-                kv += (size_t) 2 * hp.head_count_kv(il) * hp.n_embd_head * cfg.n_ctx * 2;   // F16 K and V
-        }
+        for (int il = 0; il < (int) hp.n_layer; ++il)
+            if ((size_t) dev_of(il) == d) kv += state_bytes(il);
         const size_t reserve = kv + compute;
         surplus[d] = dev_budget[d] > reserve ? (double) (dev_budget[d] - reserve) : 0.0;
         total += surplus[d];
@@ -1742,6 +1751,43 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
     kqv = ggml_permute(ctx, kqv, 0, 2, 1, 3);
     kqv = ggml_cont_2d(ctx, kqv, n_embd_head * n_head, n_tokens);
     return kqv;  // [n_embd_head*n_head, n_tokens]
+}
+
+// ---- lfm2 gated short convolution ----
+// in_proj splits into B, C and x; B*x runs through a causal depthwise conv of
+// l_cache taps whose last l_cache-1 inputs are the layer's only state; C gates
+// the result before out_proj. Mirrors llama.cpp's build_shortconv_block.
+ggml_tensor * Runtime::Impl::build_shortconv(ggml_context * ctx, ggml_cgraph * gf, int il,
+        ggml_tensor * x, int n_tokens) {
+    const auto & hp = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int d_conv = (int) hp.shortconv_l_cache - 1;
+
+    x = ggml_reshape_3d(ctx, x, n_embd, n_tokens, 1);
+    ggml_tensor * bcx = dbg(ggml_mul_mat(ctx, W("blk.%d.shortconv.in_proj.weight", il), x),
+                            "conv_in_proj", il);                              // [3*n_embd, T, 1]
+    const size_t es = ggml_element_size(bcx);
+    auto chunk = [&](int k) {
+        return ggml_view_3d(ctx, bcx, n_embd, n_tokens, 1, bcx->nb[1], bcx->nb[2],
+                            (size_t) k * n_embd * es);
+    };
+    ggml_tensor * b = chunk(0), * c = chunk(1), * xx = chunk(2);
+
+    // tokens on ne[0] so the state (the previous d_conv inputs) prepends
+    ggml_tensor * bx = ggml_transpose(ctx, ggml_mul(ctx, b, xx));             // [T, n_embd, 1]
+    ggml_tensor * cs = ggml_reshape_3d(ctx, conv_state[il], d_conv, n_embd, 1);
+    bx = ggml_concat(ctx, cs, bx, 0);                                         // [d_conv+T, n_embd, 1]
+
+    // the new state is the last d_conv columns of the padded input
+    ggml_tensor * tail = ggml_view_3d(ctx, bx, d_conv, n_embd, 1, bx->nb[1], bx->nb[2],
+                                      (size_t) (bx->ne[0] - d_conv) * ggml_element_size(bx));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, conv_state[il]));
+
+    ggml_tensor * conv = dbg(ggml_ssm_conv(ctx, bx, W("blk.%d.shortconv.conv.weight", il)),
+                             "conv_conv", il);                                // [n_embd, T, 1]
+    ggml_tensor * y = ggml_mul(ctx, c, conv);
+    y = ggml_mul_mat(ctx, W("blk.%d.shortconv.out_proj.weight", il), y);
+    return dbg(ggml_reshape_2d(ctx, y, n_embd, n_tokens), "conv_out_proj", il);
 }
 
 // ---- Gated DeltaNet layer (qwen35 / qwen3next) ----
@@ -2523,7 +2569,7 @@ ggml_cgraph * Runtime::Impl::build_graph(ggml_context * ctx, int n_tokens, int n
         }
 
         if (hp.is_recurrent(il)) {
-            cur = build_gdn(ctx, gf, il, cur, n_tokens);
+            cur = build_recurrent(ctx, gf, il, cur, n_tokens);
         } else {
             // attention (plain for qwen3, gated for qwen35)
             ggml_tensor * Q, * K, * V, * gate = nullptr;
@@ -3008,7 +3054,7 @@ void Runtime::Impl::mtp_prefill_batch(const int32_t * toks, const float * hidden
 void Runtime::Impl::decode_verify_cached(const std::vector<int32_t> & toks) {
     const int T = (int) toks.size();
     const int n_used = model.hparams().n_expert_used;
-    const bool gdn = model.hparams().has_gdn;
+    const bool gdn = model.hparams().has_recurrent();
     if (ec_min_slots() >= T * n_used) {
         // batched path: fills vH and vA (GPU argmax, no logits readback).
         // GDN states are checkpointed per verify token so a partial accept can
@@ -3044,7 +3090,7 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
     if (ecache) { decode_verify_cached(toks); return; }   // expert-offload mode
 
     const int n_tokens = (int) toks.size();
-    const bool gdn = model.hparams().has_gdn;
+    const bool gdn = model.hparams().has_recurrent();
     const int want_nkv = std::min(((n_past + n_tokens + KV_BUCKET - 1) / KV_BUCKET) * KV_BUCKET, n_ctx);
 
     if (!v_gf || want_nkv != v_nkv || n_tokens != v_ntok) {
@@ -3178,7 +3224,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
                                  const std::function<bool(int32_t)> & on_token,
                                  int32_t * out_pending, bool ckpt_after_prefill) {
     const auto & hp = model.hparams();
-    const bool gdn = hp.has_gdn;
+    const bool gdn = hp.has_recurrent();
     const int  K   = n_draft < 1 ? 1 : n_draft;
     static const bool no_accept = getenv("QWEN_MTP_NOACCEPT") != nullptr;
     static const bool prof      = getenv("QWEN_PROF_MTP") != nullptr;
@@ -3595,7 +3641,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         }
 
         if (recurrent) {
-            cur = build_gdn(ctx, gf, il, cur, tlen);
+            cur = build_recurrent(ctx, gf, il, cur, tlen);
         } else {
             ggml_tensor * Q, * K, * V, * gate_t = nullptr;
             if (gated) {
@@ -4290,7 +4336,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
         }
         if (recurrent) {
-            cur = build_gdn(ctx, gf, il, cur, 1);
+            cur = build_recurrent(ctx, gf, il, cur, 1);
         } else {
             ggml_tensor * Q, * K, * V, * gate_t = nullptr;
             if (gated) {
@@ -4523,7 +4569,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 // back conv/ssm state on a speculative miss (cache fast path) or MTP reject.
 void Runtime::Impl::init_state_backup() {
     const auto & hp = model.hparams();
-    if (!hp.has_gdn || bak_buf) return;
+    if (!hp.has_recurrent() || bak_buf) return;
     ggml_init_params bp{};
     bp.mem_size = ggml_tensor_overhead() * hp.n_layer * 2 + 256;
     bp.no_alloc = true;
@@ -4534,8 +4580,9 @@ void Runtime::Impl::init_state_backup() {
         if (!conv_state[il]) continue;
         conv_bak[il] = ggml_new_tensor(bak_ctx, conv_state[il]->type,
                                        ggml_n_dims(conv_state[il]), conv_state[il]->ne);
-        ssm_bak[il]  = ggml_new_tensor(bak_ctx, ssm_state[il]->type,
-                                       ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
+        if (ssm_state[il])
+            ssm_bak[il] = ggml_new_tensor(bak_ctx, ssm_state[il]->type,
+                                          ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
     }
     bak_buf = ggml_backend_alloc_ctx_tensors(bak_ctx, backend);
     if (!bak_buf) throw std::runtime_error("failed to alloc state backup");
@@ -4546,7 +4593,7 @@ void Runtime::Impl::backup_states() {
     for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
         if (!conv_bak[il]) continue;
         ggml_backend_tensor_copy(conv_state[il], conv_bak[il]);
-        ggml_backend_tensor_copy(ssm_state[il],  ssm_bak[il]);
+        if (ssm_bak[il]) ggml_backend_tensor_copy(ssm_state[il], ssm_bak[il]);
     }
 }
 void Runtime::Impl::restore_states() {
@@ -4554,7 +4601,7 @@ void Runtime::Impl::restore_states() {
     for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
         if (!conv_bak[il]) continue;
         ggml_backend_tensor_copy(conv_bak[il], conv_state[il]);
-        ggml_backend_tensor_copy(ssm_bak[il],  ssm_state[il]);
+        if (ssm_bak[il]) ggml_backend_tensor_copy(ssm_bak[il], ssm_state[il]);
     }
 }
 
@@ -4562,7 +4609,7 @@ void Runtime::Impl::restore_states() {
 // (T-1 snapshots: state after verify token t, t = 0..T-2).
 void Runtime::Impl::init_ckpts(int T) {
     const auto & hp = model.hparams();
-    if (!hp.has_gdn || ckpt_T >= T) return;
+    if (!hp.has_recurrent() || ckpt_T >= T) return;
     if (ckpt_buf) { ggml_backend_buffer_free(ckpt_buf); ckpt_buf = nullptr; }
     if (ckpt_ctx) { ggml_free(ckpt_ctx); ckpt_ctx = nullptr; }
     const int n_layer = (int) hp.n_layer;
@@ -4577,8 +4624,9 @@ void Runtime::Impl::init_ckpts(int T) {
             if (!conv_state[il]) continue;
             ckpt_conv[t][il] = ggml_new_tensor(ckpt_ctx, conv_state[il]->type,
                     ggml_n_dims(conv_state[il]), conv_state[il]->ne);
-            ckpt_ssm[t][il]  = ggml_new_tensor(ckpt_ctx, ssm_state[il]->type,
-                    ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
+            if (ssm_state[il])
+                ckpt_ssm[t][il] = ggml_new_tensor(ckpt_ctx, ssm_state[il]->type,
+                        ggml_n_dims(ssm_state[il]), ssm_state[il]->ne);
         }
     ckpt_buf = ggml_backend_alloc_ctx_tensors(ckpt_ctx, backend);
     if (!ckpt_buf) throw std::runtime_error("failed to alloc GDN checkpoints");
@@ -4589,7 +4637,7 @@ void Runtime::Impl::restore_ckpt(int t) {
     for (int il = 0; il < (int) model.hparams().n_layer; ++il) {
         if (!ckpt_conv[t][il]) continue;
         ggml_backend_tensor_copy(ckpt_conv[t][il], conv_state[il]);
-        ggml_backend_tensor_copy(ckpt_ssm[t][il],  ssm_state[il]);
+        if (ckpt_ssm[t][il]) ggml_backend_tensor_copy(ckpt_ssm[t][il], ssm_state[il]);
     }
 }
 
@@ -4609,7 +4657,7 @@ static size_t pk_max() {
 
 void Runtime::Impl::pk_snapshot() {
     const auto & hp = model.hparams();
-    if (!hp.has_gdn || pk_max() == 0) return;   // attention-only: truncation is free
+    if (!hp.has_recurrent() || pk_max() == 0) return;   // attention-only: truncation is free
     if (n_past <= 0) return;
     if (!pk.empty() && pk.back().pos == n_past) return;
     PromptCkpt c;
@@ -4619,13 +4667,14 @@ void Runtime::Impl::pk_snapshot() {
     c.hidden   = mtp_hidden;
     size_t total = 0;
     for (int il = 0; il < (int) hp.n_layer; ++il)
-        if (conv_state[il]) total += ggml_nbytes(conv_state[il]) + ggml_nbytes(ssm_state[il]);
+        if (conv_state[il]) total += ggml_nbytes(conv_state[il]) + (ssm_state[il] ? ggml_nbytes(ssm_state[il]) : 0);
     c.blob.resize(total);
     size_t off = 0;
     for (int il = 0; il < (int) hp.n_layer; ++il) {
         if (!conv_state[il]) continue;
         ggml_backend_tensor_get(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
         off += ggml_nbytes(conv_state[il]);
+        if (!ssm_state[il]) continue;
         ggml_backend_tensor_get(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
         off += ggml_nbytes(ssm_state[il]);
     }
@@ -4649,7 +4698,7 @@ void Runtime::Impl::pk_snapshot() {
 int Runtime::Impl::pk_best(int n) const {
     if (n <= 0) return -1;
     const auto & hp = model.hparams();
-    if (!hp.has_gdn)   // attention-only: any position works (text-only lineage)
+    if (!hp.has_recurrent())   // attention-only: any position works (text-only lineage)
         return mrope_next == n_past ? std::min(n, n_past) : -1;
     int best = -1;
     for (const auto & c : pk) { if (c.pos > n) break; best = c.pos; }
@@ -4659,7 +4708,7 @@ int Runtime::Impl::pk_best(int n) const {
 int Runtime::Impl::pk_rewind(int n) {
     const auto & hp = model.hparams();
     if (n >= (int) kv_toks.size()) return (int) kv_toks.size();   // nothing to rewind
-    if (!hp.has_gdn) {
+    if (!hp.has_recurrent()) {
         if (mrope_next != n_past) return -1;   // image lineage: positions ambiguous
         n_past = n;
         mrope_next = n;
@@ -4676,6 +4725,7 @@ int Runtime::Impl::pk_rewind(int n) {
         if (!conv_state[il]) continue;
         ggml_backend_tensor_set(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
         off += ggml_nbytes(conv_state[il]);
+        if (!ssm_state[il]) continue;
         ggml_backend_tensor_set(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
         off += ggml_nbytes(ssm_state[il]);
     }
@@ -5241,7 +5291,7 @@ size_t Runtime::state_bytes() const {
             const int rows = il >= (int) hp.n_main() ? impl_->mtp_past : impl_->n_past;
             n += 2 * (size_t) rows * impl_->k_cache[il]->nb[1];
         } else {
-            n += ggml_nbytes(impl_->conv_state[il]) + ggml_nbytes(impl_->ssm_state[il]);
+            n += ggml_nbytes(impl_->conv_state[il]) + (impl_->ssm_state[il] ? ggml_nbytes(impl_->ssm_state[il]) : 0);
         }
     }
     return n;
@@ -5277,7 +5327,7 @@ void Runtime::save_state(const std::function<void(const void *, size_t)> & sink)
             dump(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
         } else {
             dump(impl_->conv_state[il], ggml_nbytes(impl_->conv_state[il]));
-            dump(impl_->ssm_state[il],  ggml_nbytes(impl_->ssm_state[il]));
+            if (impl_->ssm_state[il]) dump(impl_->ssm_state[il], ggml_nbytes(impl_->ssm_state[il]));
         }
     }
 }
@@ -5312,7 +5362,7 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
             fill(impl_->v_cache[il], (size_t) rows * impl_->v_cache[il]->nb[1]);
         } else {
             fill(impl_->conv_state[il], ggml_nbytes(impl_->conv_state[il]));
-            fill(impl_->ssm_state[il],  ggml_nbytes(impl_->ssm_state[il]));
+            if (impl_->ssm_state[il]) fill(impl_->ssm_state[il], ggml_nbytes(impl_->ssm_state[il]));
         }
     }
     impl_->n_past     = h.n_past;

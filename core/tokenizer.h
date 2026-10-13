@@ -16,7 +16,9 @@ public:
     // Which pre-tokenizer splits the text before BPE. The GGUF names it in
     // tokenizer.ggml.pre; the two differ enough that using the wrong one gives
     // subtly different ids for digits, CJK and punctuation runs.
-    enum class Pre { QWEN, DEEPSEEK3 };
+    // LLAMA3 is the qwen2 split with digits grouped in threes (\p{N}{1,3});
+    // llama.cpp uses it for lfm2, together with ignore_merges.
+    enum class Pre { QWEN, DEEPSEEK3, LLAMA3 };
 
     explicit Tokenizer(const Vocab & vocab);
 
@@ -51,6 +53,9 @@ private:
     std::unordered_map<uint32_t, uint8_t> uni_to_byte_;
 
     Pre     pre_ = Pre::QWEN;
+    // A pre-token that is itself a vocabulary entry is emitted whole, without
+    // running the merges (llama.cpp's ignore_merges; lfm2 sets it).
+    bool    ignore_merges_ = false;
 
     // Control / user-defined tokens, longest first. Text is split on these
     // before the pre-tokenizer runs, so "<|im_start|>" in a raw prompt becomes
@@ -62,7 +67,7 @@ private:
     int32_t match_special(const std::string & text, size_t pos, size_t * len) const;
 
     std::vector<std::string> pretokenize(const std::string & text) const;
-    std::vector<std::string> pretokenize_qwen(const std::string & text) const;
+    std::vector<std::string> pretokenize_qwen(const std::string & text, int max_digits = 1) const;
     std::vector<std::string> pretokenize_deepseek3(const std::string & text) const;
     std::vector<int32_t>     bpe_encode_piece(const std::string & piece) const;
 };

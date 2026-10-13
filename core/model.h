@@ -35,6 +35,8 @@ enum class Arch {
     QWEN35MOE,    // MoE  + Gated DeltaNet hybrid
     QWEN3NEXT,    // GDN + MoE hybrid
     QWEN4EXP,     // Qwen3.8-Flash-Next: GDN + MoE + hyper-connections + QSA + PLE
+    LFM2,         // LiquidAI LFM2 / LFM2.5: short-conv + GQA hybrid, dense
+    LFM2MOE,      // LiquidAI LFM2-MoE: the same hybrid with sigmoid-routed experts
 };
 
 const char * arch_name(Arch a);
@@ -88,6 +90,11 @@ struct HParams {
     uint32_t ssm_d_conv     = 0;     // conv kernel (=4)
     uint32_t ssm_dt_rank    = 0;     // H_v (number of GDN value heads)
     uint32_t full_attn_interval = 4; // attention every `interval` layers ((il+1)%interval==0)
+
+    // Short convolution (lfm2 / lfm2moe): the recurrent layers are the ones with
+    // no kv heads. Their only state is the last l_cache-1 inputs of the conv.
+    bool     has_shortconv     = false;
+    uint32_t shortconv_l_cache = 0;
     uint32_t nextn_predict_layers = 0;
 
     // ---- qwen4exp: hyper-connections ----
@@ -146,6 +153,9 @@ struct HParams {
     uint32_t     file_type = 0;
 
     bool is_moe() const { return n_expert > 0; }
+    // Does any layer carry recurrent state (GDN or short conv)? That state
+    // cannot be truncated, so rewinds and speculative rollback need snapshots.
+    bool has_recurrent() const { return has_gdn || has_shortconv; }
     bool is_moe_layer(uint32_t il) const { return is_moe() && il >= n_dense_lead; }
     bool gating_sigmoid() const { return expert_gating_func == 2; }
 
@@ -158,6 +168,7 @@ struct HParams {
     bool     has_mtp() const { return nextn_predict_layers > 0; }
     // GDN (recurrent) layer iff hybrid, within main stack, and not a full-attn slot.
     bool is_recurrent(uint32_t il) const {
+        if (has_shortconv) return il < n_layer && head_count_kv(il) == 0;
         if (!has_gdn) return false;
         return il < n_main() && ((il + 1) % full_attn_interval != 0);
     }

@@ -1,0 +1,14 @@
+0.04.787.465 W llama_kv_cache: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to 512
+0.04.802.028 I cmn          init: llama threadpool init, n_threads = 8
+0.04.802.051 I 
+0.04.802.094 I system_info: n_threads = 8 (n_threads_batch = 8) / 16 | CUDA : ARCHS = 860,890 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | AVX512 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.04.802.095 I 
+Model add_bos: true
+Input prompt: "The capital of France is"
+Token ids (6):
+<|startoftext|>(124894) The(597)  capital(5205)  of(302)  France(3980)  is(355) 
+Data saved to d
+Data saved to d
+Prompt saved to d
+Tokens saved to d
+

@@ -80,7 +80,10 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
                             t.substr(i, e - i).find("bos_token") != std::string::npos;
         }
     }
-    pre_     = vocab.pre == "deepseek-v3" ? Pre::DEEPSEEK3 : Pre::QWEN;
+    pre_     = vocab.pre == "deepseek-v3" ? Pre::DEEPSEEK3
+             : vocab.pre == "lfm2"        ? Pre::LLAMA3
+             :                              Pre::QWEN;
+    ignore_merges_ = pre_ == Pre::LLAMA3;
 
     id_to_token_ = vocab.tokens;
     token_ids_.reserve(vocab.tokens.size());
@@ -256,16 +259,26 @@ std::vector<std::string> Tokenizer::pretokenize_deepseek3(const std::string & te
 }
 
 std::vector<std::string> Tokenizer::pretokenize(const std::string & text) const {
-    return pre_ == Pre::DEEPSEEK3 ? pretokenize_deepseek3(text) : pretokenize_qwen(text);
+    switch (pre_) {
+        case Pre::DEEPSEEK3: return pretokenize_deepseek3(text);
+        case Pre::LLAMA3:    return pretokenize_qwen(text, 3);
+        default:             return pretokenize_qwen(text);
+    }
 }
 
-std::vector<std::string> Tokenizer::pretokenize_qwen(const std::string & text) const {
+std::vector<std::string> Tokenizer::pretokenize_qwen(const std::string & text, int max_digits) const {
     auto cps = utf8_decode(text);
     std::vector<std::string> pieces;
 
     auto is_space  = [](uint32_t c){ return c==' '||c=='\t'||c=='\n'||c=='\r'||c==0x0b||c==0x0c; };
-    auto is_letter = [](uint32_t c){ return (c>='A'&&c<='Z')||(c>='a'&&c<='z')|| c>0x7F; };
-    auto is_digit  = [](uint32_t c){ return c>='0'&&c<='9'; };
+    // \p{L}\p{M}: non-ASCII goes through the same classes as the deepseek-v3
+    // split, so CJK punctuation ("。") is punctuation and joins a following
+    // newline (" ?[^\s\p{L}\p{N}]+[\r\n]*") instead of standing alone.
+    auto is_letter = [](uint32_t c){
+        if (c < 0x80) return (c>='A'&&c<='Z')||(c>='a'&&c<='z');
+        return cp_is_letter(c) || cp_is_mark(c);
+    };
+    auto is_digit  = [](uint32_t c){ return cp_is_number(c); };
     auto is_punct  = [&](uint32_t c){ return !is_space(c) && !is_letter(c) && !is_digit(c); };
     auto lower     = [](uint32_t c){ return c>='A'&&c<='Z' ? c+32 : c; };
 
@@ -296,8 +309,12 @@ std::vector<std::string> Tokenizer::pretokenize_qwen(const std::string & text) c
             size_t j = i + 2; while (j < n && is_letter(cps[j].cp)) ++j;
             emit(i, j); i = j; continue;
         }
-        // \p{N}  (one digit per piece)
-        if (is_digit(c)) { emit(i, i + 1); ++i; continue; }
+        // \p{N} (qwen2: one digit per piece) or \p{N}{1,3} (llama3)
+        if (is_digit(c)) {
+            size_t j = i + 1;
+            while (j < n && (int) (j - i) < max_digits && is_digit(cps[j].cp)) ++j;
+            emit(i, j); i = j; continue;
+        }
         //  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
         if (is_punct(c) || (c == ' ' && i + 1 < n && is_punct(cps[i+1].cp))) {
             size_t j = c == ' ' ? i + 1 : i;
@@ -379,6 +396,12 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text, bool add_bos,
     auto flush = [&](size_t from, size_t to) {
         if (to <= from) return;
         for (auto & piece : pretokenize(text.substr(from, to - from))) {
+            if (ignore_merges_) {
+                std::string sym;
+                for (unsigned char b : piece) utf8_append(sym, byte_to_uni_.at(b));
+                auto it = token_ids_.find(sym);
+                if (it != token_ids_.end()) { ids.push_back(it->second); continue; }
+            }
             auto pids = bpe_encode_piece(piece);
             ids.insert(ids.end(), pids.begin(), pids.end());
         }

@@ -137,6 +137,11 @@ static std::string split_reasoning(const std::string & text, std::string & reaso
     const size_t p = text.find("</think>");
     if (p == std::string::npos) return text;
     reasoning = text.substr(0, p);
+    // lfm2 opens the block itself instead of the prompt pre-opening it
+    const size_t lead = reasoning.find_first_not_of(" \n");
+    if (lead != std::string::npos && reasoning.compare(lead, 7, "<think>") == 0)
+        reasoning.erase(0, lead + 7);
+    while (!reasoning.empty() && reasoning.front() == '\n') reasoning.erase(0, 1);
     while (!reasoning.empty() && (reasoning.back() == '\n' || reasoning.back() == ' ')) reasoning.pop_back();
     std::string rest = text.substr(p + 8);
     while (!rest.empty() && rest.front() == '\n') rest.erase(0, 1);
@@ -155,8 +160,146 @@ static std::string split_reasoning(const std::string & text, std::string & reaso
 // re-serialized — corrupting tool arguments. Schema-declared strings stay raw
 // (same as llama.cpp's schema-aware parser).
 struct ParsedToolCall { std::string name; std::string arguments; };
+
+// ---- lfm2 tool calls: a Python call list, "[f(a='x', b=1), g()]" ----
+// A small recursive-descent reader for the literals the model writes: quoted
+// strings (either quote, backslash escapes), numbers, True/False/None, lists
+// and dicts. Returns false on anything else; the caller keeps such a block as
+// plain content rather than inventing arguments.
+struct PyReader {
+    const std::string & s;
+    size_t i = 0;
+    explicit PyReader(const std::string & src) : s(src) {}
+    void ws() { while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r')) ++i; }
+    bool eat(char c) { ws(); if (i < s.size() && s[i] == c) { ++i; return true; } return false; }
+    bool ident(std::string & out) {
+        ws();
+        const size_t b = i;
+        while (i < s.size() && (isalnum((unsigned char) s[i]) || s[i] == '_' || s[i] == '.' || s[i] == '-')) ++i;
+        out = s.substr(b, i - b);
+        return !out.empty();
+    }
+    bool str(std::string & out) {
+        ws();
+        if (i >= s.size() || (s[i] != '\'' && s[i] != '"')) return false;
+        const char q = s[i++];
+        out.clear();
+        while (i < s.size() && s[i] != q) {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                const char e = s[++i];
+                out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
+                ++i;
+            } else {
+                out += s[i++];
+            }
+        }
+        return eat(q);
+    }
+    bool value(json & v) {
+        ws();
+        if (i >= s.size()) return false;
+        std::string t;
+        if (s[i] == '\'' || s[i] == '"') { if (!str(t)) return false; v = t; return true; }
+        if (s[i] == '[') {
+            ++i; v = json::array();
+            if (eat(']')) return true;
+            do { json e; if (!value(e)) return false; v.push_back(e); } while (eat(','));
+            return eat(']');
+        }
+        if (s[i] == '{') {
+            ++i; v = json::object();
+            if (eat('}')) return true;
+            do {
+                json k, e;
+                if (!value(k) || !k.is_string() || !eat(':') || !value(e)) return false;
+                v[k.get<std::string>()] = e;
+            } while (eat(','));
+            return eat('}');
+        }
+        if (!ident(t)) return false;
+        if (t == "True")  { v = true;  return true; }
+        if (t == "False") { v = false; return true; }
+        if (t == "None")  { v = nullptr; return true; }
+        try { v = json::parse(t); return v.is_number(); } catch (...) { return false; }
+    }
+    // [name(k=v, ...), ...]
+    bool calls(std::vector<ParsedToolCall> & out) {
+        if (!eat('[')) return false;
+        if (eat(']')) return true;
+        do {
+            ParsedToolCall c;
+            json args = json::object();
+            if (!ident(c.name) || !eat('(')) return false;
+            if (!eat(')')) {
+                do {
+                    std::string k; json v;
+                    if (!ident(k) || !eat('=') || !value(v)) return false;
+                    args[k] = v;
+                } while (eat(','));
+                if (!eat(')')) return false;
+            }
+            c.arguments = args.dump();
+            out.push_back(std::move(c));
+        } while (eat(','));
+        return eat(']');
+    }
+};
+
+// A JSON argument as the lfm2 template's format_arg_value writes it: strings
+// in single quotes (unescaped, as the template does), objects as JSON, and the
+// rest through Jinja's |string, i.e. Python's str().
+static std::string py_literal(const json & v, bool top = true) {
+    if (v.is_string())  return "'" + v.get<std::string>() + "'";
+    if (v.is_boolean()) return v.get<bool>() ? "True" : "False";
+    if (v.is_null())    return "None";
+    if (v.is_object() && top) return v.dump(-1, ' ', false);
+    if (v.is_array() || v.is_object()) {
+        const bool arr = v.is_array();
+        std::string s = arr ? "[" : "{";
+        bool first = true;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (!first) s += ", ";
+            first = false;
+            if (!arr) s += "'" + it.key() + "': ";
+            s += py_literal(*it, false);
+        }
+        return s + (arr ? "]" : "}");
+    }
+    return v.dump();
+}
+
+static std::string parse_tool_calls_lfm2(const std::string & text, std::vector<ParsedToolCall> & calls) {
+    size_t scan = 0;
+    const size_t think_end = text.rfind("</think>");
+    if (think_end != std::string::npos) scan = think_end + 8;
+    std::string out = text.substr(0, scan);
+    size_t pos = scan;
+    static const std::string open = "<|tool_call_start|>", close = "<|tool_call_end|>";
+    while (true) {
+        const size_t a = text.find(open, pos);
+        if (a == std::string::npos) { out += text.substr(pos); break; }
+        const size_t b = text.find(close, a);
+        if (b == std::string::npos) { out += text.substr(pos); break; }
+        out += text.substr(pos, a - pos);
+        const std::string block = text.substr(a + open.size(), b - a - open.size());
+        std::vector<ParsedToolCall> got;
+        PyReader r(block);
+        if (r.calls(got)) { r.ws(); }
+        if (!got.empty() && r.i == block.size()) {
+            for (auto & c : got) calls.push_back(std::move(c));
+        } else {
+            out += text.substr(a, b + close.size() - a);   // malformed: keep as content
+        }
+        pos = b + close.size();
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
+    return out;
+}
+
 static std::string parse_tool_calls(const std::string & text, std::vector<ParsedToolCall> & calls,
-                                    const std::map<std::string, int> * param_kind = nullptr) {
+                                    const std::map<std::string, int> * param_kind = nullptr,
+                                    bool lfm2 = false) {
+    if (lfm2) return parse_tool_calls_lfm2(text, calls);
     size_t scan = 0;
     const size_t think_end = text.rfind("</think>");
     if (think_end != std::string::npos) scan = think_end + 8;
@@ -658,6 +801,7 @@ int main(int argc, char ** argv) {
     }();
     const int32_t eos    = model->vocab().eos_id;
     const int32_t im_end = tok->token_to_id("<|im_end|>");
+    const ChatFormat cfmt = chat_format(*tok);   // Qwen XML or lfm2 call-list markup
     auto is_stop = [&](int32_t t){ return t == eos || (im_end >= 0 && t == im_end); };
 
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
@@ -1080,9 +1224,11 @@ int main(int argc, char ** argv) {
                             args = fn["arguments"];
                         }
                     }
-                    for (auto & kv : args.items())
+                    for (auto & kv : args.items()) {
                         call.arguments.push_back({ kv.key(),
                             kv.value().is_string() ? kv.value().get<std::string>() : kv.value().dump() });
+                        call.arg_literals.push_back(py_literal(kv.value()));
+                    }
                     cm.tool_calls.push_back(std::move(call));
                 }
             }
@@ -1259,6 +1405,8 @@ int main(int argc, char ** argv) {
                 enum class Phase { Reason, Content, Tool };
                 Phase phase = Phase::Content;
                 bool skip_lead = false;           // drop newlines right after </think>
+                bool await_think = false;         // lfm2: the reply may open <think> itself
+                bool skip_lead_r = false;         // drop newlines right after that <think>
                 bool role_sent = false;           // first delta carries role:"assistant"
                 std::string hold;                 // marker holdback buffer
                 std::string pend_r;               // UTF-8 holdback (reasoning channel)
@@ -1312,8 +1460,11 @@ int main(int argc, char ** argv) {
                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})}}) + "\n\n";
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
-            st->phase = (reasoning && tok->token_to_id("<think>") >= 0)
+            st->phase = (reasoning && !cfmt.lfm2 && tok->token_to_id("<think>") >= 0)
                 ? State::Phase::Reason : State::Phase::Content;
+            // lfm2 has no pre-opened block (and reasons whether asked to or
+            // not): watch the start of the reply instead
+            st->await_think = cfmt.lfm2;
             st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
@@ -1341,7 +1492,7 @@ int main(int argc, char ** argv) {
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
-                        parse_tool_calls(st->text, calls, &st->pkind);
+                        parse_tool_calls(st->text, calls, &st->pkind, cfmt.lfm2);
                         if (getenv("QWEN_LOG_RESPONSE")) {
                             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                                     st->text.c_str(), calls.size());
@@ -1355,7 +1506,7 @@ int main(int argc, char ** argv) {
                         if (calls.empty() && !st->hold.empty()) {
                             const bool rphase = st->phase == State::Phase::Reason;
                             std::string tail = rphase ? st->pend_r : st->utf8_pend;
-                            if (st->phase == State::Phase::Tool) tail += "<tool_call>";
+                            if (st->phase == State::Phase::Tool) tail += cfmt.tool_open;
                             tail += st->hold;
                             while (!tail.empty() && (tail.back() == '\n' || tail.back() == ' ')) tail.pop_back();
                             if (!tail.empty()) {
@@ -1424,14 +1575,27 @@ int main(int argc, char ** argv) {
                         // from <tool_call> on is withheld (parsed at finish);
                         // partial markers at the buffer tail are held back
                         std::string rout, cout_;
+                        if (st->await_think) {
+                            const size_t lead = st->hold.find_first_not_of(" \n");
+                            if (lead == std::string::npos) return true;          // only whitespace so far
+                            const std::string head = st->hold.substr(lead);
+                            if (head.size() < 7 && std::string("<think>").compare(0, head.size(), head) == 0)
+                                return true;                                      // could still be <think>
+                            st->await_think = false;
+                            if (head.compare(0, 7, "<think>") == 0) {
+                                st->hold = head.substr(7);
+                                st->phase = State::Phase::Reason;
+                                st->skip_lead_r = true;
+                            }
+                        }
                         for (bool again = true; again; ) {
                             again = false;
                             // Tool phase: keep accumulating in hold — flushed as
                             // content at finish if it turns out to be unparseable
                             if (st->phase == State::Phase::Tool) break;
                             const bool rphase = st->phase == State::Phase::Reason;
-                            const char * marker = rphase ? "</think>" : "<tool_call>";
-                            const size_t mlen   = rphase ? 8 : 11;
+                            const char * marker = rphase ? "</think>" : cfmt.tool_open.c_str();
+                            const size_t mlen   = rphase ? 8 : cfmt.tool_open.size();
                             const size_t p = st->hold.find(marker);
                             if (p == std::string::npos) {
                                 const size_t hb = marker_holdback(st->hold, marker, mlen);
@@ -1450,6 +1614,12 @@ int main(int argc, char ** argv) {
                                 st->skip_lead = rphase;
                                 again = true;
                             }
+                        }
+                        if (st->skip_lead_r && !rout.empty()) {  // newlines after an opened <think>
+                            size_t i = 0;
+                            while (i < rout.size() && rout[i] == '\n') ++i;
+                            rout.erase(0, i);
+                            if (!rout.empty()) st->skip_lead_r = false;
                         }
                         if (st->skip_lead && !cout_.empty()) {   // newlines after </think>
                             size_t i = 0;
@@ -1821,7 +1991,7 @@ int main(int argc, char ** argv) {
         std::string think;
         const std::string rest = split_reasoning(text, think);
         std::vector<ParsedToolCall> calls;
-        const std::string content = parse_tool_calls(rest, calls, &pkind);
+        const std::string content = parse_tool_calls(rest, calls, &pkind, cfmt.lfm2);
         if (getenv("QWEN_LOG_RESPONSE")) {
             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                     text.c_str(), calls.size());

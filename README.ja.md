@@ -4,7 +4,7 @@
 
 Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（vendored ggml の上に構築）。
 
-- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`, `qwen4exp`（Qwen3.8-Flash-Next: hyper-connection + QSA + PLE n-gram 埋め込み）
+- **対応アーキテクチャ**: `qwen3`（dense）, `qwen3moe`（MoE）, `qwen35` / `qwen35moe`（Gated DeltaNet ハイブリッド）, `qwen3next`, `qwen4exp`（Qwen3.8-Flash-Next: hyper-connection + QSA + PLE n-gram 埋め込み）, `lfm2` / `lfm2moe`（LiquidAI LFM2 / LFM2.5: short convolution + GQA ハイブリッド。モデルが常に推論ブロックを出すため `--reasoning off` は効きません）
 - **バックエンド**: CUDA（Windows/Linux）, Metal（macOS）, HIP/ROCm（AMD, 未検証）, CPU フォールバック
 - **主な機能**:
   - MoE エキスパートのオフロード（**RAM 階層** / **SSD 階層**）＋動的 VRAM エキスパートキャッシュ

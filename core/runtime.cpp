@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace questwend {
@@ -226,6 +227,7 @@ struct Runtime::Impl {
         // scatter weights the ffn mixer produced. `ple` holds this token's
         // gathered n-gram rows.
         ggml_tensor * inject = nullptr, * inject2 = nullptr, * ple = nullptr;
+        ggml_tensor * corr = nullptr;   // [n_embd] CPU-computed experts (cpu_miss)
     };
     std::vector<CarrySet> carries;
     std::vector<float>    hop_buf;      // staging for the boundary hidden-state hop
@@ -253,6 +255,26 @@ struct Runtime::Impl {
     ggml_tensor *         p_inject   = nullptr;  // [hc]       hc scatter weights (seg A -> B)
     ggml_tensor *         p_inject2  = nullptr;
     ggml_tensor *         p_ple      = nullptr;  // [n_embd]   this token's n-gram rows
+    ggml_tensor *         p_corr     = nullptr;  // [n_embd]   CPU experts' sum (cpu_miss)
+
+    // ---- CPU/GPU split decode (QWEN_CPU_MISS) ----
+    // On the RAM tier, a decode token's routed experts that are not resident
+    // in the VRAM cache are computed on the CPU, straight from the pinned host
+    // copy, while the GPU computes the resident ones -- instead of fetching
+    // them over PCIe. On a PCIe Gen3 x8 link that fetch costs more than the
+    // CPU matmul. Every selected expert is still computed with its own weight,
+    // so the result is the same model, not an approximation.
+    bool           cpu_miss   = false;
+    ggml_gallocr_t cpu_galloc = nullptr;      // CPU-side expert graphs
+    uint64_t       cm_gpu = 0, cm_cpu = 0;    // decode experts computed on each side
+    double         cm_cpu_ms = 0, cm_wait_ms = 0;
+    double         cm_a_ms = 0, cm_split_ms = 0, cm_b_ms = 0, cm_add_ms = 0;   // breakdown
+    int            cm_refill = 4;             // experts pulled into VRAM per token
+    std::unordered_map<int, uint32_t> cm_miss_count;   // layer*n_expert+e -> CPU runs
+    // The routed experts `ids` (weights `w`) of layer il applied to the host
+    // copy of its FFN input `x`, summed into `out` [n_embd] on the CPU.
+    void cpu_experts(int il, const float * x, const std::vector<int32_t> & ids,
+                     const std::vector<float> & w, std::vector<float> & out);
 
     // Phase B v2-fast: optimistic single-graph decode over the VRAM cache.
     // One persistent (CUDA-graph friendly) graph runs the whole token; per-layer
@@ -426,6 +448,14 @@ struct Runtime::Impl {
                     (unsigned long long) acc,
                     acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
                     (unsigned long long) s.misses, (unsigned long long) s.evictions);
+            if (cpu_miss && cm_gpu + cm_cpu > 0)
+                fprintf(stderr,
+                    "cpu-miss decode: %llu experts on the GPU, %llu on the CPU (%.1f%%); "
+                    "CPU %.1f ms total, then waited %.1f ms for the GPU\n"
+                    "cpu-miss breakdown (ms total): segA %.1f, split/readback %.1f, segB build+launch %.1f, add %.1f\n",
+                    (unsigned long long) cm_gpu, (unsigned long long) cm_cpu,
+                    100.0 * (double) cm_cpu / (double) (cm_gpu + cm_cpu), cm_cpu_ms, cm_wait_ms,
+                    cm_a_ms, cm_split_ms, cm_b_ms, cm_add_ms);
             if (dc_tokens)
                 fprintf(stderr,
                     "decode_cached prof: %llu tok, wall %.2f ms/tok, gpu-compute %.2f ms/tok (%.0f%%), host %.2f ms/tok\n",
@@ -489,6 +519,7 @@ struct Runtime::Impl {
         // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
         // split/ssd mode; in single-backend mode Model owns and frees the weights.
         for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
+        if (cpu_galloc)     ggml_gallocr_free(cpu_galloc);
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
@@ -1365,6 +1396,7 @@ void Runtime::Impl::use_carry(int d) {
     p_inject   = c.inject;
     p_inject2  = c.inject2;
     p_ple      = c.ple;
+    p_corr     = c.corr;
 }
 
 // Move the running hidden state across a device boundary. This is the only
@@ -1550,6 +1582,7 @@ void Runtime::Impl::init_cache() {
         if (use_ple()) {
             c.ple = ggml_new_tensor_2d(c.ctx, GGML_TYPE_F32, n_embd, 1);
         }
+        c.corr = ggml_new_tensor_1d(c.ctx, GGML_TYPE_F32, n_embd);
         char nm[64];
         const char * base[10] = { "h", "ffn_in", "resid", "weights", "ffn_in2",
                                   "resid2", "weights2", "slot_g", "slot_u", "slot_d" };
@@ -1559,9 +1592,9 @@ void Runtime::Impl::init_cache() {
             snprintf(nm, sizeof(nm), "carry%zu.%s", d, base[k]);
             ggml_set_name(ts[k], nm);
         }
-        const char * opt_base[3] = { "inject", "inject2", "ple" };
-        ggml_tensor * opt[3] = { c.inject, c.inject2, c.ple };
-        for (int k = 0; k < 3; ++k) {
+        const char * opt_base[4] = { "inject", "inject2", "ple", "corr" };
+        ggml_tensor * opt[4] = { c.inject, c.inject2, c.ple, c.corr };
+        for (int k = 0; k < 4; ++k) {
             if (!opt[k]) continue;
             snprintf(nm, sizeof(nm), "carry%zu.%s", d, opt_base[k]);
             ggml_set_name(opt[k], nm);
@@ -1570,6 +1603,30 @@ void Runtime::Impl::init_cache() {
         if (!c.buf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
     }
     use_carry(0);
+
+    // CPU/GPU split decode: needs the experts' host copy (RAM tier, not SSD) and
+    // one device (the carries and the CPU result live on the primary).
+    if (const char * e = getenv("QWEN_CPU_MISS")) {
+        if (atoi(e) != 0) {
+            if (ssd_mode || !cpu_backend || gpus.size() > 1 || hp.has_hc()) {
+                fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
+            } else {
+                cpu_miss   = true;
+                cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+                // Few threads: the main thread issues every GPU segment, and
+                // workers spinning between expert graphs starve it. A quarter of
+                // the logical CPUs measured best on an 8C/16T i7-7820X (3050 and
+                // 4060 Ti, LFM2.5-24B): 3 -> 20.9, 4 -> 22.4, 5 -> 21.2 tok/s.
+                int nth = cfg.n_threads > 0 ? cfg.n_threads
+                        : std::max(1, (int) std::thread::hardware_concurrency() / 4);
+                if (const char * t = getenv("QWEN_CPU_MISS_THREADS")) nth = std::max(1, atoi(t));
+                ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+                if (const char * r = getenv("QWEN_CPU_MISS_REFILL")) cm_refill = std::max(0, atoi(r));
+                fprintf(stderr, "cpu-miss decode: non-resident experts are computed on the CPU "
+                                "(%d threads, refill %d/token)\n", nth, cm_refill);
+            }
+        }
+    }
 
     // Model-wide tables for the fused single-graph path. That graph is planned
     // by a scheduler, which copies these to whichever device needs them, so one
@@ -3473,6 +3530,49 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
     return moe_out;
 }
 
+// ---- cpu_miss: routed experts on the CPU, from the RAM tier's pinned copy ----
+// The model's ffn_*_exps tensors live in host memory on the RAM tier, so the
+// CPU backend reads them where they are; only the 2048-float input and output
+// cross. One small graph per call: mul_mat_id over the selected rows only.
+void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32_t> & ids,
+                                const std::vector<float> & w, std::vector<float> & out) {
+    const auto & hp = model.hparams();
+    const int n_embd = hp.n_embd;
+    const int n = (int) ids.size();
+    out.assign(n_embd, 0.0f);
+    if (n == 0) return;
+
+    ggml_init_params gp{};
+    gp.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false);
+    gp.no_alloc = true;
+    ggml_context * ctx = ggml_init(gp);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+
+    ggml_tensor * xin = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
+    ggml_tensor * idt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1);
+    ggml_tensor * wt  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+    ggml_set_input(xin); ggml_set_input(idt); ggml_set_input(wt);
+
+    ggml_tensor * up   = ggml_mul_mat_id(ctx, W("blk.%d.ffn_up_exps.weight",   il), xin, idt);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, W("blk.%d.ffn_gate_exps.weight", il), xin, idt);
+    ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);                     // [ff_exp, n, 1]
+    ggml_tensor * experts = ggml_mul_mat_id(ctx, W("blk.%d.ffn_down_exps.weight", il), act, idt); // [n_embd, n, 1]
+    ggml_tensor * et  = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n)));
+    ggml_tensor * res = ggml_mul_mat(ctx, et, wt);                             // [n_embd, 1]
+    ggml_set_output(res);
+    ggml_build_forward_expand(gf, res);
+
+    if (!ggml_gallocr_alloc_graph(cpu_galloc, gf))
+        throw std::runtime_error("cpu_experts: gallocr alloc failed");
+    ggml_backend_tensor_set(xin, x, 0, (size_t) n_embd * sizeof(float));
+    ggml_backend_tensor_set(idt, ids.data(), 0, (size_t) n * sizeof(int32_t));
+    ggml_backend_tensor_set(wt,  w.data(),   0, (size_t) n * sizeof(float));
+    if (ggml_backend_graph_compute(cpu_backend, gf) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("cpu_experts: compute failed");
+    ggml_backend_tensor_get(res, out.data(), 0, (size_t) n_embd * sizeof(float));
+    ggml_free(ctx);
+}
+
 // Batched prefill over the cache: run n_tokens through one segmented forward
 // (seg A attention/router for all tokens -> ensure the union of selected experts
 //  -> seg B expert matmuls for all tokens). Far fewer graph dispatches than the
@@ -4238,12 +4338,13 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     const bool  hc_on     = hp.has_hc();
     const int   n_hc      = hc_on ? (int) hp.hc_count : 1;
 
-    auto new_ctx = [&]() {
+    auto new_ctx_n = [&](int n_nodes) {
         ggml_init_params gp{};
-        gp.mem_size = ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false);
+        gp.mem_size = ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false);
         gp.no_alloc = true;
         return ggml_init(gp);
     };
+    auto new_ctx = [&]() { return new_ctx_n(GRAPH_SIZE); };
     // Every segment graph here touches exactly one device -- the layer's weights,
     // KV rows, expert pool and carries all live together -- so it is allocated
     // and run directly on that device. Going through the scheduler instead would
@@ -4305,6 +4406,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // Append seg A (attention/GDN + router) for layer `il` to (ctx,gf). Writes the
     // normed FFN input / residual / router weights into the layer's parity carry,
     // and exposes `selected` (router top-k) for host readback. Returns selected.
+    // cpu_miss: the previous layer's CPU-computed experts, still to be added to
+    // the hidden state. Seg A reads p_h + corr_in instead of p_h, which saves a
+    // graph launch per layer; the sum reaches the residual carry from there.
+    ggml_tensor * corr_in = nullptr;
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
         QsaShared qsa;
         const int n_head    = (int) hp.head_count(il);       // per-layer on step35
@@ -4329,10 +4434,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                     W("blk.%d.hc_attn_down.weight",   il),
                     W("blk.%d.hc_attn_up.weight",     il),
                     W("blk.%d.hc_attn_inject.weight", il), &inject);
-        } else {
+        }
+        ggml_tensor * h_in = (!hc_on && corr_in) ? ggml_add(ctx, p_h, corr_in) : p_h;
+        if (!hc_on) {
             if (dump_wants(il))
-                ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, p_h), "attn_norm_in", il));
-            cur = ggml_rms_norm(ctx, p_h, eps);
+                ggml_build_forward_expand(gf, dbg(ggml_cont(ctx, h_in), "attn_norm_in", il));
+            cur = ggml_rms_norm(ctx, h_in, eps);
             cur = dbg(ggml_mul(ctx, cur, W("blk.%d.attn_norm.weight", il)), "attn_norm", il);
         }
         if (recurrent) {
@@ -4382,7 +4489,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             ggml_build_forward_expand(gf, ggml_cpy(ctx,
                     ggml_reshape_1d(ctx, inject, n_hc), carry_inj(il)));
         } else {
-            ggml_tensor * attn_resid = dbg(ggml_add(ctx, cur, p_h), "ffn_inp", il);
+            ggml_tensor * attn_resid = dbg(ggml_add(ctx, cur, h_in), "ffn_inp", il);
             if (gated) ffn_in = ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.post_attention_norm.weight", il));
             else       ffn_in = dbg(ggml_mul(ctx, ggml_rms_norm(ctx, attn_resid, eps), W("blk.%d.ffn_norm.weight", il)), "ffn_norm", il);
             // Leading dense block: no routed experts, so the layer finishes here
@@ -4475,6 +4582,160 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // or for a dense block (no seg B) the device that computed it.
     auto h_dev = [&](int il) { return hp.is_moe_layer(il) ? pdev_of(il) : dev_of(il); };
 
+    if (cpu_miss) {
+        // Per MoE layer: seg A on the GPU, read the selection back, then the
+        // resident experts on the GPU (launched async) while the CPU computes
+        // the rest from host memory; the CPU sum joins the hidden state before
+        // the next layer reads it. One device (see init), so no carry hops.
+        ggml_backend_t be = gpus.empty() ? backend : gpus[0];
+        std::vector<float>   wv(n_used), xin(n_embd), corr, cw, gw;
+        std::vector<int32_t> cids, gsg, gsu, gsd;
+        std::vector<int>     refill_cand;   // this token's CPU experts (layer*n_expert+e)
+        bool corr_pending = false;
+        // segment graphs here are a few hundred nodes; a full-size context per
+        // graph costs more to set up than the segment takes on the GPU
+        const int HY_GRAPH = 2048;
+        auto add_corr = [&]() {   // p_h += p_corr
+            ggml_context * ctx = new_ctx();
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_h, p_corr), p_h));
+            run(ctx, gf, 0);
+            compute(gf, 0, "cpu-miss add failed");
+            ggml_free(ctx);
+            corr_pending = false;
+        };
+        using hclk = std::chrono::steady_clock;
+        auto ms_since = [](hclk::time_point t) {
+            return std::chrono::duration<double, std::milli>(hclk::now() - t).count();
+        };
+        for (int il = 0; il < N; ++il) {
+            auto t0 = hclk::now();
+            corr_in = corr_pending ? p_corr : nullptr;   // folded into seg A
+            corr_pending = false;
+            ggml_context * ctx = new_ctx_n(HY_GRAPH);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, HY_GRAPH, false);
+            ggml_tensor * selected = build_segA(ctx, gf, il);
+            corr_in = nullptr;
+            run(ctx, gf, 0);
+            set_attn_inputs(gf);
+            compute(gf, 0, "seg A compute failed");
+            dump_flush("segA");
+            if (selected) ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
+            ggml_free(ctx);
+            cm_a_ms += ms_since(t0);
+            if (!selected) continue;   // dense block: seg A finished it
+            t0 = hclk::now();
+
+            // split the selection by residency
+            ggml_backend_tensor_get(carry_wgt(il), wv.data(), 0, n_used * sizeof(float));
+            ExpertCache * ec = ec_of(il);
+            const int32_t * rg = ec->slot_of_row(ExpertCache::GATE, il);
+            const int32_t * ru = ec->slot_of_row(ExpertCache::UP,   il);
+            const int32_t * rd = ec->slot_of_row(ExpertCache::DOWN, il);
+            cids.clear(); cw.clear(); gsg.clear(); gsu.clear(); gsd.clear(); gw.clear();
+            for (int k = 0; k < n_used; ++k) {
+                const int e = sel[k];
+                if (ec->resident(ExpertCache::GATE, il, e) && ec->resident(ExpertCache::UP, il, e) &&
+                    ec->resident(ExpertCache::DOWN, il, e)) {
+                    gsg.push_back(rg[e]); gsu.push_back(ru[e]); gsd.push_back(rd[e]);
+                    gw.push_back(wv[k]);
+                    ec->touch(ExpertCache::GATE, il, e);
+                    ec->touch(ExpertCache::UP,   il, e);
+                    ec->touch(ExpertCache::DOWN, il, e);
+                } else {
+                    cids.push_back(e); cw.push_back(wv[k]);
+                }
+            }
+            cm_gpu += gsg.size();
+            cm_cpu += cids.size();
+            if (!cids.empty())
+                ggml_backend_tensor_get(carry_ffn(il), xin.data(), 0, (size_t) n_embd * sizeof(float));
+
+            cm_split_ms += ms_since(t0);
+            t0 = hclk::now();
+            // GPU: the resident experts (+ shared expert) + residual -> p_h
+            ctx = new_ctx_n(HY_GRAPH);
+            gf  = ggml_new_graph_custom(ctx, HY_GRAPH, false);
+            const int nr = (int) gsg.size();
+            ggml_tensor * ffn_l = carry_ffn(il);
+            ggml_tensor * h_new = carry_res(il);
+            ggml_tensor * t_ids[3] = { nullptr, nullptr, nullptr }, * t_w = nullptr;
+            if (nr > 0) {
+                for (int r = 0; r < 3; ++r) {
+                    t_ids[r] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nr, 1);
+                    ggml_set_input(t_ids[r]);
+                }
+                t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, 1);
+                ggml_set_input(t_w);
+                ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, 1);
+                ggml_tensor * up   = ggml_mul_mat_id(ctx, ec->up(il),   x3, t_ids[1]);
+                ggml_tensor * gate = ggml_mul_mat_id(ctx, ec->gate(il), x3, t_ids[0]);
+                ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+                ggml_tensor * ex   = ggml_mul_mat_id(ctx, ec->down(il), act, t_ids[2]);   // [n_embd, nr, 1]
+                ggml_tensor * et   = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, ex, n_embd, nr)));
+                ggml_tensor * moe  = ggml_mul_mat(ctx, et, t_w);                          // [n_embd, 1]
+                h_new = ggml_add(ctx, ggml_reshape_1d(ctx, moe, n_embd), h_new);
+            }
+            if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
+                ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
+                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
+                ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
+                                                ggml_mul(ctx, ggml_silu(ctx, g), u));
+                if (ggml_tensor * gw_sh = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
+                    sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw_sh, ffn_l)));
+                h_new = ggml_add(ctx, h_new, sh);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, p_h));
+            run(ctx, gf, 0);
+            if (nr > 0) {
+                ggml_backend_tensor_set(t_ids[0], gsg.data(), 0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set(t_ids[1], gsu.data(), 0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set(t_ids[2], gsd.data(), 0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set(t_w,      gw.data(),  0, (size_t) nr * sizeof(float));
+            }
+            if (ggml_backend_graph_compute_async(be, gf) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("decode_cached: cpu-miss seg B failed");
+
+            cm_b_ms += ms_since(t0);
+            // CPU: the rest, while the GPU works
+            auto tc = std::chrono::steady_clock::now();
+            if (!cids.empty()) cpu_experts(il, xin.data(), cids, cw, corr);
+            auto tw = std::chrono::steady_clock::now();
+            ggml_backend_synchronize(be);
+            auto te = std::chrono::steady_clock::now();
+            cm_cpu_ms  += std::chrono::duration<double, std::milli>(tw - tc).count();
+            cm_wait_ms += std::chrono::duration<double, std::milli>(te - tw).count();
+            ggml_free(ctx);
+            if (!cids.empty()) {
+                ggml_backend_tensor_set(p_corr, corr.data(), 0, (size_t) n_embd * sizeof(float));
+                corr_pending = true;
+                for (int e : cids) refill_cand.push_back(il * hp.n_expert + e);
+            }
+        }
+        auto ta = hclk::now();
+        if (corr_pending) add_corr();
+        cm_add_ms += ms_since(ta);
+
+        // Refill: pull the experts the CPU keeps being handed into the VRAM
+        // cache, a few per token, most often missed first. Without it the
+        // cache holds whatever the prompt's prefill left behind, which is not
+        // what the generation goes on to use.
+        if (cm_refill > 0 && !refill_cand.empty()) {
+            for (int key : refill_cand) cm_miss_count[key]++;
+            std::sort(refill_cand.begin(), refill_cand.end(), [&](int a, int b) {
+                return cm_miss_count[a] > cm_miss_count[b];
+            });
+            int budget = cm_refill;
+            for (size_t i = 0; i < refill_cand.size() && budget > 0; ++i) {
+                const int key = refill_cand[i];
+                if (i > 0 && key == refill_cand[i - 1]) continue;
+                const int l = key / (int) hp.n_expert, e = key % (int) hp.n_expert;
+                ec_of(l)->ensure_resident(l, e);
+                --budget;
+            }
+        }
+        refill_cand.clear();
+    } else {
     do_segA(0);
     for (int il = 0; il < N; ++il) {
         const int anxt = (il + 1 < N) ? dev_of(il + 1) : -1;    // next attention device
@@ -4516,6 +4777,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             do_segA(il + 1);
         }
     }
+    }   // !cpu_miss
     // the final norm and output head are model-global, so they live on the primary
     hop_carry(h_dev(N - 1), 0);
     use_carry(0);
@@ -4976,7 +5238,9 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
 
     // single-token decode via the dynamic VRAM expert cache (expert-offload mode)
     if (n_tokens == 1 && ecache)
-        return cache_fast_enabled ? decode_cached_fast(tokens[0]) : decode_cached(tokens[0]);
+        // the fused single-graph path never leaves the GPU, so the CPU split
+        // runs on the per-layer path
+        return cache_fast_enabled && !cpu_miss ? decode_cached_fast(tokens[0]) : decode_cached(tokens[0]);
 
     // Prefill as batched chunks through the VRAM expert cache (chunk bounded so
     // a layer's distinct experts fit the pools). Used for both offload tiers:

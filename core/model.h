@@ -44,8 +44,8 @@ struct HParams {
     uint32_t n_layer        = 0;
     uint32_t n_embd         = 0;
     uint32_t n_ff           = 0;     // dense FFN hidden size
-    uint32_t n_head         = 0;
-    uint32_t n_head_kv      = 0;
+    uint32_t n_head         = 0;     // max over layers when the count varies
+    uint32_t n_head_kv      = 0;     // max over layers when the count varies
     uint32_t n_embd_head    = 0;     // head dim (qkv)
     uint32_t n_rot          = 0;     // rotary dims (may be < n_embd_head: partial rope)
     uint32_t n_ctx_train    = 0;
@@ -58,11 +58,27 @@ struct HParams {
     int      rope_sections[4] = {0, 0, 0, 0};
     bool     use_mrope        = false;
 
-    // MoE (qwen3moe / qwen35moe / qwen3next)
+    // Per-layer head counts. head_count / head_count_kv are scalars on every
+    // Qwen arch but per-layer arrays on step35 (64 vs 96 heads) and lfm2moe
+    // (kv = 0 on its convolution layers). Empty = uniform; always go through
+    // head_count(il) / head_count_kv(il).
+    std::vector<uint32_t> n_head_l;
+    std::vector<uint32_t> n_head_kv_l;
+
+    // MoE (qwen3moe / qwen35moe / qwen3next / qwen4exp / step35 / lfm2moe)
     uint32_t n_expert       = 0;     // total experts (0 = dense)
     uint32_t n_expert_used  = 0;     // top-k
     uint32_t n_ff_exp       = 0;     // per-expert FFN size
     float    expert_weights_scale = 1.0f;
+    // Routing shape. Qwen ranks experts on softmax(logits); step35 and lfm2moe
+    // squash each logit with a sigmoid and rank on that plus a per-expert
+    // selection bias (blk.N.exp_probs_b.bias), mixing with the unbiased value.
+    // Values follow llama.cpp's llama_expert_gating_func_type.
+    uint32_t expert_gating_func  = 1;     // 1 = softmax, 2 = sigmoid
+    bool     expert_weights_norm = true;  // renormalise the top-k weights to sum 1
+    // Leading blocks with a dense FFN before the first MoE block (step35: 3,
+    // lfm2moe: 2). They have no routed experts at all.
+    uint32_t n_dense_lead   = 0;
 
     // Gated DeltaNet (qwen35 / qwen35moe / qwen3next)
     bool     has_gdn        = false;
@@ -130,6 +146,13 @@ struct HParams {
     uint32_t     file_type = 0;
 
     bool is_moe() const { return n_expert > 0; }
+    bool is_moe_layer(uint32_t il) const { return is_moe() && il >= n_dense_lead; }
+    bool gating_sigmoid() const { return expert_gating_func == 2; }
+
+    // Per-layer shape accessors; uniform architectures fall back to the scalar,
+    // so these are safe to call unconditionally.
+    uint32_t head_count   (uint32_t il) const { return il < n_head_l.size()    ? n_head_l[il]    : n_head; }
+    uint32_t head_count_kv(uint32_t il) const { return il < n_head_kv_l.size() ? n_head_kv_l[il] : n_head_kv; }
     // Main transformer stack excludes the trailing MTP (next-token-prediction) blocks.
     uint32_t n_main()  const { return n_layer - nextn_predict_layers; }
     bool     has_mtp() const { return nextn_predict_layers > 0; }
@@ -171,6 +194,9 @@ struct Vocab {
     std::vector<std::string> merges;
     std::string              model;          // "gpt2" for Qwen
     int32_t bos_id = -1, eos_id = -1, pad_id = -1;
+    // tokenizer.ggml.add_bos_token: the Qwen models say false, step35 says true.
+    bool                     add_bos = false;
+    std::string              pre;            // tokenizer.ggml.pre ("qwen2", "deepseek-v3", "lfm2", ...)
     std::string              chat_template;
 };
 

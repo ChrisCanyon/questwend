@@ -94,7 +94,12 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                          bool ssd, const std::vector<bool> * layer_mask)
     : model_(model), ssd_(ssd), n_layer_(n_layer), n_expert_(n_expert) {
     // Layers this cache is responsible for (all of them without a split).
-    auto owns = [&](int il) { return !layer_mask || (*layer_mask)[(size_t) il]; };
+    // A leading dense block (step35, lfm2moe) has no routed experts at all; it
+    // is left unserved exactly like another device's layer, so every consumer
+    // that already checks serves() skips it.
+    auto owns = [&](int il) {
+        return (!layer_mask || (*layer_mask)[(size_t) il]) && role_tensor(model, GATE, il) != nullptr;
+    };
 
     backend_ = gpu_backend;
     if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D

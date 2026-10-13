@@ -62,18 +62,31 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
     const int32_t im_end      = tok.token_to_id("<|im_end|>");
     const int32_t think_open  = tok.token_to_id("<think>");
     const int32_t think_close = tok.token_to_id("</think>");
-    const int32_t vis_start   = tok.token_to_id("<|vision_start|>");
-    const int32_t vis_end     = tok.token_to_id("<|vision_end|>");
-    const int32_t image_pad   = tok.token_to_id("<|image_pad|>");
+    // Image placeholders: Qwen wraps the run in <|vision_start|>/<|vision_end|>,
+    // step35 in <im_start>/<im_end> with <im_patch> as the repeated token. The
+    // emission below is the same shape either way, so only the ids differ.
+    int32_t vis_start = tok.token_to_id("<|vision_start|>");
+    int32_t vis_end   = tok.token_to_id("<|vision_end|>");
+    int32_t image_pad = tok.token_to_id("<|image_pad|>");
+    if (image_pad < 0) {
+        vis_start = tok.token_to_id("<im_start>");
+        vis_end   = tok.token_to_id("<im_end>");
+        image_pad = tok.token_to_id("<im_patch>");
+    }
 
     ChatPrompt out;
     auto & ids = out.ids;
     auto emit_text = [&](const std::string & s) {
         if (s.empty()) return;
-        const auto v = tok.encode(s, false);
+        const auto v = tok.encode(s, /*add_bos=*/false, /*parse_special=*/false);
         ids.insert(ids.end(), v.begin(), v.end());
     };
     auto emit_tok = [&](int32_t t) { ids.push_back(t); };
+
+    // Models that set tokenizer.ggml.add_bos_token (step35) or whose template
+    // opens with bos_token (lfm2) want it in front of the whole conversation,
+    // not per message. The Qwen models do neither.
+    if (tok.chat_wants_bos() && tok.bos() >= 0) emit_tok(tok.bos());
 
     // ---- fallback: base model without ChatML specials (text only) ----
     if (im_start < 0 || im_end < 0) {

@@ -701,8 +701,17 @@ void Model::load_hparams() {
     hp_.n_layer     = gguf_u32(gguf_, k("block_count"));
     hp_.n_embd      = gguf_u32(gguf_, k("embedding_length"));
     hp_.n_ff        = gguf_u32(gguf_, k("feed_forward_length"));
-    hp_.n_head      = gguf_u32(gguf_, k("attention.head_count"));
-    hp_.n_head_kv   = gguf_u32(gguf_, k("attention.head_count_kv"), hp_.n_head);
+    // head_count / head_count_kv may be per-layer arrays (step35, lfm2moe).
+    // gguf_u32() cannot see an array and would silently yield 0, so read the
+    // array first. The scalar keeps the max, which is what buffer sizing wants.
+    hp_.n_head_l = gguf_u32_array(gguf_, k("attention.head_count"));
+    hp_.n_head   = hp_.n_head_l.empty()
+                     ? gguf_u32(gguf_, k("attention.head_count"))
+                     : *std::max_element(hp_.n_head_l.begin(), hp_.n_head_l.end());
+    hp_.n_head_kv_l = gguf_u32_array(gguf_, k("attention.head_count_kv"));
+    hp_.n_head_kv   = hp_.n_head_kv_l.empty()
+                        ? gguf_u32(gguf_, k("attention.head_count_kv"), hp_.n_head)
+                        : *std::max_element(hp_.n_head_kv_l.begin(), hp_.n_head_kv_l.end());
     hp_.n_ctx_train = gguf_u32(gguf_, k("context_length"), 32768);
     hp_.rope_freq_base = gguf_f32(gguf_, k("rope.freq_base"), 1000000.0f);
     hp_.rms_eps        = gguf_f32(gguf_, k("attention.layer_norm_rms_epsilon"), 1e-6f);
@@ -731,6 +740,15 @@ void Model::load_hparams() {
     hp_.n_expert_used = gguf_u32(gguf_, k("expert_used_count"), 0);
     hp_.n_ff_exp      = gguf_u32(gguf_, k("expert_feed_forward_length"), 0);
     hp_.expert_weights_scale = gguf_f32(gguf_, k("expert_weights_scale"), 1.0f);
+    // Absent on the Qwen files, whose defaults (softmax, renormalised top-k, no
+    // dense lead) are what these fall back to.
+    hp_.expert_gating_func  = gguf_u32 (gguf_, k("expert_gating_func"), 1);
+    hp_.expert_weights_norm = gguf_bool(gguf_, k("expert_weights_norm"), true);
+    hp_.n_dense_lead        = gguf_u32 (gguf_, k("leading_dense_block_count"), 0);
+    if (hp_.expert_gating_func != 1 && hp_.expert_gating_func != 2) {
+        throw std::runtime_error("unsupported expert_gating_func = " +
+                                 std::to_string(hp_.expert_gating_func));
+    }
 
     // Gated DeltaNet
     hp_.ssm_d_inner = gguf_u32(gguf_, k("ssm.inner_size"), 0);
@@ -811,6 +829,8 @@ void Model::load_vocab() {
     vocab_.bos_id        = gguf_i32(gguf_, "tokenizer.ggml.bos_token_id", 151643);
     vocab_.eos_id        = gguf_i32(gguf_, "tokenizer.ggml.eos_token_id", 151645);
     vocab_.pad_id        = gguf_i32(gguf_, "tokenizer.ggml.padding_token_id", -1);
+    vocab_.add_bos       = gguf_bool(gguf_, "tokenizer.ggml.add_bos_token", false);
+    vocab_.pre           = gguf_str(gguf_, "tokenizer.ggml.pre", "");
     vocab_.chat_template = gguf_str(gguf_, "tokenizer.chat_template", "");
     if (hp_.n_vocab == 0) hp_.n_vocab = (uint32_t) vocab_.tokens.size();
 }
@@ -856,7 +876,8 @@ std::string Model::summary() const {
        << "n_layer       = " << hp_.n_layer << "\n"
        << "n_embd        = " << hp_.n_embd << "\n"
        << "n_ff          = " << hp_.n_ff << "\n"
-       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv << ")\n"
+       << "n_head        = " << hp_.n_head << " (kv=" << hp_.n_head_kv
+       << (hp_.n_head_l.empty() && hp_.n_head_kv_l.empty() ? "" : ", per-layer max") << ")\n"
        << "n_embd_head   = " << hp_.n_embd_head << "\n"
        << "n_ctx_train   = " << hp_.n_ctx_train << "\n"
        << "n_vocab       = " << hp_.n_vocab << "\n"
@@ -865,6 +886,11 @@ std::string Model::summary() const {
     if (hp_.is_moe()) {
         os << "n_expert      = " << hp_.n_expert << " (used=" << hp_.n_expert_used
            << ", ff_exp=" << hp_.n_ff_exp << ")\n";
+        if (hp_.gating_sigmoid() || hp_.n_dense_lead > 0 || !hp_.expert_weights_norm) {
+            os << "routing       = " << (hp_.gating_sigmoid() ? "sigmoid" : "softmax")
+               << (hp_.expert_weights_norm ? ", normalised" : ", unnormalised")
+               << ", " << hp_.n_dense_lead << " leading dense block(s)\n";
+        }
     }
     if (hp_.has_gdn) {
         os << "GDN: d_inner=" << hp_.ssm_d_inner << " n_group=" << hp_.ssm_n_group

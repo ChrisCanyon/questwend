@@ -1,14 +1,17 @@
 # third_party/ggml に載っているパッチ
 
 `third_party/ggml` は upstream の [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
-の `ggml/` を vendor したもの（コミットは `third_party/ggml/GGML_VERSION`）に、
-以下を適用した状態です。どちらも **qwencpp 固有**で、upstream に入る見込みは無いため
-再 vendor のたびに再適用が必要です。
+の `ggml/` を vendor したもの（コミットは `third_party/ggml/GGML_VERSION`）で、
+**現在 qwencpp 固有のパッチは無い**（upstream そのまま）。
 
-| # | パッチ | 内容 |
+2026-10-14 の再 vendor（`1b70350c9`）で、以前当てていた 2 本は不要になったため削除した:
+
+| # | 旧パッチ | 不要になった理由 |
 |---|---|---|
-| 01 | `01-qwencpp-metal-mmid-blocked.patch` | Metal `mm_id_map0` を expert ブロック単位ループに変更。expert キャッシュのスロットプールは `ne02` が threadgroup のスレッド上限を超えるため、upstream の `GGML_ASSERT(ne02 <= max_threads)` では動かない。`QWEN_METAL_MMID_MV=1` で mat-vec 経路に強制切替する A/B スイッチも含む |
-| 02 | `02-qwencpp-cuda-quiet-graph-logs.patch` | CUDA graph の `GGML_LOG_DEBUG` 3 行を削除（グラフキーごとに毎回出て自前のログを埋める） |
+| 01 | `01-qwencpp-metal-mmid-blocked.patch` | Metal `mm_id_map0` が expert 数 `ne02` > threadgroup 上限で assert する問題。upstream の `ggml_metal_op_mul_mat_id_use_mm` が `ne02 <= 1024` を条件に含むようになり、それを超える expert キャッシュのスロットプールは mat-vec 経路へ自動で回る。A/B スイッチ `QWEN_METAL_MMID_MV` は無くなった。**未検証**: pipeline のスレッド上限が 1024 未満で `ne02` がその間に入る場合は upstream の assert が残るので、Mac で一度確認すること |
+| 02 | `02-qwencpp-cuda-quiet-graph-logs.patch` | CUDA graph の DEBUG ログ。upstream が `ggml_cuda_graph_debug_enabled()` の下に入れたので既定では出ない |
+
+パッチを再び足すときは `patches/0N-*.patch` に置き、下の手順 3 で当てる。
 
 > サブ 1bit 量子化（`IQ1_XS` / `IQ1_XXS` / `IQ1_XXXS`）は **`iq1-narrow` ブランチ**に分けてあります。
 > 本家 llama.cpp に取り込まれたら、そのブランチを捨てて通常の再 vendor で拾えば済みます。

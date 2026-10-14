@@ -43,12 +43,12 @@ struct GpuPlan {
 };
 
 // Where a MoE model's routed experts live once they no longer fit in VRAM.
-// SSD is the default tier: the pages the run actually touches end up in the
-// OS page cache anyway, so a RAM copy of the same weights mostly buys a second
-// copy of them -- and it is the tier that lets a model larger than memory run
-// at all. RAM is worth asking for when the experts do fit in host memory and
-// the drive is slow (see docs/, --experts-ram).
-enum class ExpertTier { Ssd, Ram };
+// SSD streams them from the GGUF and lets a model larger than memory run at
+// all. RAM holds a pinned copy, which is what the CPU/GPU split decode needs
+// (a missed expert is computed on the CPU from it instead of fetched). Auto,
+// the default, takes RAM when the experts fit in the memory that is free with
+// room to spare, and SSD otherwise -- including when the RAM allocation fails.
+enum class ExpertTier { Ssd, Ram, Auto };
 
 struct RuntimeConfig {
     int    n_ctx          = 4096;
@@ -64,7 +64,7 @@ struct RuntimeConfig {
     std::vector<GpuPlan> gpus;
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
-    ExpertTier expert_tier = ExpertTier::Ssd;   // tier used when the experts must leave VRAM
+    ExpertTier expert_tier = ExpertTier::Auto;  // tier used when the experts must leave VRAM
     bool   use_mtp        = false;   // MTP self-speculative decode (keeps nextn block VRAM-resident)
     bool   embd_q8        = false;   // use Q8_0 (not F16) for token embedding fallback (saves VRAM)
 

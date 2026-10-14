@@ -150,14 +150,15 @@ free and streams whatever does not fit -- the routed experts -- straight from th
 disk. The typical case, a model larger than the machine's memory, needs no flags.
 
 ```bash
-# automatic: resident if the weights fit the free VRAM, SSD tier if they do not
+# automatic: resident if the weights fit the free VRAM; otherwise the experts go to
+# host RAM when they fit there (CPU/GPU split decode), else they stream from the SSD
 qw-cli -m moe.gguf -p "..." -n 128
 
 # an explicit budget (leave VRAM for other processes, divide it across GPUs, ...)
 qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
 
-# RAM tier: experts in pinned host RAM, streamed through the VRAM cache (PCIe)
-qw-cli -m moe.gguf -p "..." -n 128 --experts-ram
+# force a tier: ram (pinned host RAM) or ssd (stream from the GGUF)
+qw-cli -m moe.gguf -p "..." -n 128 --experts ram
 
 # residency profile: saved on the first run, then hot experts are preloaded at startup
 qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
@@ -174,11 +175,22 @@ qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
   stops before loading a single weight, naming what it needs, what is available and how much of
   it is KV at the current `--n-ctx`. If only the budget is exceeded and the device itself has
   room, it warns instead and says that nothing is left for the expert pool.
-- `--experts-ssd`: read the experts straight from the GGUF on disk (no RAM copy). **The
-  default tier**, so it rarely needs passing: the pages a run touches end up in the OS page
-  cache anyway, which makes a separate RAM copy of them mostly redundant.
-- `--experts-ram`: hold them in pinned host RAM instead. Worth it when they fit and the
-  drive is slow. Passing it together with `--experts-ssd` is an error.
+- `--experts <ram|ssd|auto>`: where the routed experts go once they do not fit in VRAM.
+  **`auto` is the default** and rarely needs overriding.
+  - `ram`: a pinned copy in host RAM. Decode then computes the experts missing from the
+    VRAM cache on the CPU instead of fetching them over PCIe (the CPU/GPU split decode,
+    tuned on the first decode tokens per GPU / CPU / model and remembered in
+    `%LOCALAPPDATA%\questwend\tune.tsv` or `~/.cache/questwend/tune.tsv`).
+  - `ssd`: stream the experts from the GGUF on disk. Needs no RAM, so it is the tier that
+    lets a model larger than the machine's memory run at all.
+  - `auto`: `ram` when the offloaded experts fit in the memory the OS reports as available
+    with room to spare (the larger of 4 GB or 10% of physical memory), `ssd` otherwise.
+    If the RAM tier's pinned allocation still fails, it falls back to `ssd`. The choice is
+    logged at startup (`expert tier: auto -> RAM ...`).
+  - Giving more than one value (`--experts ram --experts ssd`, or `ram` together with
+    `auto`) means `auto`, with a warning.
+- `--experts-ram` / `--experts-ssd`: **deprecated** spellings of `--experts ram` /
+  `--experts ssd`. Still accepted, with a warning pointing at the new form.
 - `--ngram <off|disk|ram>`: where qwen4exp keeps its n-gram embedding table (default `disk`).
   It is 26.8 GB in Qwen3.8-Flash-Next and **never goes on the GPU in any mode**.
   `off` skips the module entirely -- it is a gated additive branch onto the residual,
@@ -280,7 +292,7 @@ Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s
 | `--port <N>` | port (default 8080) |
 | `--n-ctx <N>` | context length |
 | `--vram-budget <GB>` | VRAM the model may use (default: whatever the device has free; GB, fractions ok, `M`/`G` suffix to be explicit) |
-| `--experts-ssd` / `--experts-ram` | where offloaded experts live (SSD by default; passing both is an error) |
+| `--experts <ram\|ssd\|auto>` | where offloaded experts live (default `auto`; `--experts-ram` / `--experts-ssd` are deprecated aliases) |
 | `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
 | `--cache-profile <file>` | residency profile (**the server only reads it**, never overwrites) |
 | `--reasoning <on\|off>` | default thinking mode (also reflected in the UI checkbox) |

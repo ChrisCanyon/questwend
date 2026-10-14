@@ -147,14 +147,15 @@ qw-cli -m model.gguf --info                  # モデル情報を表示して終
 SSD オフロードで動かす、という典型的な使い方にフラグは要らない。
 
 ```bash
-# 自動: 空き VRAM に収まればそのまま常駐、収まらなければ SSD 階層に落ちる
+# 自動: 空き VRAM に収まれば全常駐。収まらなければ、エキスパートが RAM に入るなら
+# RAM 階層（CPU/GPU 分担 decode）、入らなければ SSD 階層
 qw-cli -m moe.gguf -p "..." -n 128
 
 # 予算を明示（他のプロセスに VRAM を残す、複数 GPU に配分する、など）
 qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
 
-# RAM 階層: エキスパートを pinned host RAM に置いて VRAM キャッシュへ流す
-qw-cli -m moe.gguf -p "..." -n 128 --experts-ram
+# 階層を指定: ram（pinned host RAM）か ssd（GGUF から読む）
+qw-cli -m moe.gguf -p "..." -n 128 --experts ram
 
 # 常駐プロファイル: 1回目に保存、2回目以降は起動時にホットなエキスパートを事前常駐
 qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
@@ -169,10 +170,20 @@ qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
 - 必須部分（オフロードできない重み + KV）が入らないときは、重みをロードする前に必要量・利用可能量・
   内訳（`--n-ctx` ぶんの KV がいくらか）を挙げて止まる。予算だけを超えていてデバイスには載る場合は
   警告のみで続行し、エキスパートプールが取れないことを明示する。
-- `--experts-ssd`: エキスパートを GGUF からディスク直読（RAM コピーなし）。**既定の階層**なので
-  通常は指定不要。触ったページは OS のページキャッシュに乗るので、RAM コピーを別に持つ意味は薄い。
-- `--experts-ram`: 代わりに pinned host RAM に置く。エキスパートが RAM に収まり、かつドライブが
-  遅いときに効く。`--experts-ssd` と同時指定はエラー。
+- `--experts <ram|ssd|auto>`: VRAM に入りきらないエキスパートの置き場。**既定は `auto`** で、
+  通常は指定不要。
+  - `ram`: pinned host RAM にコピーを置く。decode では VRAM キャッシュに無いエキスパートを
+    PCIe で転送せず CPU で計算する（CPU/GPU 分担 decode。GPU・CPU・モデルごとに最初の decode
+    トークンで自動調整し、`%LOCALAPPDATA%\questwend\tune.tsv` または
+    `~/.cache/questwend/tune.tsv` に記憶）。
+  - `ssd`: GGUF からディスク直読。RAM を使わないので、マシンのメモリより大きいモデルも動かせる。
+  - `auto`: 退避するエキスパートが OS の報告する利用可能メモリに余裕を持って収まれば
+    （4 GB と物理メモリの 10% の大きい方を残す）`ram`、収まらなければ `ssd`。`ram` を選んでも
+    pinned 確保に失敗したら `ssd` に切り替える。判定は起動ログに出る（`expert tier: auto -> RAM ...`）。
+  - 複数の値を指定した場合（`--experts ram --experts ssd`、`ram` と `auto` の併用など）は、
+    警告を出して `auto` になる。
+- `--experts-ram` / `--experts-ssd`: `--experts ram` / `--experts ssd` の**非推奨**の書き方。
+  引き続き受け付けるが、新しい書き方を促す警告が出る。
 - `--ngram <off|disk|ram>`: qwen4exp の n-gram 埋め込みテーブルの置き場（既定 `disk`）。
   Qwen3.8-Flash-Next では 26.8 GB あり、**どのモードでも GPU には載せない**。
   `off` はモジュールごとスキップする（残差へのゲート付き加算ブランチなので、外してもスタックは動く）。
@@ -269,7 +280,7 @@ qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
 | `--port <N>` | ポート（既定 8080） |
 | `--n-ctx <N>` | コンテキスト長 |
 | `--vram-budget <GB>` | モデルが使ってよい VRAM（既定: 空き容量を自動取得。GB、小数可、`M`/`G` で明示指定） |
-| `--experts-ssd` / `--experts-ram` | エキスパートの退避先（既定 SSD。同時指定はエラー） |
+| `--experts <ram\|ssd\|auto>` | エキスパートの退避先（既定 `auto`。`--experts-ram` / `--experts-ssd` は非推奨の別名） |
 | `--gpus <list>` / `--gpu-split <list>` | 複数 GPU を使う（[複数 GPU](#複数-gpu) 参照） |
 | `--cache-profile <file>` | 常駐プロファイル（**サーバーは読み込みのみ**, 上書きしない） |
 | `--reasoning <on\|off>` | thinking モードの既定（UI のチェックにも反映） |

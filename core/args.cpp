@@ -37,8 +37,18 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
         const std::string v = next();
         o.reasoning = (v != "off" && v != "0" && v != "false");
     }
-    else if (a == "--experts-ssd")        o.experts_ssd_given = true;
-    else if (a == "--experts-ram")        o.experts_ram_given = true;
+    else if (a == "--experts-ssd")        o.experts_ssd_req = o.experts_ssd_legacy = true;
+    else if (a == "--experts-ram")        o.experts_ram_req = o.experts_ram_legacy = true;
+    else if (a == "--experts" && has_val) {
+        const std::string v = next();
+        if      (v == "ram")  o.experts_ram_req  = true;
+        else if (v == "ssd")  o.experts_ssd_req  = true;
+        else if (v == "auto") o.experts_auto_req = true;
+        else {
+            fprintf(stderr, "error: --experts takes ram, ssd or auto (got %s)\n", v.c_str());
+            return ArgResult::Error;
+        }
+    }
     else if (a == "--gpus" && has_val) {
         const std::string v = next();
         if (!parse_gpu_list(v, o.gpu_ids)) {
@@ -94,10 +104,21 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
 }
 
 bool validate_common_options(const CommonOptions & o) {
-    if (o.experts_ssd_given && o.experts_ram_given) {
-        fprintf(stderr, "error: --experts-ssd and --experts-ram name two different places for "
-                        "the same weights; pass one (SSD is the default)\n");
-        return false;
+    // The expert tier never refuses to start: an old spelling is pointed at the
+    // new one, and a contradiction falls back to auto -- out loud, so the run is
+    // not quietly something other than what was typed.
+    if (o.experts_ram_legacy)
+        fprintf(stderr, "warning: --experts-ram is deprecated; use --experts ram\n");
+    if (o.experts_ssd_legacy)
+        fprintf(stderr, "warning: --experts-ssd is deprecated; use --experts ssd\n");
+    if ((int) o.experts_ram_req + (int) o.experts_ssd_req + (int) o.experts_auto_req > 1) {
+        std::string asked;
+        if (o.experts_ram_req)  asked += " ram";
+        if (o.experts_ssd_req)  asked += " ssd";
+        if (o.experts_auto_req) asked += " auto";
+        fprintf(stderr, "warning: the expert tier was given more than one value (%s); "
+                        "using auto (RAM when the experts fit in free memory, else SSD)\n",
+                asked.c_str() + 1);
     }
     // On a lone GPU the "device off" reading of 0 has nowhere to move the model
     // to, so say so instead of silently treating it as "measure the free VRAM".
@@ -172,11 +193,17 @@ void print_common_help(FILE * out) {
         "                      becomes expert pool for the others.\n"
         "                      auto = every GPU present, share by free VRAM\n"
         "expert offload (MoE models whose weights exceed the budget; automatic):\n"
-        "  --experts-ssd       stream the routed experts from the GGUF on disk. The\n"
-        "                      default: it needs no RAM, and the pages the run\n"
-        "                      touches end up in the OS page cache anyway\n"
-        "  --experts-ram       hold them in host RAM instead. Worth it when they fit\n"
-        "                      and the drive is slow; fails to allocate when they do not\n"
+        "  --experts <where>   where the routed experts go: ram, ssd or auto (default)\n"
+        "                      ram: a pinned copy in host memory; decode then computes\n"
+        "                        VRAM-cache misses on the CPU from it (tuned per machine)\n"
+        "                      ssd: streamed from the GGUF; needs no RAM, so a model\n"
+        "                        larger than memory still runs\n"
+        "                      auto: ram when the experts fit in free RAM with room to\n"
+        "                        spare (and its allocation succeeds), ssd otherwise\n"
+        "                      Giving more than one value (e.g. ram and ssd, or ram and\n"
+        "                      auto) means auto, with a warning\n"
+        "  --experts-ram / --experts-ssd  deprecated spellings of --experts ram / ssd\n"
+        "                      (still accepted, with a warning)\n"
         "  --cache-profile <f> persist/prefetch the hot-expert profile for warm\n"
         "                      restarts (the server only ever reads the file)\n"
         "  --ngram <mode>      qwen4exp n-gram embedding: disk (default), ram or off.\n"

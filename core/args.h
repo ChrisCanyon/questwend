@@ -36,14 +36,18 @@ struct CommonOptions {
     bool                gpu_split_given = false;
     std::vector<size_t> vram_list;          // --vram-budget, one entry per GPU
 
-    // Expert tier. Neither flag is needed for the common case: with no
-    // --vram-budget the runtime measures what is free and offloads to the SSD
-    // whatever does not fit. The flags are recorded separately from the tier so
-    // that asking for both can be rejected instead of silently resolved.
-    bool experts_ssd_given = false;         // --experts-ssd
-    bool experts_ram_given = false;         // --experts-ram
+    // Expert tier: --experts ram|ssd|auto, with --experts-ram / --experts-ssd
+    // as spellings of the first two. Every request is recorded; one place asked
+    // for (any number of times) is that place, and anything else -- auto, or
+    // two different places -- is auto, which picks by free RAM.
+    bool experts_ram_req  = false;
+    bool experts_ssd_req  = false;
+    bool experts_auto_req = false;
+    bool experts_ram_legacy = false;        // --experts-ram (deprecated spelling)
+    bool experts_ssd_legacy = false;        // --experts-ssd (deprecated spelling)
     ExpertTier tier() const {
-        return experts_ram_given ? ExpertTier::Ram : ExpertTier::Ssd;
+        if (experts_auto_req || experts_ram_req == experts_ssd_req) return ExpertTier::Auto;
+        return experts_ram_req ? ExpertTier::Ram : ExpertTier::Ssd;
     }
 };
 

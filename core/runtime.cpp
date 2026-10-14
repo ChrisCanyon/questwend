@@ -8,6 +8,19 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#  include <sys/sysctl.h>
+#endif
+
 #include <memory>
 
 #include <algorithm>
@@ -26,6 +39,37 @@
 namespace questwend {
 
 static const int GRAPH_SIZE = 16384;
+
+// Physical memory the OS could hand out now (free plus what it would reclaim
+// without paging out, e.g. the page cache), and the machine's total. 0, 0 when
+// the platform cannot tell; the caller then keeps the SSD tier.
+static void host_memory(size_t & avail, size_t & total) {
+    avail = total = 0;
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) { avail = (size_t) ms.ullAvailPhys; total = (size_t) ms.ullTotalPhys; }
+#elif defined(__APPLE__)
+    int64_t mem = 0;
+    size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) total = (size_t) mem;
+    vm_statistics64_data_t vs;
+    mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS)
+        avail = (size_t) (vs.free_count + vs.inactive_count + vs.purgeable_count) * (size_t) vm_page_size;
+#else
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char key[64];
+        unsigned long long kb = 0;
+        while (fscanf(f, "%63s %llu kB", key, &kb) == 2) {
+            if (!strcmp(key, "MemTotal:"))     total = (size_t) kb * 1024;
+            if (!strcmp(key, "MemAvailable:")) avail = (size_t) kb * 1024;
+        }
+        fclose(f);
+    }
+#endif
+}
 
 // Prefill chunk length in tokens (--batch-chunk / QWEN_BATCH_CHUNK). The
 // batched prefill graph is the biggest one built, so this is also what bounds
@@ -1011,6 +1055,10 @@ void Runtime::Impl::init() {
     // Decide which device computes which layer before any weight is placed.
     plan_layers();
 
+    // An auto tier that picked RAM drops to SSD if the pinned buffers cannot
+    // be had after all, so the chain below may run twice.
+    for (bool load_again = true; load_again; ) {
+    load_again = false;
     if (use_expert_offload && ssd_mode) {
         // ---- SSD tier: experts stay on disk; non-expert weights -> GPU ----
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
@@ -1062,8 +1110,22 @@ void Runtime::Impl::init() {
         // expert → CPU (pinned).
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
         DevicePlan plan = device_plan();
-        model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs,
-                                 &plan, &dev_weight_bytes);
+        try {
+            model.load_weights_split(backend, cpu_buft, weights_bufs, expert_cpu_bufs,
+                                     &plan, &dev_weight_bytes);
+        } catch (const std::exception & e) {
+            if (cfg.expert_tier != ExpertTier::Auto) throw;
+            fprintf(stderr, "expert tier: RAM failed (%s); using the SSD tier\n", e.what());
+            for (auto b : weights_bufs)    if (b) ggml_backend_buffer_free(b);
+            for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
+            weights_bufs.clear();
+            expert_cpu_bufs.clear();
+            ggml_backend_free(cpu_backend);
+            cpu_backend = nullptr;
+            ssd_mode   = true;
+            load_again = true;
+            continue;
+        }
 
         // Create backend scheduler: GPUs first (higher priority, in plan order),
         // CPU last. The sched routes each op to the backend that owns its
@@ -1103,6 +1165,7 @@ void Runtime::Impl::init() {
     } else {
         weights_bufs.push_back(model.load_weights(backend));
     }
+    }   // load_again
 
     // fused flash attention on GPU (disable with QWEN_NO_FLASH)
     use_flash = cfg.use_cuda && getenv("QWEN_NO_FLASH") == nullptr;
@@ -1309,6 +1372,18 @@ void Runtime::Impl::plan_offload() {
     if (model.has_expert_tensors() && need > budget) {
         offload  = true;
         ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
+        if (cfg.expert_tier == ExpertTier::Auto) {
+            // RAM if the experts fit in what the OS could hand out now and still
+            // leave it room: the larger of 4 GB or a tenth of the machine.
+            size_t avail = 0, total = 0;
+            host_memory(avail, total);
+            const size_t exp_b  = model.offloaded_expert_bytes();
+            const size_t margin = std::max<size_t>(4ull << 30, total / 10);
+            ssd_mode = !(avail > 0 && exp_b + margin <= avail);
+            fprintf(stderr, "expert tier: auto -> %s (experts %zu MB, %zu MB of RAM available, "
+                            "keeping %zu MB free)\n",
+                    ssd_mode ? "SSD" : "RAM", exp_b >> 20, avail >> 20, margin >> 20);
+        }
     }
 
     // What the device has to hold whatever the tier decides: the weights that

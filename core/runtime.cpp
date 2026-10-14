@@ -282,8 +282,15 @@ struct Runtime::Impl {
         ggml_tensor  * sel = nullptr;
         ggml_tensor  * ids[3] = { nullptr, nullptr, nullptr };
         ggml_tensor  * w = nullptr;
+        // attention seg A only: the KV bucket it was built for, and its inputs
+        int            nkv = 0;
+        ggml_tensor  * pos = nullptr, * mask = nullptr, * kvidx = nullptr;
     };
     std::vector<HyGraph> hy_a, hy_b;
+    static const int HY_KV_BUCKET = 256;   // attention seg A is rebuilt once per bucket
+    ggml_fp16_t * pin_mask = nullptr;      // [n_ctx]
+    int32_t     * pin_pos  = nullptr;      // [4] (M-RoPE needs 4 per token)
+    int64_t     * pin_kvidx = nullptr;     // [1]
     static const int HY_CACHED = 1024;   // nodes per kept graph
     int32_t * pin_sel = nullptr, * pin_ids = nullptr;   // [n_used], [3*n_used]
     float   * pin_w = nullptr, * pin_gw = nullptr;      // [n_used], [n_used]
@@ -3618,7 +3625,7 @@ void Runtime::Impl::setup_cpu_miss() {
     cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
     {
         const size_t nu = hp.n_expert_used, ne = hp.n_embd;
-        const size_t bytes = (nu * 4 + nu * 3 + nu + ne * 2) * 4 + 256;
+        const size_t bytes = (nu * 4 + nu * 3 + nu + ne * 2) * 4 + (size_t) n_ctx * 2 + 4 * 4 + 8 + 512;
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
         if (!hb) hb = ggml_backend_get_default_buffer_type(cpu_backend);
@@ -3630,7 +3637,10 @@ void Runtime::Impl::setup_cpu_miss() {
         pin_w    = (float *)   p; p += nu * 4;
         pin_gw   = (float *)   p; p += nu * 4;
         pin_x    = (float *)   p; p += ne * 4;
-        pin_corr = (float *)   p;
+        pin_corr = (float *)   p; p += ne * 4;
+        pin_kvidx = (int64_t *) (((uintptr_t) p + 7) & ~(uintptr_t) 7); p = (char *) (pin_kvidx + 1);
+        pin_pos  = (int32_t *) p; p += 4 * 4;
+        pin_mask = (ggml_fp16_t *) p;
     }
     if (const char * r = getenv("QWEN_CPU_MISS_REFILL")) cm_refill = std::max(0, atoi(r));
     const int hw = std::max(1, (int) std::thread::hardware_concurrency());
@@ -4719,6 +4729,9 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // the hidden state. Seg A reads p_h + corr_in instead of p_h, which saves a
     // graph launch per layer; the sum reaches the residual carry from there.
     ggml_tensor * corr_in = nullptr;
+    // KV columns seg A attends over: n_kv, except while cpu_miss builds a kept
+    // graph, which is sized for a whole bucket and masks the unwritten rows.
+    int seg_nkv = n_kv;
     auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
         QsaShared qsa;
         const int n_head    = (int) hp.head_count(il);       // per-layer on step35
@@ -4728,7 +4741,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         if (!recurrent) {
             inp_pos  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rope_dim(1));
             ggml_set_input(inp_pos);  ggml_set_name(inp_pos, "inp_pos");
-            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, 1);
+            inp_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, seg_nkv, 1);
             ggml_set_input(inp_mask); ggml_set_name(inp_mask, "inp_mask");
         }
         ggml_tensor * res_hc = nullptr, * inject = nullptr;
@@ -4780,8 +4793,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
             ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
-                                             1, n_kv, n_past, qsa);
-            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, 1, n_kv);
+                                             1, seg_nkv, n_past, qsa);
+            ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, 1, seg_nkv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
         }
@@ -4910,6 +4923,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         std::vector<int>     refill_cand;   // this token's CPU experts (layer*n_expert+e)
         const int  HY_GRAPH  = 2048;        // throwaway segment graphs
         const bool can_cache = dump_layers.empty();
+        // QSA and the PLE n-gram rows carry their own per-token inputs
+        const bool can_cache_attn = can_cache && !hp.has_qsa() && !use_ple();
         if (hy_a.size() != (size_t) N) hy_a.assign((size_t) N, HyGraph{});
         if (hy_b.size() != (size_t) N * (n_used + 1)) hy_b.assign((size_t) N * (n_used + 1), HyGraph{});
         ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(be);
@@ -4984,6 +4999,47 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                     if (!ggml_gallocr_alloc_graph(g.galloc, g.gf))
                         throw std::runtime_error("decode_cached: cpu-miss seg A alloc failed");
                 }
+                gf = g.gf;
+                selected = g.sel;
+            } else if (can_cache_attn) {
+                // Attention: sized for the KV bucket, so it is rebuilt once per
+                // HY_KV_BUCKET tokens; position, mask and the KV write row are
+                // inputs (the write goes through set_rows, as in the resident
+                // decode graph). Rows past n_past are masked, and the KV cache
+                // is zeroed at reset, so the wider view changes nothing.
+                const int nb = std::min(n_ctx, (n_kv + HY_KV_BUCKET - 1) / HY_KV_BUCKET * HY_KV_BUCKET);
+                HyGraph & g = hy_a[(size_t) il];
+                if (g.gf && g.nkv != nb) {
+                    ggml_gallocr_free(g.galloc);
+                    ggml_free(g.ctx);
+                    g = HyGraph{};
+                }
+                if (!g.gf) {
+                    g.ctx   = new_ctx_n(HY_CACHED);
+                    g.gf    = ggml_new_graph_custom(g.ctx, HY_CACHED, false);
+                    g.kvidx = ggml_new_tensor_1d(g.ctx, GGML_TYPE_I64, 1);
+                    ggml_set_input(g.kvidx);
+                    const bool sv_p = persistent;
+                    ggml_tensor * sv_d = d_kvidx;
+                    persistent = true;  d_kvidx = g.kvidx;  seg_nkv = nb;
+                    g.sel = build_segA(g.ctx, g.gf, il);
+                    persistent = sv_p;  d_kvidx = sv_d;     seg_nkv = n_kv;
+                    g.pos  = ggml_graph_get_tensor(g.gf, "inp_pos");
+                    g.mask = ggml_graph_get_tensor(g.gf, "inp_mask");
+                    g.nkv  = nb;
+                    g.galloc = ggml_gallocr_new(gpu_buft);
+                    if (!g.pos || !g.mask || !ggml_gallocr_alloc_graph(g.galloc, g.gf))
+                        throw std::runtime_error("decode_cached: cpu-miss attention seg A alloc failed");
+                }
+                std::vector<int32_t> posv;
+                fill_rope_pos(posv, 1, mrope_next);
+                std::copy(posv.begin(), posv.end(), pin_pos);
+                const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+                for (int j = 0; j < nb; ++j) pin_mask[j] = j <= n_past ? z : ninf;
+                *pin_kvidx = n_past;
+                ggml_backend_tensor_set_async(be, g.pos,   pin_pos,   0, posv.size() * sizeof(int32_t));
+                ggml_backend_tensor_set_async(be, g.mask,  pin_mask,  0, (size_t) nb * sizeof(ggml_fp16_t));
+                ggml_backend_tensor_set_async(be, g.kvidx, pin_kvidx, 0, sizeof(int64_t));
                 gf = g.gf;
                 selected = g.sel;
             } else {

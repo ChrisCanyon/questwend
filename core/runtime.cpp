@@ -1169,6 +1169,30 @@ void Runtime::Impl::init() {
 
     // fused flash attention on GPU (disable with QWEN_NO_FLASH)
     use_flash = cfg.use_cuda && getenv("QWEN_NO_FLASH") == nullptr;
+    if (use_flash) {
+        // Every device must have a kernel for this head size: the CUDA backend
+        // aborts on one it lacks (e.g. 32 since the 2026-10 ggml) instead of
+        // declining the op. Ask with a stand-in node shaped like decode's.
+        const auto & hp0 = model.hparams();
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 8 + 256;
+        ip.no_alloc = true;
+        ggml_context * pctx = ggml_init(ip);
+        const int hd = (int) hp0.n_embd_head, nh = (int) hp0.n_head;
+        const int nkv = std::max(1, (int) hp0.n_head_kv);
+        ggml_tensor * q = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, hd, 1, nh);
+        ggml_tensor * k = ggml_new_tensor_3d(pctx, GGML_TYPE_F16, hd, 256, nkv);
+        ggml_tensor * v = ggml_new_tensor_3d(pctx, GGML_TYPE_F16, hd, 256, nkv);
+        ggml_tensor * m = ggml_new_tensor_2d(pctx, GGML_TYPE_F16, 256, 1);
+        ggml_tensor * fa = ggml_flash_attn_ext(pctx, q, k, v, m, 1.0f, 0.0f, 0.0f);
+        std::vector<ggml_backend_t> devs_used(gpus.begin(), gpus.end());
+        if (devs_used.empty()) devs_used.push_back(backend);
+        for (ggml_backend_t be : devs_used)
+            if (!ggml_backend_supports_op(be, fa)) use_flash = false;
+        ggml_free(pctx);
+        if (!use_flash)
+            fprintf(stderr, "flash attention: off (no kernel for head size %d on this device)\n", hd);
+    }
     if (getenv("QWEN_NO_REUSE")) reuse_graph = false;
 
     const auto & hp = model.hparams();
@@ -1744,6 +1768,9 @@ void Runtime::Impl::init_cache() {
         }
         c.buf = ggml_backend_alloc_ctx_tensors(c.ctx, gpus.empty() ? backend : gpus[d]);
         if (!c.buf) throw std::runtime_error("init_cache: failed to alloc carry buffer");
+        // cpu_miss scales a zero CPU sum by a layer's inject weights before that
+        // layer has written them: zero, not garbage, keeps 0 * NaN out of it
+        ggml_backend_buffer_clear(c.buf, 0);
     }
     use_carry(0);
 
@@ -3708,7 +3735,7 @@ void Runtime::Impl::setup_cpu_miss() {
     const char * env  = getenv("QWEN_CPU_MISS");
     const std::string mode = env ? env : "auto";
     if (mode == "0" || !ecache) return;
-    const bool eligible = !ssd_mode && cpu_backend && gpus.size() <= 1 && !hp.has_hc();
+    const bool eligible = !ssd_mode && cpu_backend && gpus.size() <= 1;
     if (!eligible) {
         if (mode != "auto")
             fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
@@ -4820,6 +4847,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // the hidden state. Seg A reads p_h + corr_in instead of p_h, which saves a
     // graph launch per layer; the sum reaches the residual carry from there.
     ggml_tensor * corr_in = nullptr;
+    // With hyper-connections the CPU sum reaches the residual the way any FFN
+    // output does, scattered over the streams by its layer's inject weights
+    // (combine is linear in the block output), so it needs those weights too.
+    ggml_tensor * corr_inj = nullptr;
     // KV columns seg A attends over: n_kv, except while cpu_miss builds a kept
     // graph, which is sized for a whole bucket and masks the unwritten rows.
     int seg_nkv = n_kv;
@@ -4839,6 +4870,9 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         ggml_tensor * cur;
         if (hc_on) {
             res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+            if (corr_in && corr_inj)
+                res_hc = build_hc_combine(ctx, res_hc, ggml_reshape_2d(ctx, corr_in, n_embd, 1),
+                                          ggml_reshape_2d(ctx, corr_inj, n_hc, 1));
             if (p_ple && hp.is_ple(il)) {
                 res_hc = build_ple(ctx, gf, il, res_hc, p_ple, 1);
             }
@@ -5040,10 +5074,16 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         upload_corr(false);
 
         // seg B: the resident experts (+ shared expert) + residual -> p_h
+        // hc: the block output is scattered over the residual streams by this
+        // layer's inject weights instead of added to one residual. A layer with
+        // no resident experts and no shared expert then has nothing to do.
+        auto has_B = [&](int il, int nr) {
+            return !hc_on || nr > 0 || Wopt("blk.%d.ffn_up_shexp.weight", il) != nullptr;
+        };
         auto build_B = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int nr, HyGraph & g) {
             ExpertCache * ec = ec_of(il);
             ggml_tensor * ffn_l = carry_ffn(il);
-            ggml_tensor * h_new = carry_res(il);
+            ggml_tensor * h_new = hc_on ? nullptr : carry_res(il);   // hc: the block output alone
             if (nr > 0) {
                 for (int r = 0; r < 3; ++r) {
                     g.ids[r] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nr, 1);
@@ -5058,7 +5098,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 ggml_tensor * ex   = ggml_mul_mat_id(ctx, ec->down(il), act, g.ids[2]);   // [n_embd, nr, 1]
                 ggml_tensor * et   = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, ex, n_embd, nr)));
                 ggml_tensor * moe  = ggml_mul_mat(ctx, et, g.w);                          // [n_embd, 1]
-                h_new = ggml_add(ctx, ggml_reshape_1d(ctx, moe, n_embd), h_new);
+                h_new = h_new ? ggml_add(ctx, ggml_reshape_1d(ctx, moe, n_embd), h_new)
+                              : ggml_reshape_1d(ctx, moe, n_embd);
             }
             if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
                 ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
@@ -5067,7 +5108,14 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                                                 ggml_mul(ctx, ggml_silu(ctx, gt), u));
                 if (ggml_tensor * gw_sh = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
                     sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw_sh, ffn_l)));
-                h_new = ggml_add(ctx, h_new, sh);
+                h_new = h_new ? ggml_add(ctx, h_new, ggml_reshape_1d(ctx, sh, n_embd))
+                              : ggml_reshape_1d(ctx, sh, n_embd);
+            }
+            if (hc_on) {
+                ggml_tensor * res_hc = ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1);
+                h_new = build_hc_combine(ctx, res_hc, ggml_reshape_2d(ctx, h_new, n_embd, 1),
+                                         ggml_reshape_2d(ctx, carry_inj(il), n_hc, 1));
+                h_new = ggml_reshape_2d(ctx, h_new, n_embd, n_hc);
             }
             ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, p_h));
         };
@@ -5079,7 +5127,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             ggml_context * tctx = nullptr;
             ggml_cgraph  * gf   = nullptr;
             ggml_tensor  * selected = nullptr;
-            corr_in = hc_on ? nullptr : p_corr;
+            corr_in  = p_corr;
+            // the previous layer's inject (same parity as il-1; at il 0 the
+            // CPU sum is zero, and the buffer was zeroed at allocation)
+            corr_inj = hc_on ? carry_inj(il + 1) : nullptr;
             if (can_cache && hp.is_recurrent(il)) {
                 HyGraph & g = hy_a[(size_t) il];
                 if (!g.gf) {
@@ -5140,7 +5191,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 run(tctx, gf, 0);
                 set_attn_inputs(gf);
             }
-            corr_in = nullptr;
+            corr_in = corr_inj = nullptr;
             // seg A and the readbacks it feeds, queued; one wait for all of it
             if (ggml_backend_graph_compute_async(be, gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached: seg A compute failed");
@@ -5184,9 +5235,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 
             // ---- seg B on the GPU, async ----
             const int nr = (int) gsg.size();
+            const bool do_B = has_B(il, nr);
             HyGraph   tmp;
             HyGraph * gb = &tmp;
-            if (can_cache) {
+            if (!do_B) {
+                // hc, no resident and no shared expert: the residual stays as is
+            } else if (can_cache) {
                 HyGraph & g = hy_b[(size_t) il * (n_used + 1) + nr];
                 if (!g.gf) {
                     g.ctx = new_ctx_n(HY_CACHED);
@@ -5203,7 +5257,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 build_B(tctx, tmp.gf, il, nr, tmp);
                 run(tctx, tmp.gf, 0);
             }
-            if (nr > 0) {
+            if (do_B && nr > 0) {
                 std::copy(gsg.begin(), gsg.end(), pin_ids);
                 std::copy(gsu.begin(), gsu.end(), pin_ids + n_used);
                 std::copy(gsd.begin(), gsd.end(), pin_ids + 2 * n_used);
@@ -5213,7 +5267,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 ggml_backend_tensor_set_async(be, gb->ids[2], pin_ids + 2 * n_used, 0, (size_t) nr * sizeof(int32_t));
                 ggml_backend_tensor_set_async(be, gb->w,      pin_gw,               0, (size_t) nr * sizeof(float));
             }
-            if (ggml_backend_graph_compute_async(be, gb->gf) != GGML_STATUS_SUCCESS)
+            if (do_B && ggml_backend_graph_compute_async(be, gb->gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached: cpu-miss seg B failed");
             cm_b_ms += ms_since(t0);
 
@@ -5234,7 +5288,14 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         if (corr_dirty) {
             ggml_context * ctx = new_ctx_n(HY_GRAPH);
             ggml_cgraph * gf = ggml_new_graph_custom(ctx, HY_GRAPH, false);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_h, p_corr), p_h));
+            if (hc_on) {
+                ggml_tensor * h = build_hc_combine(ctx, ggml_reshape_3d(ctx, p_h, n_embd, n_hc, 1),
+                                                   ggml_reshape_2d(ctx, p_corr, n_embd, 1),
+                                                   ggml_reshape_2d(ctx, carry_inj(N - 1), n_hc, 1));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_reshape_2d(ctx, h, n_embd, n_hc), p_h));
+            } else {
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_h, p_corr), p_h));
+            }
             run(ctx, gf, 0);
             compute(gf, 0, "cpu-miss add failed");
             ggml_free(ctx);

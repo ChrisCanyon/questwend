@@ -374,14 +374,25 @@ int main(int argc, char ** argv) {
             smp.prime(ids);   // repetition-penalty window (prompt tail)
             int generated = 0;
             auto tg0 = clk::now();
+            // QWEN_STEP_LOGITS=<file>: every generated step's sampled token and
+            // full logits, one line each, so two decode paths can be diffed up
+            // to the step where their sampled tokens part.
+            FILE * step_f = nullptr;
+            if (const char * p = getenv("QWEN_STEP_LOGITS")) step_f = fopen(p, "w");
             for (int t = 0; t < max_tokens; ++t) {
                 int next = smp.sample(logits);
                 smp.accept(next);
+                if (step_f) {
+                    fprintf(step_f, "%d", next);
+                    for (float v : logits) fprintf(step_f, " %.6g", v);
+                    fputc('\n', step_f);
+                }
                 if (is_stop(next)) break;
                 std::cout << tok.decode(next) << std::flush;
                 ++generated;
                 logits = rt.decode({ next });
             }
+            if (step_f) fclose(step_f);
             double gen_s = secs(clk::now() - tg0);
             std::cout << std::endl;
             if (log_speed) {

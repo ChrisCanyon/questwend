@@ -267,7 +267,6 @@ struct Runtime::Impl {
     // CPU matmul. Every selected expert is still computed with its own weight,
     // so the result is the same model, not an approximation.
     bool           cpu_miss   = false;
-    ggml_gallocr_t cpu_galloc = nullptr;      // CPU-side expert graphs
     // Pinned staging for the per-layer host<->GPU traffic, so those copies can
     // be queued on the stream (cudaMemcpyAsync is only async from pinned
     // memory) and a layer pays one synchronisation instead of one per copy.
@@ -287,6 +286,14 @@ struct Runtime::Impl {
         ggml_tensor  * pos = nullptr, * mask = nullptr, * kvidx = nullptr;
     };
     std::vector<HyGraph> hy_a, hy_b;
+    // kept CPU expert graphs, per (layer, number of CPU experts)
+    struct CpuGraph {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph  * gf  = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        ggml_tensor  * xin = nullptr, * idt = nullptr, * wt = nullptr, * res = nullptr;
+    };
+    std::vector<CpuGraph> cpu_g;
     static const int HY_KV_BUCKET = 256;   // attention seg A is rebuilt once per bucket
     ggml_fp16_t * pin_mask = nullptr;      // [n_ctx]
     int32_t     * pin_pos  = nullptr;      // [4] (M-RoPE needs 4 per token)
@@ -571,13 +578,16 @@ struct Runtime::Impl {
         // expert_cpu_bufs and weights_bufs are owned here (not by Model) in
         // split/ssd mode; in single-backend mode Model owns and frees the weights.
         for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
-        if (cpu_galloc)     ggml_gallocr_free(cpu_galloc);
         if (hy_pin)         ggml_backend_buffer_free(hy_pin);
         for (auto * v : { &hy_a, &hy_b })
             for (auto & g : *v) {
                 if (g.galloc) ggml_gallocr_free(g.galloc);
                 if (g.ctx)    ggml_free(g.ctx);
             }
+        for (auto & g : cpu_g) {
+            if (g.galloc) ggml_gallocr_free(g.galloc);
+            if (g.ctx)    ggml_free(g.ctx);
+        }
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
@@ -3580,35 +3590,42 @@ void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32
     out.assign(n_embd, 0.0f);
     if (n == 0) return;
 
-    ggml_init_params gp{};
-    gp.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false);
-    gp.no_alloc = true;
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+    // One kept graph per (layer, expert count), like the GPU segments: built
+    // and allocated once, only its three inputs change.
+    const int n_used = (int) hp.n_expert_used;
+    if (cpu_g.size() != (size_t) hp.n_layer * (n_used + 1)) cpu_g.assign((size_t) hp.n_layer * (n_used + 1), CpuGraph{});
+    CpuGraph & g = cpu_g[(size_t) il * (n_used + 1) + n];
+    if (!g.gf) {
+        ggml_init_params gp{};
+        gp.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false);
+        gp.no_alloc = true;
+        g.ctx = ggml_init(gp);
+        g.gf  = ggml_new_graph_custom(g.ctx, 64, false);
 
-    ggml_tensor * xin = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, 1, 1);
-    ggml_tensor * idt = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n, 1);
-    ggml_tensor * wt  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
-    ggml_set_input(xin); ggml_set_input(idt); ggml_set_input(wt);
+        g.xin = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, n_embd, 1, 1);
+        g.idt = ggml_new_tensor_2d(g.ctx, GGML_TYPE_I32, n, 1);
+        g.wt  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n, 1);
+        ggml_set_input(g.xin); ggml_set_input(g.idt); ggml_set_input(g.wt);
 
-    ggml_tensor * up   = ggml_mul_mat_id(ctx, W("blk.%d.ffn_up_exps.weight",   il), xin, idt);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx, W("blk.%d.ffn_gate_exps.weight", il), xin, idt);
-    ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);                     // [ff_exp, n, 1]
-    ggml_tensor * experts = ggml_mul_mat_id(ctx, W("blk.%d.ffn_down_exps.weight", il), act, idt); // [n_embd, n, 1]
-    ggml_tensor * et  = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, experts, n_embd, n)));
-    ggml_tensor * res = ggml_mul_mat(ctx, et, wt);                             // [n_embd, 1]
-    ggml_set_output(res);
-    ggml_build_forward_expand(gf, res);
+        ggml_tensor * up   = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_up_exps.weight",   il), g.xin, g.idt);
+        ggml_tensor * gate = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_gate_exps.weight", il), g.xin, g.idt);
+        ggml_tensor * act  = ggml_swiglu_split(g.ctx, gate, up);                   // [ff_exp, n, 1]
+        ggml_tensor * experts = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_down_exps.weight", il), act, g.idt); // [n_embd, n, 1]
+        ggml_tensor * et  = ggml_cont(g.ctx, ggml_transpose(g.ctx, ggml_reshape_2d(g.ctx, experts, n_embd, n)));
+        g.res = ggml_mul_mat(g.ctx, et, g.wt);                                    // [n_embd, 1]
+        ggml_set_output(g.res);
+        ggml_build_forward_expand(g.gf, g.res);
 
-    if (!ggml_gallocr_alloc_graph(cpu_galloc, gf))
-        throw std::runtime_error("cpu_experts: gallocr alloc failed");
-    ggml_backend_tensor_set(xin, x, 0, (size_t) n_embd * sizeof(float));
-    ggml_backend_tensor_set(idt, ids.data(), 0, (size_t) n * sizeof(int32_t));
-    ggml_backend_tensor_set(wt,  w.data(),   0, (size_t) n * sizeof(float));
-    if (ggml_backend_graph_compute(cpu_backend, gf) != GGML_STATUS_SUCCESS)
+        g.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+        if (!ggml_gallocr_alloc_graph(g.galloc, g.gf))
+            throw std::runtime_error("cpu_experts: gallocr alloc failed");
+    }
+    ggml_backend_tensor_set(g.xin, x, 0, (size_t) n_embd * sizeof(float));
+    ggml_backend_tensor_set(g.idt, ids.data(), 0, (size_t) n * sizeof(int32_t));
+    ggml_backend_tensor_set(g.wt,  w.data(),   0, (size_t) n * sizeof(float));
+    if (ggml_backend_graph_compute(cpu_backend, g.gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("cpu_experts: compute failed");
-    ggml_backend_tensor_get(res, out.data(), 0, (size_t) n_embd * sizeof(float));
-    ggml_free(ctx);
+    ggml_backend_tensor_get(g.res, out.data(), 0, (size_t) n_embd * sizeof(float));
 }
 
 void Runtime::Impl::setup_cpu_miss() {
@@ -3622,7 +3639,6 @@ void Runtime::Impl::setup_cpu_miss() {
             fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
         return;
     }
-    cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
     {
         const size_t nu = hp.n_expert_used, ne = hp.n_embd;
         const size_t bytes = (nu * 4 + nu * 3 + nu + ne * 2) * 4 + (size_t) n_ctx * 2 + 4 * 4 + 8 + 512;

@@ -172,6 +172,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     for (auto & s : sigs) total_bytes += s.slab * (size_t) s.n_layers * n_expert;
     double frac = total_bytes ? (double) vram_avail_bytes / (double) total_bytes : 1.0;
     if (frac > 1.0) frac = 1.0;
+    frac_ = frac;
 
     ggml_init_params p{};
     p.mem_size = ggml_tensor_overhead() * sigs.size() + 256;

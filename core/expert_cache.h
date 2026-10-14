@@ -73,6 +73,8 @@ public:
 
     int n_expert() const { return n_expert_; }
     int min_slots() const;   // smallest pool capacity (bounds a safe prefill batch)
+    // Fraction of all routed-expert bytes the VRAM pools can hold (0..1).
+    double resident_fraction() const { return frac_; }
     // Slot capacity serving `layer` (min over roles): one ensure() call must not
     // reference more distinct experts than this, or it evicts its own slots.
     int capacity(int layer) const;
@@ -177,6 +179,7 @@ private:
 
     Model &        model_;
     ggml_backend_t backend_ = nullptr;   // GPU backend (for async H2D on its stream)
+    double         frac_ = 1.0;          // resident fraction (see resident_fraction())
     bool           async_fetch_ = true;  // overlap RAM-tier H2D with host work
     ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;

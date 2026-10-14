@@ -18,6 +18,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <filesystem>
+#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -275,6 +277,29 @@ struct Runtime::Impl {
     // copy of its FFN input `x`, summed into `out` [n_embd] on the CPU.
     void cpu_experts(int il, const float * x, const std::vector<int32_t> & ids,
                      const std::vector<float> & w, std::vector<float> & out);
+    // Decide cpu_miss from QWEN_CPU_MISS (0 / 1 / auto, the default): auto
+    // times one expert's PCIe fetch against computing it on the CPU at a few
+    // thread counts, on this machine and this model, and picks from that.
+    void setup_cpu_miss();
+
+    // ---- cpu_miss online tuning ----
+    // Startup timings cannot see the main thread losing its core to the CPU
+    // workers, nor the normal path's cache warming up, so the decision is made
+    // on real decode tokens: each candidate (0 = hybrid off, t = hybrid with t
+    // threads) runs WIN tokens, ROUNDS times interleaved so the slow drift of a
+    // growing context cancels, and the fastest is kept and saved.
+    struct CmTune {
+        bool                active = false;
+        std::vector<int>    cfgs;
+        std::vector<double> sum;
+        std::vector<int>    cnt;
+        int idx = 0, n = 0, round = 0;
+        static const int WIN = 16, SKIP = 3, ROUNDS = 2;
+        std::string key;
+    } cm_tune;
+    void cm_apply(int cfg);
+    void cm_tune_record(double ms);
+    static std::string tune_file();
 
     // Phase B v2-fast: optimistic single-graph decode over the VRAM cache.
     // One persistent (CUDA-graph friendly) graph runs the whole token; per-layer
@@ -1604,30 +1629,6 @@ void Runtime::Impl::init_cache() {
     }
     use_carry(0);
 
-    // CPU/GPU split decode: needs the experts' host copy (RAM tier, not SSD) and
-    // one device (the carries and the CPU result live on the primary).
-    if (const char * e = getenv("QWEN_CPU_MISS")) {
-        if (atoi(e) != 0) {
-            if (ssd_mode || !cpu_backend || gpus.size() > 1 || hp.has_hc()) {
-                fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
-            } else {
-                cpu_miss   = true;
-                cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
-                // Few threads: the main thread issues every GPU segment, and
-                // workers spinning between expert graphs starve it. A quarter of
-                // the logical CPUs measured best on an 8C/16T i7-7820X (3050 and
-                // 4060 Ti, LFM2.5-24B): 3 -> 20.9, 4 -> 22.4, 5 -> 21.2 tok/s.
-                int nth = cfg.n_threads > 0 ? cfg.n_threads
-                        : std::max(1, (int) std::thread::hardware_concurrency() / 4);
-                if (const char * t = getenv("QWEN_CPU_MISS_THREADS")) nth = std::max(1, atoi(t));
-                ggml_backend_cpu_set_n_threads(cpu_backend, nth);
-                if (const char * r = getenv("QWEN_CPU_MISS_REFILL")) cm_refill = std::max(0, atoi(r));
-                fprintf(stderr, "cpu-miss decode: non-resident experts are computed on the CPU "
-                                "(%d threads, refill %d/token)\n", nth, cm_refill);
-            }
-        }
-    }
-
     // Model-wide tables for the fused single-graph path. That graph is planned
     // by a scheduler, which copies these to whichever device needs them, so one
     // copy on the primary is enough.
@@ -1657,6 +1658,10 @@ void Runtime::Impl::init_cache() {
     sel_host.assign((size_t) n_used * hp.n_layer, 0);
     resmask_host.assign((size_t) hp.n_layer * hp.n_expert, 0.0f);
     want_host.assign((size_t) n_used * hp.n_layer, 0);
+
+    // CPU/GPU split decode: needs the experts' host copy (RAM tier, not SSD) and
+    // one device (the carries and the CPU result live on the primary).
+    setup_cpu_miss();
 
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
     if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
@@ -3573,6 +3578,268 @@ void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32
     ggml_free(ctx);
 }
 
+void Runtime::Impl::setup_cpu_miss() {
+    const auto & hp = model.hparams();
+    const char * env  = getenv("QWEN_CPU_MISS");
+    const std::string mode = env ? env : "auto";
+    if (mode == "0" || !ecache) return;
+    const bool eligible = !ssd_mode && cpu_backend && gpus.size() <= 1 && !hp.has_hc();
+    if (!eligible) {
+        if (mode != "auto")
+            fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
+        return;
+    }
+    cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    if (const char * r = getenv("QWEN_CPU_MISS_REFILL")) cm_refill = std::max(0, atoi(r));
+    const int hw = std::max(1, (int) std::thread::hardware_concurrency());
+    int forced_threads = cfg.n_threads > 0 ? cfg.n_threads : 0;
+    if (const char * t = getenv("QWEN_CPU_MISS_THREADS")) forced_threads = std::max(1, atoi(t));
+
+    if (mode != "auto") {
+        // Few threads: the main thread issues every GPU segment, and workers
+        // spinning between expert graphs starve it (a quarter of the logical
+        // CPUs measured best on an 8C/16T i7-7820X).
+        const int nth = forced_threads > 0 ? forced_threads : std::max(1, hw / 4);
+        ggml_backend_cpu_set_n_threads(cpu_backend, nth);
+        cpu_miss = true;
+        fprintf(stderr, "cpu-miss decode: on (forced; %d threads, refill %d/token)\n", nth, cm_refill);
+        return;
+    }
+
+    // A previous run on this GPU, CPU, model and memory budget already tuned
+    // it: start there. QWEN_TUNE=redo tunes again.
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        const std::string path = model.path();
+        char key[512];
+        snprintf(key, sizeof(key), "%s|cpus %d|%s|res %d%%|refill %d",
+                 dev ? ggml_backend_dev_description(dev) : "?", hw,
+                 path.substr(path.find_last_of("/\\") + 1).c_str(),
+                 (int) (ecache->resident_fraction() * 20 + 0.5) * 5, cm_refill);
+        cm_tune.key = key;
+    }
+    const char * tune_env = getenv("QWEN_TUNE");
+    const bool   redo     = tune_env && std::string(tune_env) == "redo";
+    if (!redo && !forced_threads) {
+        std::ifstream f(tune_file());
+        std::string line;
+        while (std::getline(f, line)) {
+            const size_t tab = line.rfind('\t');
+            if (tab == std::string::npos || line.compare(0, tab, cm_tune.key) != 0 ||
+                tab != cm_tune.key.size()) continue;
+            cm_apply(atoi(line.c_str() + tab + 1));
+            fprintf(stderr, "cpu-miss decode: %s (tuned earlier for this machine and model; "
+                            "QWEN_TUNE=redo to re-tune)\n",
+                    cpu_miss ? (std::to_string(atoi(line.c_str() + tab + 1)) + " threads").c_str() : "off");
+            return;
+        }
+    }
+
+    // ---- calibration: one representative MoE layer, this machine ----
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    int il0 = -1;
+    for (int il = 0; il < (int) hp.n_main(); ++il) if (hp.is_moe_layer(il)) { il0 = il; break; }
+    if (il0 < 0) return;
+    ggml_tensor * te[3] = { W("blk.%d.ffn_gate_exps.weight", il0), W("blk.%d.ffn_up_exps.weight", il0),
+                            W("blk.%d.ffn_down_exps.weight", il0) };
+    size_t slab = 0;
+    for (auto * t : te) slab += t->nb[2];
+    const int n_exp = (int) hp.n_expert, n_used = (int) hp.n_expert_used;
+    const auto tc0 = clk::now();
+
+    // (1) PCIe: one expert's three slabs, pinned host -> VRAM, synchronously,
+    //     which is what a decode-time miss costs on the critical path
+    double fetch_ms = 0.0;
+    {
+        ggml_init_params ip{};
+        ip.mem_size = ggml_tensor_overhead() * 2 + 256;
+        ip.no_alloc = true;
+        ggml_context * sctx = ggml_init(ip);
+        ggml_tensor * dst = ggml_new_tensor_1d(sctx, GGML_TYPE_I8, (int64_t) slab);
+        ggml_backend_buffer_t sbuf = ggml_backend_alloc_ctx_tensors(sctx, backend);
+        if (!sbuf) { ggml_free(sctx); return; }
+        const int n_t = std::min(16, n_exp);
+        auto copy_one = [&](int e) {
+            size_t off = 0;
+            for (auto * t : te) {
+                ggml_backend_tensor_set(dst, (const char *) t->data + (size_t) e * t->nb[2], off, t->nb[2]);
+                off += t->nb[2];
+            }
+        };
+        copy_one(0); copy_one(1);   // warm
+        const auto t0 = clk::now();
+        for (int e = 0; e < n_t; ++e) copy_one(e);
+        ggml_backend_synchronize(backend);
+        fetch_ms = ms(t0, clk::now()) / n_t;
+        ggml_backend_buffer_free(sbuf);
+        ggml_free(sctx);
+    }
+
+    // (2) the GPU round trip hybrid adds per MoE layer: one more small graph,
+    //     launched and waited for, plus the readbacks of the selection
+    double rt_ms = 0.0;
+    {
+        std::vector<double> v;
+        for (int r = 0; r < 12; ++r) {
+            ggml_init_params gp{};
+            gp.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false);
+            gp.no_alloc = true;
+            ggml_context * ctx = ggml_init(gp);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_corr, p_corr), p_corr));
+            const auto t0 = clk::now();
+            if (!ggml_gallocr_alloc_graph(cache_gallocs[0], gf)) { ggml_free(ctx); return; }
+            ggml_backend_graph_compute(backend, gf);
+            float probe[4];
+            ggml_backend_tensor_get(p_corr, probe, 0, sizeof(probe));
+            v.push_back(ms(t0, clk::now()));
+            ggml_free(ctx);
+        }
+        rt_ms = median(v);
+        std::vector<float> zero(hp.n_embd, 0.0f);
+        ggml_backend_tensor_set(p_corr, zero.data(), 0, zero.size() * sizeof(float));
+    }
+
+    // (3) CPU: the routed experts of one layer at a few thread counts. A layer
+    //     typically hands the CPU a couple of experts, so time n_used/2 of them.
+    const int k = std::max(1, n_used / 2);
+    std::vector<float> x(hp.n_embd), out;
+    for (int i = 0; i < (int) hp.n_embd; ++i) x[i] = 0.01f * (float) ((i * 37) % 101 - 50);
+    std::vector<int32_t> ids(k);
+    std::vector<float> w(k, 1.0f / k);
+    for (int i = 0; i < k; ++i) ids[i] = (i * 7) % n_exp;
+    std::vector<int> cand;
+    for (int t : { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 }) if (t <= hw) cand.push_back(t);
+    std::vector<double> cpu_ms(cand.size());
+    for (size_t c = 0; c < cand.size(); ++c) {
+        ggml_backend_cpu_set_n_threads(cpu_backend, cand[c]);
+        cpu_experts(il0, x.data(), ids, w, out);   // warm (allocator, threads)
+        std::vector<double> v;
+        for (int r = 0; r < 7; ++r) {
+            const auto t0 = clk::now();
+            cpu_experts(il0, x.data(), ids, w, out);
+            v.push_back(ms(t0, clk::now()));
+        }
+        cpu_ms[c] = median(v);
+    }
+    size_t best = 0;
+    for (size_t c = 1; c < cand.size(); ++c) if (cpu_ms[c] < cpu_ms[best]) best = c;
+    // the fewest threads within 10% of the fastest: workers beyond that only
+    // compete with the main thread
+    size_t pick = best;
+    for (size_t c = 0; c < cand.size(); ++c) if (cpu_ms[c] <= 1.10 * cpu_ms[best]) { pick = c; break; }
+    const int    nth          = forced_threads > 0 ? forced_threads : cand[pick];
+    // judged at the thread count decode can actually afford (see below)
+    size_t q = 0;
+    for (size_t c = 0; c < cand.size(); ++c) if (cand[c] <= std::max(1, hw / 4)) q = c;
+    const double cpu_per_exp  = cpu_ms[q] / k;
+    const double frac         = ecache->resident_fraction();
+
+    fprintf(stderr, "cpu-miss calibration (%.0f ms): fetch %.3f ms/expert (%.1f GB/s), "
+                    "GPU round trip %.3f ms, CPU %d experts:",
+            ms(tc0, clk::now()), fetch_ms, slab / (fetch_ms * 1e6), rt_ms, k);
+    for (size_t c = 0; c < cand.size(); ++c) fprintf(stderr, " %dT %.3f", cand[c], cpu_ms[c]);
+    fprintf(stderr, " ms; resident %.0f%%\n", 100.0 * frac);
+
+    // These isolated timings only rule the CPU out: when computing an expert is
+    // clearly slower than fetching it, nothing on the real decode path can make
+    // up for it. Otherwise the choice -- and the thread count, which these
+    // numbers get wrong (they reward every core, decode wants few) -- is made
+    // on real tokens by the online tuner.
+    (void) nth;
+    if (cpu_per_exp > 1.5 * fetch_ms) {
+        cm_apply(0);
+        fprintf(stderr, "cpu-miss decode: off (CPU %.3f vs fetch %.3f ms/expert)\n", cpu_per_exp, fetch_ms);
+        return;
+    }
+    if (tune_env && std::string(tune_env) == "0") {   // no tuning: keep the plain path
+        cm_apply(0);
+        return;
+    }
+    cm_tune.cfgs = { 0 };
+    for (int t : { hw / 8, hw / 4, (3 * hw) / 8 }) {
+        if (forced_threads > 0) t = forced_threads;
+        t = std::max(1, t);
+        if (std::find(cm_tune.cfgs.begin(), cm_tune.cfgs.end(), t) == cm_tune.cfgs.end())
+            cm_tune.cfgs.push_back(t);
+    }
+    cm_tune.sum.assign(cm_tune.cfgs.size(), 0.0);
+    cm_tune.cnt.assign(cm_tune.cfgs.size(), 0);
+    cm_tune.active = true;
+    cm_apply(0);
+    fprintf(stderr, "cpu-miss decode: tuning on the first %d decode tokens (off vs",
+            (int) cm_tune.cfgs.size() * CmTune::WIN * CmTune::ROUNDS);
+    for (size_t c = 1; c < cm_tune.cfgs.size(); ++c) fprintf(stderr, " %dT", cm_tune.cfgs[c]);
+    fprintf(stderr, ")\n");
+}
+
+void Runtime::Impl::cm_apply(int cfg) {
+    cpu_miss = cfg > 0;
+    if (cpu_miss) ggml_backend_cpu_set_n_threads(cpu_backend, cfg);
+}
+
+std::string Runtime::Impl::tune_file() {
+    std::string dir;
+#ifdef _WIN32
+    if (const char * a = getenv("LOCALAPPDATA")) dir = std::string(a) + "\\questwend";
+#else
+    if (const char * x = getenv("XDG_CACHE_HOME")) dir = std::string(x) + "/questwend";
+    else if (const char * h = getenv("HOME"))      dir = std::string(h) + "/.cache/questwend";
+#endif
+    if (dir.empty()) return "questwend-tune.tsv";
+    return dir + "/tune.tsv";
+}
+
+void Runtime::Impl::cm_tune_record(double ms) {
+    CmTune & t = cm_tune;
+    if (++t.n > CmTune::SKIP) {   // the first tokens of a window pay for the switch
+        t.sum[(size_t) t.idx] += ms;
+        t.cnt[(size_t) t.idx] += 1;
+    }
+    if (t.n < CmTune::WIN) return;
+    t.n = 0;
+    if (++t.idx < (int) t.cfgs.size()) return;
+    t.idx = 0;
+    if (++t.round < CmTune::ROUNDS) return;
+
+    // done: keep the fastest
+    size_t best = 0;
+    for (size_t c = 0; c < t.cfgs.size(); ++c)
+        if (t.sum[c] / std::max(1, t.cnt[c]) < t.sum[best] / std::max(1, t.cnt[best])) best = c;
+    t.active = false;
+    cm_apply(t.cfgs[best]);
+    fprintf(stderr, "\ncpu-miss tuning:");
+    for (size_t c = 0; c < t.cfgs.size(); ++c) {
+        const double m = t.sum[c] / std::max(1, t.cnt[c]);
+        if (t.cfgs[c] == 0) fprintf(stderr, " off %.1f", 1000.0 / m);
+        else                fprintf(stderr, " %dT %.1f", t.cfgs[c], 1000.0 / m);
+    }
+    fprintf(stderr, " tok/s -> %s\n",
+            t.cfgs[best] ? (std::to_string(t.cfgs[best]) + " threads").c_str() : "off");
+
+    // remember it, replacing this key's earlier line
+    const std::string path = tune_file();
+    std::vector<std::string> keep;
+    {
+        std::ifstream f(path);
+        std::string line;
+        while (std::getline(f, line))
+            if (line.compare(0, t.key.size() + 1, t.key + "\t") != 0) keep.push_back(line);
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::ofstream f(path, std::ios::trunc);
+    for (const auto & l : keep) f << l << "\n";
+    f << t.key << "\t" << t.cfgs[best] << "\n";
+}
+
 // Batched prefill over the cache: run n_tokens through one segmented forward
 // (seg A attention/router for all tokens -> ensure the union of selected experts
 //  -> seg B expert matmuls for all tokens). Far fewer graph dispatches than the
@@ -5237,10 +5504,19 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
     if (n_past + n_tokens > n_ctx) throw std::runtime_error("decode: context overflow");
 
     // single-token decode via the dynamic VRAM expert cache (expert-offload mode)
-    if (n_tokens == 1 && ecache)
+    if (n_tokens == 1 && ecache) {
         // the fused single-graph path never leaves the GPU, so the CPU split
         // runs on the per-layer path
-        return cache_fast_enabled && !cpu_miss ? decode_cached_fast(tokens[0]) : decode_cached(tokens[0]);
+        if (!cm_tune.active)
+            return cache_fast_enabled && !cpu_miss ? decode_cached_fast(tokens[0]) : decode_cached(tokens[0]);
+        cm_apply(cm_tune.cfgs[(size_t) cm_tune.idx]);
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<float> & r = cache_fast_enabled && !cpu_miss ? decode_cached_fast(tokens[0])
+                                                                       : decode_cached(tokens[0]);
+        cm_tune_record(std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t0).count());
+        return r;
+    }
 
     // Prefill as batched chunks through the VRAM expert cache (chunk bounded so
     // a layer's distinct experts fit the pools). Used for both offload tiers:

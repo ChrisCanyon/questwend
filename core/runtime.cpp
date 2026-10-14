@@ -268,6 +268,26 @@ struct Runtime::Impl {
     // so the result is the same model, not an approximation.
     bool           cpu_miss   = false;
     ggml_gallocr_t cpu_galloc = nullptr;      // CPU-side expert graphs
+    // Pinned staging for the per-layer host<->GPU traffic, so those copies can
+    // be queued on the stream (cudaMemcpyAsync is only async from pinned
+    // memory) and a layer pays one synchronisation instead of one per copy.
+    ggml_backend_buffer_t hy_pin = nullptr;
+    // Segment graphs kept across tokens (see decode_cached): built and
+    // allocated once, recomputed every token, so ggml-cuda can replay them as
+    // CUDA graphs. hy_a per layer, hy_b per (layer, resident experts).
+    struct HyGraph {
+        ggml_context * ctx = nullptr;
+        ggml_cgraph  * gf  = nullptr;
+        ggml_gallocr_t galloc = nullptr;
+        ggml_tensor  * sel = nullptr;
+        ggml_tensor  * ids[3] = { nullptr, nullptr, nullptr };
+        ggml_tensor  * w = nullptr;
+    };
+    std::vector<HyGraph> hy_a, hy_b;
+    static const int HY_CACHED = 1024;   // nodes per kept graph
+    int32_t * pin_sel = nullptr, * pin_ids = nullptr;   // [n_used], [3*n_used]
+    float   * pin_w = nullptr, * pin_gw = nullptr;      // [n_used], [n_used]
+    float   * pin_x = nullptr, * pin_corr = nullptr;    // [n_embd], [n_embd]
     uint64_t       cm_gpu = 0, cm_cpu = 0;    // decode experts computed on each side
     double         cm_cpu_ms = 0, cm_wait_ms = 0;
     double         cm_a_ms = 0, cm_split_ms = 0, cm_b_ms = 0, cm_add_ms = 0;   // breakdown
@@ -545,6 +565,12 @@ struct Runtime::Impl {
         // split/ssd mode; in single-backend mode Model owns and frees the weights.
         for (auto b : expert_cpu_bufs) if (b) ggml_backend_buffer_free(b);
         if (cpu_galloc)     ggml_gallocr_free(cpu_galloc);
+        if (hy_pin)         ggml_backend_buffer_free(hy_pin);
+        for (auto * v : { &hy_a, &hy_b })
+            for (auto & g : *v) {
+                if (g.galloc) ggml_gallocr_free(g.galloc);
+                if (g.ctx)    ggml_free(g.ctx);
+            }
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
@@ -3590,6 +3616,22 @@ void Runtime::Impl::setup_cpu_miss() {
         return;
     }
     cpu_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(cpu_backend));
+    {
+        const size_t nu = hp.n_expert_used, ne = hp.n_embd;
+        const size_t bytes = (nu * 4 + nu * 3 + nu + ne * 2) * 4 + 256;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (!hb) hb = ggml_backend_get_default_buffer_type(cpu_backend);
+        hy_pin = ggml_backend_buft_alloc_buffer(hb, bytes);
+        if (!hy_pin) return;
+        char * p = (char *) ggml_backend_buffer_get_base(hy_pin);
+        pin_sel  = (int32_t *) p; p += nu * 4;
+        pin_ids  = (int32_t *) p; p += nu * 3 * 4;
+        pin_w    = (float *)   p; p += nu * 4;
+        pin_gw   = (float *)   p; p += nu * 4;
+        pin_x    = (float *)   p; p += ne * 4;
+        pin_corr = (float *)   p;
+    }
     if (const char * r = getenv("QWEN_CPU_MISS_REFILL")) cm_refill = std::max(0, atoi(r));
     const int hw = std::max(1, (int) std::thread::hardware_concurrency());
     int forced_threads = cfg.n_threads > 0 ? cfg.n_threads : 0;
@@ -3764,7 +3806,7 @@ void Runtime::Impl::setup_cpu_miss() {
         return;
     }
     cm_tune.cfgs = { 0 };
-    for (int t : { hw / 8, hw / 4, (3 * hw) / 8 }) {
+    for (int t : { hw / 8, hw / 4, (3 * hw) / 8, hw / 2 }) {
         if (forced_threads > 0) t = forced_threads;
         t = std::max(1, t);
         if (std::find(cm_tune.cfgs.begin(), cm_tune.cfgs.end(), t) == cm_tune.cfgs.end())
@@ -4852,135 +4894,205 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     if (cpu_miss) {
         // Per MoE layer: seg A on the GPU, read the selection back, then the
         // resident experts on the GPU (launched async) while the CPU computes
-        // the rest from host memory; the CPU sum joins the hidden state before
-        // the next layer reads it. One device (see init), so no carry hops.
+        // the rest from host memory. One device (see init), so no carry hops.
+        //
+        // The cost here is not the GPU's work, which is tiny per layer, but
+        // launching it: ~25 kernels per segment, ~1000 per token. So segments
+        // without per-token inputs are built once and recomputed as the same
+        // graph every token, which lets ggml-cuda record them as CUDA graphs
+        // and replay them. That is seg A of a recurrent layer (no positions or
+        // mask) and seg B per (layer, number of resident experts). For seg A
+        // to stay one shape, it always adds p_corr, the previous layer's CPU
+        // sum -- zeroed whenever there is none.
         ggml_backend_t be = gpus.empty() ? backend : gpus[0];
-        std::vector<float>   wv(n_used), xin(n_embd), corr, cw, gw;
+        std::vector<float>   corr, cw, gw;
         std::vector<int32_t> cids, gsg, gsu, gsd;
         std::vector<int>     refill_cand;   // this token's CPU experts (layer*n_expert+e)
-        bool corr_pending = false;
-        // segment graphs here are a few hundred nodes; a full-size context per
-        // graph costs more to set up than the segment takes on the GPU
-        const int HY_GRAPH = 2048;
-        auto add_corr = [&]() {   // p_h += p_corr
-            ggml_context * ctx = new_ctx();
-            ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_h, p_corr), p_h));
-            run(ctx, gf, 0);
-            compute(gf, 0, "cpu-miss add failed");
-            ggml_free(ctx);
-            corr_pending = false;
-        };
+        const int  HY_GRAPH  = 2048;        // throwaway segment graphs
+        const bool can_cache = dump_layers.empty();
+        if (hy_a.size() != (size_t) N) hy_a.assign((size_t) N, HyGraph{});
+        if (hy_b.size() != (size_t) N * (n_used + 1)) hy_b.assign((size_t) N * (n_used + 1), HyGraph{});
+        ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(be);
+
         using hclk = std::chrono::steady_clock;
         auto ms_since = [](hclk::time_point t) {
             return std::chrono::duration<double, std::milli>(hclk::now() - t).count();
         };
+
+        bool corr_dirty = true;   // p_corr's contents are unknown at token start
+        auto upload_corr = [&](bool has) {
+            if (has) {
+                std::copy(corr.begin(), corr.end(), pin_corr);
+            } else {
+                if (!corr_dirty) return;
+                std::fill(pin_corr, pin_corr + n_embd, 0.0f);
+            }
+            // queued ahead of the next seg A on the same stream
+            ggml_backend_tensor_set_async(be, p_corr, pin_corr, 0, (size_t) n_embd * sizeof(float));
+            corr_dirty = has;
+        };
+        upload_corr(false);
+
+        // seg B: the resident experts (+ shared expert) + residual -> p_h
+        auto build_B = [&](ggml_context * ctx, ggml_cgraph * gf, int il, int nr, HyGraph & g) {
+            ExpertCache * ec = ec_of(il);
+            ggml_tensor * ffn_l = carry_ffn(il);
+            ggml_tensor * h_new = carry_res(il);
+            if (nr > 0) {
+                for (int r = 0; r < 3; ++r) {
+                    g.ids[r] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nr, 1);
+                    ggml_set_input(g.ids[r]);
+                }
+                g.w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, 1);
+                ggml_set_input(g.w);
+                ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, 1);
+                ggml_tensor * up   = ggml_mul_mat_id(ctx, ec->up(il),   x3, g.ids[1]);
+                ggml_tensor * gate = ggml_mul_mat_id(ctx, ec->gate(il), x3, g.ids[0]);
+                ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
+                ggml_tensor * ex   = ggml_mul_mat_id(ctx, ec->down(il), act, g.ids[2]);   // [n_embd, nr, 1]
+                ggml_tensor * et   = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, ex, n_embd, nr)));
+                ggml_tensor * moe  = ggml_mul_mat(ctx, et, g.w);                          // [n_embd, 1]
+                h_new = ggml_add(ctx, ggml_reshape_1d(ctx, moe, n_embd), h_new);
+            }
+            if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
+                ggml_tensor * gt = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
+                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
+                ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
+                                                ggml_mul(ctx, ggml_silu(ctx, gt), u));
+                if (ggml_tensor * gw_sh = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
+                    sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw_sh, ffn_l)));
+                h_new = ggml_add(ctx, h_new, sh);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, p_h));
+        };
+
         for (int il = 0; il < N; ++il) {
             auto t0 = hclk::now();
-            corr_in = corr_pending ? p_corr : nullptr;   // folded into seg A
-            corr_pending = false;
-            ggml_context * ctx = new_ctx_n(HY_GRAPH);
-            ggml_cgraph * gf = ggml_new_graph_custom(ctx, HY_GRAPH, false);
-            ggml_tensor * selected = build_segA(ctx, gf, il);
+
+            // ---- seg A ----
+            ggml_context * tctx = nullptr;
+            ggml_cgraph  * gf   = nullptr;
+            ggml_tensor  * selected = nullptr;
+            corr_in = hc_on ? nullptr : p_corr;
+            if (can_cache && hp.is_recurrent(il)) {
+                HyGraph & g = hy_a[(size_t) il];
+                if (!g.gf) {
+                    g.ctx = new_ctx_n(HY_CACHED);
+                    g.gf  = ggml_new_graph_custom(g.ctx, HY_CACHED, false);
+                    g.sel = build_segA(g.ctx, g.gf, il);
+                    g.galloc = ggml_gallocr_new(gpu_buft);
+                    if (!ggml_gallocr_alloc_graph(g.galloc, g.gf))
+                        throw std::runtime_error("decode_cached: cpu-miss seg A alloc failed");
+                }
+                gf = g.gf;
+                selected = g.sel;
+            } else {
+                tctx = new_ctx_n(HY_GRAPH);
+                gf   = ggml_new_graph_custom(tctx, HY_GRAPH, false);
+                selected = build_segA(tctx, gf, il);
+                run(tctx, gf, 0);
+                set_attn_inputs(gf);
+            }
             corr_in = nullptr;
-            run(ctx, gf, 0);
-            set_attn_inputs(gf);
-            compute(gf, 0, "seg A compute failed");
-            dump_flush("segA");
-            if (selected) ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
-            ggml_free(ctx);
+            // seg A and the readbacks it feeds, queued; one wait for all of it
+            if (ggml_backend_graph_compute_async(be, gf) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("decode_cached: seg A compute failed");
+            if (selected) {
+                ggml_backend_tensor_get_async(be, selected,      pin_sel, 0, n_used * sizeof(int32_t));
+                ggml_backend_tensor_get_async(be, carry_wgt(il), pin_w,   0, n_used * sizeof(float));
+                ggml_backend_tensor_get_async(be, carry_ffn(il), pin_x,   0, (size_t) n_embd * sizeof(float));
+            }
+            ggml_backend_synchronize(be);
+            if (tctx) { dump_flush("segA"); ggml_free(tctx); tctx = nullptr; }
             cm_a_ms += ms_since(t0);
-            if (!selected) continue;   // dense block: seg A finished it
+            if (!selected) {          // dense block: seg A finished it, and used p_corr
+                upload_corr(false);
+                continue;
+            }
             t0 = hclk::now();
 
-            // split the selection by residency
-            ggml_backend_tensor_get(carry_wgt(il), wv.data(), 0, n_used * sizeof(float));
+            // ---- split the selection by residency ----
             ExpertCache * ec = ec_of(il);
             const int32_t * rg = ec->slot_of_row(ExpertCache::GATE, il);
             const int32_t * ru = ec->slot_of_row(ExpertCache::UP,   il);
             const int32_t * rd = ec->slot_of_row(ExpertCache::DOWN, il);
             cids.clear(); cw.clear(); gsg.clear(); gsu.clear(); gsd.clear(); gw.clear();
             for (int k = 0; k < n_used; ++k) {
-                const int e = sel[k];
+                const int e = pin_sel[k];
                 if (ec->resident(ExpertCache::GATE, il, e) && ec->resident(ExpertCache::UP, il, e) &&
                     ec->resident(ExpertCache::DOWN, il, e)) {
                     gsg.push_back(rg[e]); gsu.push_back(ru[e]); gsd.push_back(rd[e]);
-                    gw.push_back(wv[k]);
+                    gw.push_back(pin_w[k]);
                     ec->touch(ExpertCache::GATE, il, e);
                     ec->touch(ExpertCache::UP,   il, e);
                     ec->touch(ExpertCache::DOWN, il, e);
                 } else {
-                    cids.push_back(e); cw.push_back(wv[k]);
+                    cids.push_back(e); cw.push_back(pin_w[k]);
                 }
             }
             cm_gpu += gsg.size();
             cm_cpu += cids.size();
-            if (!cids.empty())
-                ggml_backend_tensor_get(carry_ffn(il), xin.data(), 0, (size_t) n_embd * sizeof(float));
-
             cm_split_ms += ms_since(t0);
             t0 = hclk::now();
-            // GPU: the resident experts (+ shared expert) + residual -> p_h
-            ctx = new_ctx_n(HY_GRAPH);
-            gf  = ggml_new_graph_custom(ctx, HY_GRAPH, false);
-            const int nr = (int) gsg.size();
-            ggml_tensor * ffn_l = carry_ffn(il);
-            ggml_tensor * h_new = carry_res(il);
-            ggml_tensor * t_ids[3] = { nullptr, nullptr, nullptr }, * t_w = nullptr;
-            if (nr > 0) {
-                for (int r = 0; r < 3; ++r) {
-                    t_ids[r] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nr, 1);
-                    ggml_set_input(t_ids[r]);
-                }
-                t_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nr, 1);
-                ggml_set_input(t_w);
-                ggml_tensor * x3   = ggml_reshape_3d(ctx, ffn_l, n_embd, 1, 1);
-                ggml_tensor * up   = ggml_mul_mat_id(ctx, ec->up(il),   x3, t_ids[1]);
-                ggml_tensor * gate = ggml_mul_mat_id(ctx, ec->gate(il), x3, t_ids[0]);
-                ggml_tensor * act  = ggml_swiglu_split(ctx, gate, up);
-                ggml_tensor * ex   = ggml_mul_mat_id(ctx, ec->down(il), act, t_ids[2]);   // [n_embd, nr, 1]
-                ggml_tensor * et   = ggml_cont(ctx, ggml_transpose(ctx, ggml_reshape_2d(ctx, ex, n_embd, nr)));
-                ggml_tensor * moe  = ggml_mul_mat(ctx, et, t_w);                          // [n_embd, 1]
-                h_new = ggml_add(ctx, ggml_reshape_1d(ctx, moe, n_embd), h_new);
-            }
-            if (ggml_tensor * up_sh = Wopt("blk.%d.ffn_up_shexp.weight", il)) {
-                ggml_tensor * g  = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_shexp.weight", il), ffn_l);
-                ggml_tensor * u  = ggml_mul_mat(ctx, up_sh, ffn_l);
-                ggml_tensor * sh = ggml_mul_mat(ctx, W("blk.%d.ffn_down_shexp.weight", il),
-                                                ggml_mul(ctx, ggml_silu(ctx, g), u));
-                if (ggml_tensor * gw_sh = Wopt("blk.%d.ffn_gate_inp_shexp.weight", il))
-                    sh = ggml_mul(ctx, sh, ggml_sigmoid(ctx, ggml_mul_mat(ctx, gw_sh, ffn_l)));
-                h_new = ggml_add(ctx, h_new, sh);
-            }
-            ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, p_h));
-            run(ctx, gf, 0);
-            if (nr > 0) {
-                ggml_backend_tensor_set(t_ids[0], gsg.data(), 0, (size_t) nr * sizeof(int32_t));
-                ggml_backend_tensor_set(t_ids[1], gsu.data(), 0, (size_t) nr * sizeof(int32_t));
-                ggml_backend_tensor_set(t_ids[2], gsd.data(), 0, (size_t) nr * sizeof(int32_t));
-                ggml_backend_tensor_set(t_w,      gw.data(),  0, (size_t) nr * sizeof(float));
-            }
-            if (ggml_backend_graph_compute_async(be, gf) != GGML_STATUS_SUCCESS)
-                throw std::runtime_error("decode_cached: cpu-miss seg B failed");
 
-            cm_b_ms += ms_since(t0);
-            // CPU: the rest, while the GPU works
-            auto tc = std::chrono::steady_clock::now();
-            if (!cids.empty()) cpu_experts(il, xin.data(), cids, cw, corr);
-            auto tw = std::chrono::steady_clock::now();
-            ggml_backend_synchronize(be);
-            auto te = std::chrono::steady_clock::now();
-            cm_cpu_ms  += std::chrono::duration<double, std::milli>(tw - tc).count();
-            cm_wait_ms += std::chrono::duration<double, std::milli>(te - tw).count();
-            ggml_free(ctx);
-            if (!cids.empty()) {
-                ggml_backend_tensor_set(p_corr, corr.data(), 0, (size_t) n_embd * sizeof(float));
-                corr_pending = true;
-                for (int e : cids) refill_cand.push_back(il * hp.n_expert + e);
+            // ---- seg B on the GPU, async ----
+            const int nr = (int) gsg.size();
+            HyGraph   tmp;
+            HyGraph * gb = &tmp;
+            if (can_cache) {
+                HyGraph & g = hy_b[(size_t) il * (n_used + 1) + nr];
+                if (!g.gf) {
+                    g.ctx = new_ctx_n(HY_CACHED);
+                    g.gf  = ggml_new_graph_custom(g.ctx, HY_CACHED, false);
+                    build_B(g.ctx, g.gf, il, nr, g);
+                    g.galloc = ggml_gallocr_new(gpu_buft);
+                    if (!ggml_gallocr_alloc_graph(g.galloc, g.gf))
+                        throw std::runtime_error("decode_cached: cpu-miss seg B alloc failed");
+                }
+                gb = &g;
+            } else {
+                tctx = new_ctx_n(HY_GRAPH);
+                tmp.gf = ggml_new_graph_custom(tctx, HY_GRAPH, false);
+                build_B(tctx, tmp.gf, il, nr, tmp);
+                run(tctx, tmp.gf, 0);
             }
+            if (nr > 0) {
+                std::copy(gsg.begin(), gsg.end(), pin_ids);
+                std::copy(gsu.begin(), gsu.end(), pin_ids + n_used);
+                std::copy(gsd.begin(), gsd.end(), pin_ids + 2 * n_used);
+                std::copy(gw.begin(),  gw.end(),  pin_gw);
+                ggml_backend_tensor_set_async(be, gb->ids[0], pin_ids,              0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set_async(be, gb->ids[1], pin_ids + n_used,     0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set_async(be, gb->ids[2], pin_ids + 2 * n_used, 0, (size_t) nr * sizeof(int32_t));
+                ggml_backend_tensor_set_async(be, gb->w,      pin_gw,               0, (size_t) nr * sizeof(float));
+            }
+            if (ggml_backend_graph_compute_async(be, gb->gf) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("decode_cached: cpu-miss seg B failed");
+            cm_b_ms += ms_since(t0);
+
+            // ---- the CPU's share, while the GPU works ----
+            auto tc = hclk::now();
+            if (!cids.empty()) cpu_experts(il, pin_x, cids, cw, corr);
+            auto tw = hclk::now();
+            ggml_backend_synchronize(be);
+            cm_cpu_ms  += std::chrono::duration<double, std::milli>(tw - tc).count();
+            cm_wait_ms += ms_since(tw);
+            if (tctx) { ggml_free(tctx); tctx = nullptr; }
+            upload_corr(!cids.empty());
+            for (int e : cids) refill_cand.push_back(il * (int) hp.n_expert + e);
         }
+
+        // the last layer's CPU sum has no seg A after it to fold into
         auto ta = hclk::now();
-        if (corr_pending) add_corr();
+        if (corr_dirty) {
+            ggml_context * ctx = new_ctx_n(HY_GRAPH);
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx, HY_GRAPH, false);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_add(ctx, p_h, p_corr), p_h));
+            run(ctx, gf, 0);
+            compute(gf, 0, "cpu-miss add failed");
+            ggml_free(ctx);
+            upload_corr(false);
+        }
         cm_add_ms += ms_since(ta);
 
         // Refill: pull the experts the CPU keeps being handed into the VRAM
@@ -5001,7 +5113,6 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 --budget;
             }
         }
-        refill_cand.clear();
     } else {
     do_segA(0);
     for (int il = 0; il < N; ++il) {

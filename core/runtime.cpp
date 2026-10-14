@@ -5048,8 +5048,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         std::vector<int>     refill_cand;   // this token's CPU experts (layer*n_expert+e)
         const int  HY_GRAPH  = 2048;        // throwaway segment graphs
         const bool can_cache = dump_layers.empty();
-        // QSA and the PLE n-gram rows carry their own per-token inputs
-        const bool can_cache_attn = can_cache && !hp.has_qsa() && !use_ple();
+        // QSA's inputs are named graph inputs filled per token (set_qsa_inputs,
+        // as for the resident decode graph, which is also kept for a whole KV
+        // bucket), and PLE reads the per-token p_ple carry: both cacheable.
+        const bool can_cache_attn = can_cache;
         if (hy_a.size() != (size_t) N) hy_a.assign((size_t) N, HyGraph{});
         if (hy_b.size() != (size_t) N * (n_used + 1)) hy_b.assign((size_t) N * (n_used + 1), HyGraph{});
         ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(be);
@@ -5182,6 +5184,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 ggml_backend_tensor_set_async(be, g.pos,   pin_pos,   0, posv.size() * sizeof(int32_t));
                 ggml_backend_tensor_set_async(be, g.mask,  pin_mask,  0, (size_t) nb * sizeof(ggml_fp16_t));
                 ggml_backend_tensor_set_async(be, g.kvidx, pin_kvidx, 0, sizeof(int64_t));
+                set_qsa_inputs(g.gf, 1, nb, n_past);   // no-op without QSA
                 gf = g.gf;
                 selected = g.sel;
             } else {

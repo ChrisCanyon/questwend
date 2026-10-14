@@ -10,6 +10,7 @@ A from-scratch inference engine for Qwen3 / Qwen3.5 / Qwen3.6, built on vendored
   - MoE expert offloading (**RAM tier** / **SSD tier**) with a dynamic VRAM expert cache
     → runs models like 35B-A3B MoE on a 16GB GPU
   - Persistent hot-expert residency profiles (`--cache-profile`) for fast warm starts
+  - CPU/GPU split decode on the RAM tier: experts missing from the VRAM cache are computed on the CPU instead of fetched over PCIe, tuned automatically on the first decode tokens per GPU/CPU/model and remembered (`QWEN_CPU_MISS=0/1` forces it, `QWEN_TUNE=redo` re-tunes)
   - MTP (Multi-Token Prediction / nextn) self-speculative decoding (`--mtp`, `--draft N`)
   - **Image input** (Qwen3-VL family + mmproj GGUF; the vision tower runs on ggml/GPU. CLI `--image`, server takes OpenAI-style `image_url`)
   - **Tool calling** (OpenAI-compatible: `tools` / `tool_calls` / `role:"tool"`, with two-way conversion of Qwen3.6's `<function=...>` form)

@@ -10,6 +10,7 @@ Qwen3 / Qwen3.5 / Qwen3.6 をスクラッチ実装した推論エンジン（ven
   - MoE エキスパートのオフロード（**RAM 階層** / **SSD 階層**）＋動的 VRAM エキスパートキャッシュ
     → 16GB GPU で 35B-A3B MoE などを実行可能
   - エキスパート常駐プロファイルの永続化（`--cache-profile`）でウォーム起動を高速化
+  - RAM 階層での CPU/GPU 分担 decode: VRAM キャッシュに無いエキスパートを PCIe で転送せず CPU で計算。GPU・CPU・モデルごとに最初の decode トークンで自動調整して記憶（`QWEN_CPU_MISS=0/1` で強制、`QWEN_TUNE=redo` で再調整）
   - MTP（Multi-Token Prediction / nextn）自己推測デコード（`--mtp`, `--draft N`）
   - **画像入力**（Qwen3-VL 系 + mmproj GGUF; vision tower を ggml/GPU で実行。CLI `--image`、サーバーは OpenAI 形式の `image_url`）
   - **tool calling**（OpenAI 互換: `tools` / `tool_calls` / `role:"tool"`、Qwen3.6 の `<function=...>` 形式を双方向変換）

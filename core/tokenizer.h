@@ -22,9 +22,9 @@ public:
 
     explicit Tokenizer(const Vocab & vocab);
 
-    // parse_special: recognise control / user-defined tokens written literally in
-    // the text. True matches llama.cpp for a raw prompt. Chat message bodies pass
-    // false -- otherwise a user who types "<|im_end|>" ends their own turn.
+    // parse_special enables control tokens such as <|im_end|>. User-defined
+    // tokens (including Qwen's tool markers) are always recognized, matching
+    // llama.cpp and HF added-token semantics. CONTROL tokens remain gated.
     std::vector<int32_t> encode(const std::string & text, bool add_bos = false,
                                 bool parse_special = true) const;
     std::string          decode(int32_t token) const;
@@ -61,10 +61,12 @@ private:
     // before the pre-tokenizer runs, so "<|im_start|>" in a raw prompt becomes
     // the single control id and not the six pieces its characters would BPE to.
     std::vector<std::pair<std::string, int32_t>> special_;
+    std::vector<bool> control_token_;  // gated by parse_special; user-defined tokens are not
     bool special_first_[256] = { false };   // first byte of some special token
 
     // Longest special token starting at text[pos], or -1.
-    int32_t match_special(const std::string & text, size_t pos, size_t * len) const;
+    int32_t match_special(const std::string & text, size_t pos, size_t * len,
+                          bool parse_special = true) const;
 
     std::vector<std::string> pretokenize(const std::string & text) const;
     std::vector<std::string> pretokenize_qwen(const std::string & text, int max_digits = 1) const;

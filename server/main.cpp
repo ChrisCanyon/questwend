@@ -10,6 +10,7 @@
 #include "chat.h"
 #include "vision.h"
 #include "args.h"
+#include "stream_heartbeat.h"
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -1436,6 +1437,7 @@ int main(int argc, char ** argv) {
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
                 clk::time_point gen_log;          // last long-output progress line
+                clk::time_point last_output = clk::now(); // also bound silence while buffering tool arguments
                 State(const SamplerConfig & sc) : smp(sc) {}
                 ~State() { if (holding && tl) tl->unlock(); }   // client disconnect mid-slice
             };
@@ -1641,7 +1643,8 @@ int main(int argc, char ** argv) {
                         };
                         if (!rout.empty())  add_chunk("reasoning_content", rout);
                         if (!cout_.empty()) add_chunk("content", cout_);
-                        if (ev.empty()) return true;               // nothing complete to send yet
+                        if (!questwend::prepare_stream_event(ev, hb_on, st->hb, clk::now(), st->last_output))
+                            return true;
                         return sink.write(ev.data(), ev.size());
                     };
                     try {

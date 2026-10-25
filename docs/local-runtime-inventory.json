@@ -1,0 +1,808 @@
+{
+  "source": "C:\\workspace\\questwend-rpc-test",
+  "base_commit": "86fc9da74a0d9d0ed4e70f57f0fada685a366ad7",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "new_file": false,
+      "bytes": 15935,
+      "sha256": "4a0f8f31d8153977848caddbef220bc8a8fe5b49389183ffd9e82bb81f0cfa68",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/activation_policy.h",
+      "new_file": true,
+      "bytes": 6139,
+      "sha256": "0221e72955f35dcbcb8dccfd64347926b2035a7be2712f1a16523af1bb141876",
+      "category": "local-with-experimental-policy",
+      "reason": "Activation tracing is enabled in the saved profile; the MoE-Infinity-derived scheduling policy is a separate experiment."
+    },
+    {
+      "path": "core/args.cpp",
+      "new_file": false,
+      "bytes": 14409,
+      "sha256": "bf3180d49ac92e59f2ef30255bedfbe9dd1dc1941938cc863db0751c88b9a652",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/args.h",
+      "new_file": false,
+      "bytes": 4331,
+      "sha256": "567baa3000c0a84b93e1ca163aca151176a214400052071ebc110bfe006c61bc",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/backend_loader.h",
+      "new_file": true,
+      "bytes": 1603,
+      "sha256": "2d973556d0e33fd5039d124a51886f57ae5da28cc6931f41c978560b1c38885b",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/cache_memory_budget.h",
+      "new_file": true,
+      "bytes": 1615,
+      "sha256": "3c246124e94c3960204eb126e397ad30ed324bb242763e282fb34b6649fe52af",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/chat.cpp",
+      "new_file": false,
+      "bytes": 19519,
+      "sha256": "9bb61df118d24237d590f17bc0e9d3548f85784a73e2b0ace5c596fb74a5f620",
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper."
+    },
+    {
+      "path": "core/chat.h",
+      "new_file": false,
+      "bytes": 4614,
+      "sha256": "f179950f59be4fa3a7e1957227d5a541cc0d558524c01376314d01d8247ca894",
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper."
+    },
+    {
+      "path": "core/expert_admission.h",
+      "new_file": true,
+      "bytes": 1881,
+      "sha256": "46755534fd9c3cb6d4ab6824a773dbde0e53dfd034d2afd79b8a9f5cac6a6b97",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_cache.cpp",
+      "new_file": false,
+      "bytes": 96545,
+      "sha256": "5e488a5682f139308efb7707b5e67a9e996b0afb6ecda341306331029db00f8d",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/expert_cache.h",
+      "new_file": false,
+      "bytes": 18539,
+      "sha256": "8cacedc831880a359339bfd2e44154a4d9daa70adebb9a42b34f48cfdb8cfabb",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/expert_demand_trace.h",
+      "new_file": true,
+      "bytes": 9139,
+      "sha256": "806fe0fd0943093555204038158924fab6cbc6ca4609e8825a3145a50a783a9c",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_install_check.h",
+      "new_file": true,
+      "bytes": 994,
+      "sha256": "a5d2a01c8e6508c54b0a1b802e5e47da071cf0f4a1ac1737dd33018501985073",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_io_workers.h",
+      "new_file": true,
+      "bytes": 9950,
+      "sha256": "ae118aff363bdc2da638e769a17461a3f46f183fd5bcd3f6affbf62a7270208c",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_readiness.h",
+      "new_file": true,
+      "bytes": 1407,
+      "sha256": "7c902d7eefd4734fbab8bd30f68e16484be93331b89de4e2303ae7454cdfec81",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_ssd_read_phase.h",
+      "new_file": true,
+      "bytes": 3588,
+      "sha256": "4bdb3d17b070602c3247b270db8228c5e8d3e4dd374040404cec21d474c38591",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_ssd_windows.h",
+      "new_file": true,
+      "bytes": 4225,
+      "sha256": "445d13b07bef6b6d5894be72a98b3498d6ec45daca49974f476434aac70c9d15",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/expert_weight_audit.h",
+      "new_file": true,
+      "bytes": 6284,
+      "sha256": "615c809ae9929932c831766e3a78adbea21775a16b0debbd57dcb4cef64eb333",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/gpu_lru_index.h",
+      "new_file": true,
+      "bytes": 9088,
+      "sha256": "7974306bb3e893cef640d5f7ca5444fa5b98583700c048a7428e02ca2d2dba70",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/gpu_lru_pool_hooks.h",
+      "new_file": true,
+      "bytes": 3781,
+      "sha256": "7ca79e14899272fac90784b595f0af78bb968cbbd8c1724e70214fd0fb5f1ee3",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/grouped_experts_api.h.inc",
+      "new_file": true,
+      "bytes": 1094,
+      "sha256": "2cfbac0845677a32eb084c4475fb1f1207184939a3387f84ffe60a291ea56def",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/grouped_experts_fields.h.inc",
+      "new_file": true,
+      "bytes": 284,
+      "sha256": "d7ccc09a582b0c347ecd277f0af54d37699af9e234fe547fb0168915fb511aad",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/grouped_experts_methods.cpp.inc",
+      "new_file": true,
+      "bytes": 3100,
+      "sha256": "5c37771884516cb94fa03a254750a9b97ae96a41d450e2b8ec8cce069093a53a",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/grouped_experts_partition.h.inc",
+      "new_file": true,
+      "bytes": 1650,
+      "sha256": "655d531d74e1847a173fa8b43a6af4dd9e16484f6aa2d0cd0cd1aa01120be372",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/grouped_experts_submit.h.inc",
+      "new_file": true,
+      "bytes": 1804,
+      "sha256": "8628fb68c0a0c5019fb4fad2b7e607de4986e481a3b3159e0640184e83576793",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/host_expert_cache.h",
+      "new_file": true,
+      "bytes": 22157,
+      "sha256": "b39c515af74c9d58f1fdfd5ed7d6760aac3ee8a9cac95ee6d519fee878b025bb",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/hybrid_schedule.h",
+      "new_file": true,
+      "bytes": 3866,
+      "sha256": "d132e53270856fd3de4d579b0ebaa070164aad11f2361919d9003c84a7c751f7",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/model.cpp",
+      "new_file": false,
+      "bytes": 46273,
+      "sha256": "99e3f0a96157005cb43ecab2dbb3752b5b8c3debd12d773fd68352b36b763f20",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "core/model.h",
+      "new_file": false,
+      "bytes": 18786,
+      "sha256": "169e0bf44456fe7f07635190e01522945dfcda534e7e18e4aa4b303f0c1f234c",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "core/prefill_cache_policy.h",
+      "new_file": true,
+      "bytes": 711,
+      "sha256": "91f317622e32783624cf65affe39494ffb888995df8c03876340a698e0a41bc2",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/prompt_checkpoint_memory.h",
+      "new_file": true,
+      "bytes": 1714,
+      "sha256": "a341838ba7cef42255ca6ffc5d398a56fb029dbad9452eada4baa77b1b1dbbd7",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/qsa_capture_api.h.inc",
+      "new_file": true,
+      "bytes": 625,
+      "sha256": "b4c0f62bd6d0fd02b40c46453b655cdcf723f7b077c50069ec09f20f11aa8ffd",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/qsa_capture_runtime.inc",
+      "new_file": true,
+      "bytes": 2168,
+      "sha256": "e23744e2e0b742495bce3dc36412450adebefdb8a307740d6a4a38aeda99ba4b",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/qsa_constant_inputs.h",
+      "new_file": true,
+      "bytes": 2321,
+      "sha256": "c54d6985dfd80992dada64beb28e0a07a70717b22033e32a233cd70d50d7f315",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/ram_s3fifo_LICENSE.txt",
+      "new_file": true,
+      "bytes": 11560,
+      "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime."
+    },
+    {
+      "path": "core/ram_s3fifo_metadata.h",
+      "new_file": true,
+      "bytes": 10109,
+      "sha256": "1643f9b2751db81b4b4cb49cec45606160a22308b20510e19401b2f127edd76d",
+      "category": "experiment",
+      "reason": "Alternative cache policy; no production promotion assumed."
+    },
+    {
+      "path": "core/ram_ssd_admission.h",
+      "new_file": true,
+      "bytes": 1821,
+      "sha256": "1408afb6b88d3e6dab769b47704bf19d111ad63033c35590d1f63c7df83938fe",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/rpc_weights.h",
+      "new_file": true,
+      "bytes": 4256,
+      "sha256": "0f9d6cf311b7ce0a303c216d84d8af599304e9b491ce1fd123addf769e8161fb",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "core/runtime.cpp",
+      "new_file": false,
+      "bytes": 394699,
+      "sha256": "9fa63ecd87e4ab56a70c79330e58624359651c479017c5c31d50b17987556c82",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/runtime.h",
+      "new_file": false,
+      "bytes": 15481,
+      "sha256": "d00e625fb0a40bd897d817bcfa2ee1e10ea7142d60dc7d1117d37969e7e1c2c7",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "core/scheduler_timing.h",
+      "new_file": true,
+      "bytes": 576,
+      "sha256": "5fae3a352d83e975d2be9e1b3db1928cb1c733d36ac141e95000782cac374656",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "core/speculation_api.h.inc",
+      "new_file": true,
+      "bytes": 1499,
+      "sha256": "07305744ccd4f1dedf7fddafc4bdb07035fb8e8555d5d9030fcaa7431eecf644",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/speculation_runtime.inc",
+      "new_file": true,
+      "bytes": 8102,
+      "sha256": "b2120057f68545d34f0bc31ae393f355288274affb625e4b2bef323f30891679",
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately."
+    },
+    {
+      "path": "core/tokenizer.cpp",
+      "new_file": false,
+      "bytes": 18878,
+      "sha256": "448545d422e60018a1527d3be37b7f30fbc9968842aa3c6618a312d33d1773c6",
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper."
+    },
+    {
+      "path": "core/tokenizer.h",
+      "new_file": false,
+      "bytes": 3567,
+      "sha256": "4ec41db89a89f446fb04c8ab1740997b508bc6326a7ba4d5b14be08f08454267",
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper."
+    },
+    {
+      "path": "core/workspace_partition.h",
+      "new_file": true,
+      "bytes": 3618,
+      "sha256": "802d34fd3e2782cadad5195494f86b6c2ddee1942cdb4c5744cfc4b682676ac1",
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified."
+    },
+    {
+      "path": "server/main.cpp",
+      "new_file": false,
+      "bytes": 118200,
+      "sha256": "b9923f5807f84491e78a33736d8fb7366c87ed68ab5b15b29380a8f64c8a6df7",
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR."
+    },
+    {
+      "path": "server/qwen_tool_calls.h",
+      "new_file": true,
+      "bytes": 6442,
+      "sha256": "d4acb7c1889b917511905be5fd4951d4621ed2044238ec371b8d41f94e22e15b",
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes."
+    },
+    {
+      "path": "server/rpc_server.cpp",
+      "new_file": true,
+      "bytes": 3971,
+      "sha256": "1fc735972ee81afed2cc253ca09f4fa3c1e2000e5643e2dd49b27dd2eefe6a1f",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "tests/block_transport_echo.cpp",
+      "new_file": true,
+      "bytes": 5680,
+      "sha256": "0d031833e684f18513a2d5da0c577283667a47c46bbc657b42442e78e9644a2b",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/block_worker.cpp",
+      "new_file": true,
+      "bytes": 22321,
+      "sha256": "d9c9db4b5d43ab53302faddb2a789921538580189c83280149be961b3d2dad8e",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/cache_memory_budget_test.cpp",
+      "new_file": true,
+      "bytes": 3324,
+      "sha256": "d72075d1d280887631ae9c6ce4554dee99e586b3ba77ffda2e44d5b1f1725549",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/chat_template_probe.cpp",
+      "new_file": true,
+      "bytes": 2705,
+      "sha256": "473ebec5e987f427d37f8b004ee943a23770ca06aedb7526a1924db6b3ae3e32",
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes."
+    },
+    {
+      "path": "tests/direct_pinned_covering_test.cpp",
+      "new_file": true,
+      "bytes": 5596,
+      "sha256": "2f51c462f2a054ef547ea4470b35d9a8ffd157f18184dc9376391092244c9c3e",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_calibrate.cpp",
+      "new_file": true,
+      "bytes": 10598,
+      "sha256": "bfa3f79730c3aff5f71ef87cf5c21d69ae8d46d285f06b60ab38f4c5a97dde43",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_cost_graph.h",
+      "new_file": true,
+      "bytes": 8913,
+      "sha256": "19f99baf35ab3a975d14ac677060898f53bc24e7eea4c9f75841f54eaa4da721",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_cost_io.h",
+      "new_file": true,
+      "bytes": 5098,
+      "sha256": "45d6bcca674ef6271d8ccd38d15744b92f43249c728c14aaa0b7bbd8669e53d6",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_cost_stats.h",
+      "new_file": true,
+      "bytes": 1228,
+      "sha256": "4e6545d2d2de2f8b2ee8f4a5e8bf1ad7409c4d08273851253f4c40cc8072e4f5",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_costs.cpp",
+      "new_file": true,
+      "bytes": 20449,
+      "sha256": "756e7e02c5ef1ecf1775d779921f2fac3a4fe3fea2e9e1d43d6f4af615443f56",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_demand_pipeline_test.cpp",
+      "new_file": true,
+      "bytes": 10395,
+      "sha256": "543512226b8a969b6861768c37caf12396091c42a6e8e36b777cb01298de82db",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_demand_trace_test.cpp",
+      "new_file": true,
+      "bytes": 7572,
+      "sha256": "9e5a757aeb363a5d9c0ad61e29cd5e9abc2e4dad6eed893e0b3b83a4aac30da7",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_install_check_test.cpp",
+      "new_file": true,
+      "bytes": 3806,
+      "sha256": "75fa870bd4c998ebfa3dde3cf7fba05f156abd8ba07fb6f4a5cfb18f7f12e49a",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_io_targeted_wake_test.cpp",
+      "new_file": true,
+      "bytes": 4984,
+      "sha256": "1076e3a728d3fb9ed41492c143049041d9cb53fba4deec5bcb324421ff0739d2",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_io_workers_test.cpp",
+      "new_file": true,
+      "bytes": 9499,
+      "sha256": "6d36fe6732af934633c12a8516633b142e222192ee8b80a8dba6be44df4cef00",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_ssd_read_phase_test.cpp",
+      "new_file": true,
+      "bytes": 11397,
+      "sha256": "f709f496c5ed630ef196ded549a58c5e3f525685584472f996a1adfc88d00c3f",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/expert_weight_audit_test.cpp",
+      "new_file": true,
+      "bytes": 2372,
+      "sha256": "d4959a71118db59bd95ce5b132a9b6b1c80ce1ab49bd8850c6a5f1ae6b5394ed",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/gpu_lru_index_test.cpp",
+      "new_file": true,
+      "bytes": 12714,
+      "sha256": "1cbdd3e40da77885b0e2e69b13b303c9f2d798f9032b75633b15aef4e182f4ec",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/grouped_cost_graph.h",
+      "new_file": true,
+      "bytes": 9908,
+      "sha256": "15a93929ca9384f8ec7486050bc7223d5132eaeaf1512bcba048021566c3f5d9",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/host_cache_s3fifo_test.cpp",
+      "new_file": true,
+      "bytes": 11629,
+      "sha256": "72df65a357ec86d8d51523899678adda4fcf615805a8320546a94b7eb9c60723",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/host_cache_test.cpp",
+      "new_file": true,
+      "bytes": 9781,
+      "sha256": "9ffad5bffb461dabfdae71d4e1cc608dd281f5b2f6fc16544174306f8b36deff",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/prefill_cache_policy_test.cpp",
+      "new_file": true,
+      "bytes": 3334,
+      "sha256": "7f76900dc279462b3940d614288e26eb595045df15aad5a870e89e7815370caf",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/prompt_checkpoint_memory_test.cpp",
+      "new_file": true,
+      "bytes": 2713,
+      "sha256": "864cbcbc3d582a970e1b877b6ea09d3f3e50e8fd76afbcc681f7e052530fe6d4",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/qsa_attention_reference.cpp",
+      "new_file": true,
+      "bytes": 9452,
+      "sha256": "0360f8ea8c53ddae9497963c92e3ab4452665e740c5575859657979a3297d5f2",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/qsa_constant_inputs_test.cpp",
+      "new_file": true,
+      "bytes": 4300,
+      "sha256": "34a466173346c17295de9b3d9666f1ad501dc64a111474b6458e709c44a4931a",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/qsa_constant_storage_test.cpp",
+      "new_file": true,
+      "bytes": 4495,
+      "sha256": "9edcf96f64c342b0c589feab562f18019f8d27bc7ade8bf08b2e30c89dc4f4e6",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/qsa_identity_view_test.cpp",
+      "new_file": true,
+      "bytes": 8836,
+      "sha256": "e42ba2347f2edf2045770e5a9639445ba89f7a03339a18a1c57a07fc381157ac",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/qsa_pool4_probe.cpp",
+      "new_file": true,
+      "bytes": 7621,
+      "sha256": "bf0e9fdab44ee7e840dcceff72c2c484232d8ec535b1e1ac59f5aa4090406751",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/ram_ssd_admission_test.cpp",
+      "new_file": true,
+      "bytes": 3185,
+      "sha256": "77bdb8f281fceff36c3a9dd337e3b235f4abdac8c1c88f72464cc9f2f9dd601c",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/real_grouped_client.h",
+      "new_file": true,
+      "bytes": 6589,
+      "sha256": "a921b9593626c362279b420812b895761a2cab4b10320b68e246d9fe00c9ea9b",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/real_grouped_probe.cpp",
+      "new_file": true,
+      "bytes": 15143,
+      "sha256": "c49657197ce2442bc26775d0c3a4d810b64a16e37fd3762a0dff93edc6dae2fe",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/real_grouped_reference.h",
+      "new_file": true,
+      "bytes": 3730,
+      "sha256": "c3a617ff68a70ca629d4bb3afec208750a773560f51df1a5741c558b6aa729c9",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/rpc_probe.cpp",
+      "new_file": true,
+      "bytes": 6827,
+      "sha256": "34f4472f0731e0f70ec986f9b48f5bdae70339b48877d0545183485596dcd082",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/scalar_get_rows_probe.cpp",
+      "new_file": true,
+      "bytes": 6082,
+      "sha256": "4b04b00b74f2dbbb95cbac1881993917703709bbdfbab5f9b2661144d9036503",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/speculation_probe.cpp",
+      "new_file": true,
+      "bytes": 33616,
+      "sha256": "4870d4b9dd971e7e6bc169dfe58972b7bccf918c397ce9c6595e396f41a22a28",
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/tiny_batch_workspace_test.cpp",
+      "new_file": true,
+      "bytes": 6404,
+      "sha256": "dab4e274336fab0e76f162e0bc5deede85d334d55bbbd3e9d454b73e68365565",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/tool_call_probe.cpp",
+      "new_file": true,
+      "bytes": 1167,
+      "sha256": "a1b600cd44f99c45bd7b8b202d001a94458754c82dc8693998fb11b11d091241",
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes."
+    },
+    {
+      "path": "tests/vector_get_rows_probe.cpp",
+      "new_file": true,
+      "bytes": 6652,
+      "sha256": "6b567d54e732a4fc7a9237c32991e4e075e9623b5664252c2fe8bcadc5037a05",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "tests/workspace_partition_test.cpp",
+      "new_file": true,
+      "bytes": 5490,
+      "sha256": "9c049b6ad4d96be64db18ca22a672154c1be6ca323070b27b30f87a898af6769",
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module."
+    },
+    {
+      "path": "third_party/caffeine/LICENSE",
+      "new_file": true,
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime."
+    },
+    {
+      "path": "third_party/ggml/include/ggml-rpc.h",
+      "new_file": false,
+      "bytes": 1184,
+      "sha256": "5a44c86009b236784404800113e88a726ba35decb0dfe4fad46521dd3bfc6aa2",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/cp-async.cuh",
+      "new_file": false,
+      "bytes": 2725,
+      "sha256": "901a6742b177adc13be79ef67d0475ae3e3e38afae70937dbe047aa46dbc3142",
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/fattn-mma-f16.cuh",
+      "new_file": false,
+      "bytes": 116695,
+      "sha256": "5102e96cf50291f6ef2721327bc410d04a3c93c79ac4a6e49cfd0944d3f47be8",
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/getrows.cu",
+      "new_file": false,
+      "bytes": 28375,
+      "sha256": "2c47d6723f21262bbfb1ead1f7ef8eea9791d3b35d240f81ce7c4512abbb770e",
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/pool2d.cu",
+      "new_file": false,
+      "bytes": 8723,
+      "sha256": "aaab83b124f6ea9fc7c5a05f4cfd74208ce091047b0ab4abe83394c30d0ccbc5",
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-rpc/ggml-rpc.cpp",
+      "new_file": false,
+      "bytes": 131474,
+      "sha256": "da2e6f3187853c65e6bd3a3b3295f896235ffce146d9dab4e59a91fb4830bace",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "third_party/ggml/src/ggml-rpc/indexed_weights.h",
+      "new_file": true,
+      "bytes": 4105,
+      "sha256": "424476aff67c90a71141ea5c07e319e88e2d623361143f7575e1e35c26eb5dea",
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup."
+    },
+    {
+      "path": "third_party/hybrimoe/LICENSE",
+      "new_file": true,
+      "bytes": 11357,
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime."
+    },
+    {
+      "path": "third_party/moe-infinity/LICENSE",
+      "new_file": true,
+      "bytes": 11347,
+      "sha256": "b54cda09d3828700460612b54c991dbe087966753ca414f0810d42ee9225fad7",
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime."
+    }
+  ],
+  "counts": {
+    "experiment": 24,
+    "local-attribution": 4,
+    "local-extension": 20,
+    "local-kernel-candidate": 4,
+    "local-temporary": 3,
+    "local-with-experimental-policy": 1,
+    "mixed": 8,
+    "reuse-upstream": 4,
+    "validation": 30
+  },
+  "unclassified": [],
+  "note": "File ownership is not a claim that mixed files or the current binary exclude experimental branches.",
+  "patches": {
+    "0001-user-defined-tokens.patch": "e5faa79e188b553ddef4058651ec21a498cb8cd08f31b5af999a0691c57cfc5e",
+    "0002-buffered-stream-heartbeats.patch": "af7893083b8a7d24c8dd9e2ced7bc4b9f7df3ee4abf2a966f3630c47478fc44a"
+  },
+  "full_source_patch_sha256": "a0c831afd4c0fd58fe50dbe1a17d2c83bd650eeb84a2c859b1fb107cc4a87847"
+}

@@ -22,6 +22,15 @@
 // a pread from the on-disk weight blob — nothing else changes.
 
 #include <cstdint>
+#include <memory>
+#include "host_expert_cache.h"
+#include "gpu_lru_index.h"
+#include "expert_admission.h"
+#include "ram_ssd_admission.h"
+#include "prefill_cache_policy.h"
+#include "expert_ssd_read_phase.h"
+#include "activation_policy.h"
+#include <future>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +44,8 @@ typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 namespace questwend {
 
 class Model;
+class PersistentExpertIO;
+class ExpertWeightAudit;
 
 class ExpertCache {
 public:
@@ -63,7 +74,7 @@ public:
     // Make `layer`'s selected experts resident for all three roles, copying
     // misses into VRAM. Fills the three parallel slot-id arrays (length n each).
     void ensure(int layer, const int32_t * expert_ids, int n,
-                int32_t * slot_gate, int32_t * slot_up, int32_t * slot_down);
+                int32_t * slot_gate, int32_t * slot_up, int32_t * slot_down, bool record_demand = true);
 
     // Slot-pool tensor for a given layer/role (mul_mat_id weight arg).
     ggml_tensor * tensor(Role role, int layer) const;
@@ -96,7 +107,14 @@ public:
     void ensure_resident(int layer, int expert);
 
     struct Stats { uint64_t hits = 0, misses = 0, evictions = 0;
-                   double fetch_ms = 0; uint64_t fetch_bytes = 0; };
+                   double fetch_ms = 0; uint64_t fetch_bytes = 0;
+                   bool direct_covering_requested = false;
+                   uint64_t direct_covering_batches = 0, direct_covering_fallback_batches = 0;
+                   uint64_t direct_covering_read_jobs = 0, direct_covering_payload_bytes = 0;
+                   uint64_t direct_covering_requested_bytes = 0;
+                   uint64_t pipeline_batches = 0, pipeline_jobs = 0;
+                   uint64_t pipeline_ram_bytes = 0, pipeline_file_bytes = 0;
+                   double pipeline_owner_wait_ms = 0, pipeline_owner_work_ms = 0; };
     const Stats & stats() const { return stats_; }
 
     // ---- per-layer instrumentation (QWEN_LAYER_STATS) ----
@@ -146,6 +164,31 @@ public:
     // Persist the access-frequency profile (hot experts) for warm restarts, and
     // pre-fill the VRAM slots from a saved profile before generation starts.
     bool   save_profile(const std::string & path) const;
+    bool   save_tier_stats(const std::string & path) const;
+    bool has_host_cache() const { return host_cache_ != nullptr; }
+    struct OwnerStagingCapacity {
+        size_t pinned_requested_bytes = 0;
+        size_t pageable_vector_capacity_bytes = 0;
+    };
+    // Explicit owner-thread profile boundary only. No backend calls or buffer
+    // reads; excludes worker-private bounce buffers and OS/allocator overhead.
+    OwnerStagingCapacity owner_staging_capacity() const {
+        OwnerStagingCapacity result;
+        result.pinned_requested_bytes = stage_cap_ + coal_stage_cap_ +
+            (victim_stage_ ? (64ull << 20) : 0);
+        result.pageable_vector_capacity_bytes = stage_.capacity() + coal_buf_.capacity() + abuf_.capacity();
+        return result;
+    }
+    void note_demands(int layer, const int32_t * ids, int count);
+    void promote_hot_demand(int layer, const int32_t * ids, int count);
+    bool uses_transient_admission() const { return transient_admission_; }
+    // Synchronized entry boundary: scratch for this batch selection union, capped at a layer.
+    // Kernel batching and source-prefill cache policy are independent.
+    void set_phase_workspace(bool batched, int token_count, bool source_prefill = true);
+    bool host_resident(int layer, int expert, bool touch = true);
+    void activation_lookahead(int current_layer);
+    void copy_host_slab(Role role, int layer, int expert, void * destination, size_t bytes);
+    std::shared_ptr<const uint8_t[]> borrow_host_slab(Role role, int layer, int expert, size_t bytes);
     size_t load_prefetch(const std::string & path);   // returns # experts prefetched
 
 private:
@@ -154,10 +197,12 @@ private:
         uint8_t *     host = nullptr;       // host-visible slot memory (unified-memory
                                             // backends only): SSD reads go straight in
         int           role = 0;
+        int           scratch_slots = 0;
         int           n_slots = 0;
         std::unordered_map<int, int> key2slot;  // key = layer*n_expert+expert
         std::vector<int>      slot2key;         // -1 = empty
         std::vector<uint64_t> clk;              // LRU timestamps
+        std::unique_ptr<GpuLruIndex> lru_index;  // opt-in exact unconstrained scan accelerator
         std::unordered_map<int, uint64_t> count;  // access frequency per key
         std::vector<int32_t>  slot_of;          // key -> slot (0 sentinel if absent)
         std::vector<int>      quota;            // per layer: max slots here (-1 = not served)
@@ -171,7 +216,11 @@ private:
     int  slot_for(Pool & pool, int layer, int expert, Role role);
     int  reserve_victim(Pool & pool, int key);   // evict + claim a slot, no fetch
     int  pick_victim(Pool & pool, int layer);    // quota-aware LRU slot choice
+    void touch_slot(Pool & pool, int slot);
+    void rebuild_gpu_lru_indexes();
+    void validate_gpu_lru_indexes() const;
     void compute_quota(std::vector<int> & q) const;  // the greedy, without applying it
+    void release_victim(Pool & pool, int slot);
     void drop_slot(Pool & pool, int slot);       // release a slot's key (occ/maps/stats)
     void fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot);
     void fetch_parallel(int layer, std::vector<FetchJob> & jobs);  // SSD: parallel pread + serial H2D
@@ -184,12 +233,14 @@ private:
     ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buf_ = nullptr;
 
+    ExpertSsdReadPhase ssd_read_phase_; // Owner-only; snapshots passed to CPU readers.
     bool  ssd_  = false;
     bool  direct_ = false;                    // Windows: FILE_FLAG_NO_BUFFERING reads
                                               // (bypass the OS page cache; QWEN_SSD_DIRECT)
     std::unordered_map<std::string, void *> hfiles_;  // path -> HANDLE (direct, main thread)
     std::vector<uint8_t> abuf_;               // aligned staging for direct reads (main thread)
     int   prefetch_threads_ = 1;              // parallel SSD read workers
+    std::unique_ptr<PersistentExpertIO> io_workers_; // Opt-in persistent singles-path readers
     std::vector<size_t>      foff_[N_ROLE];   // file offset of expert tensor (role,layer)
     std::vector<std::string> fpath_[N_ROLE];  // shard file of expert tensor (role,layer)
     std::unordered_map<std::string, void *> files_;  // path -> FILE* (lazy open)
@@ -225,6 +276,51 @@ private:
     void *                     stage_ptr_ = nullptr;  // base of stage_buf_
     size_t                     stage_cap_ = 0;        // bytes of stage_buf_
     void * stage_host(size_t nbytes);                 // ptr to >= nbytes pinned (or pageable) staging
+
+    std::unique_ptr<ExpertWeightAudit> weight_audit_;
+    std::unique_ptr<HostExpertCache> host_cache_;
+    std::unique_ptr<ExpertAdmission> admission_;
+    RamSsdAdmission ram_ssd_admission_;
+    std::unique_ptr<ActivationPolicy> activation_;
+    bool infinity_policy_ = false;
+    bool activation_scores_ = false, activation_prefetch_ = false;
+    double gpu_victim_selection_ms_ = 0, activation_observe_ms_ = 0;
+    double prediction_rank_ms_ = 0, prediction_commit_ms_ = 0, prediction_submit_ms_ = 0;
+    uint64_t gpu_victim_calls_ = 0, gpu_victim_candidates_ = 0;
+    uint64_t unused_retention_decisions_skipped_ = 0; // Owner-only actual covered-role occurrences.
+    bool gpu_lru_index_enabled_ = false;
+    uint64_t gpu_lru_index_calls_ = 0, gpu_lru_index_candidates_ = 0;
+    uint64_t gpu_lru_bitmap_words_ = 0, gpu_lru_index_rebuilds_ = 0;
+    double gpu_lru_index_rebuild_ms_ = 0;
+    struct PredictedSlab { int role, layer, expert; std::vector<uint8_t> data; };
+    std::future<std::vector<PredictedSlab>> prediction_future_;
+    std::vector<std::vector<int>> predicted_;
+    uint64_t prediction_calls_ = 0, prediction_candidates_ = 0, prediction_hits_ = 0;
+    uint64_t prediction_bytes_ = 0, prediction_inserted_bytes_ = 0, prediction_errors_ = 0;
+    double prediction_plan_ms_ = 0;
+    std::vector<uint8_t> active_demands_;
+    bool transient_admission_ = false;
+    bool phase_workspace_ = false;
+    PrefillCachePolicy prefill_cache_policy_;
+    uint64_t transient_role_fills_ = 0, retained_role_fills_ = 0, proactive_promotions_ = 0;
+    bool can_retain(int layer, int expert);
+    bool transient_slot(const Pool & pool, int slot) const { return slot >= pool.n_slots; }
+    uint64_t ram_key(int role, int layer, int expert) const;
+    void demote_to_ram(Pool & pool, int slot, int key);
+    void remember_ssd_slab(int role, int layer, int expert, const void * data, size_t bytes, bool retain = false);
+    bool readthrough_ram_ = false;
+    uint64_t cache_min_free_bytes_ = 2560ull << 20;
+    double admission_ms_ = 0;
+    uint64_t ram_ssd_rejected_copies_ = 0, ram_ssd_rejected_bytes_ = 0;
+    struct PendingVictim { uint64_t key; size_t offset, bytes; };
+    std::vector<PendingVictim> pending_victims_;
+    ggml_backend_buffer_t victim_stage_ = nullptr;
+    size_t victim_used_ = 0;
+    uint64_t victim_batches_ = 0;
+    bool batch_victims_ = false;
+    void flush_victims();
+    double demotion_ms_ = 0;
+    uint64_t demotion_bytes_ = 0;
 
     Stats stats_;
     // per-layer counters (indexed by layer); see dump_layer_stats()

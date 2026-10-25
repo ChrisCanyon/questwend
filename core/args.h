@@ -19,6 +19,7 @@ namespace questwend {
 struct CommonOptions {
     std::string model_path;                 // -m
     int         n_ctx = 0;                  // --n-ctx (0 = the model's trained length)
+    std::string kv_cache_type = "f16"; // --kv-cache-type f16|q8_0
     bool        force_cpu = false;          // --cpu
     std::string cache_profile;              // --cache-profile
     std::string mmproj_path;                // --mmproj
@@ -31,6 +32,7 @@ struct CommonOptions {
     float       repeat_penalty = 1.0f;      // --repeat-penalty <f>
 
     // Multi-GPU plan, as typed. build_gpu_plan() combines them (see apply()).
+    std::vector<std::string> rpc_endpoints; // loopback SSH forwarding endpoints
     std::vector<int>    gpu_ids;            // --gpus
     std::vector<float>  gpu_split;          // --gpu-split ("auto" leaves this empty)
     bool                gpu_split_given = false;

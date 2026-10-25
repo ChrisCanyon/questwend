@@ -45,6 +45,20 @@ static __device__ __forceinline__ void cp_async_cg_16(const unsigned int dst, co
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// Same async-copy destination/participation as the ordinary16-byte loader,
+// but PTX src-size=0 writes zeros without reading historical global K/V.
+// No cache-prefetch hint is requested on this zero-source operation.
+static __device__ __forceinline__ void cp_async_cg_16_zero(
+        const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;"
+        : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED_VARS(dst, src);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Makes each thread wait until its asynchronous data copies are done.
 // This does NOT provide any additional synchronization.
 // In particular, when copying data with multiple warps a call to __syncthreads will be needed.

@@ -70,6 +70,13 @@ static Arch arch_from_string(const std::string & s) {
            name.find("ffn_down_exps") != std::string::npos;
 }
 
+bool Model::selected_weight(const std::string & name) const {
+    if (window_first_ < 0) return true;
+    int layer = -1;
+    return std::sscanf(name.c_str(), "blk.%d.", &layer) == 1 &&
+        layer >= window_first_ && layer < window_last_;
+}
+
 bool Model::has_expert_tensors() const {
     for (auto & kv : tensors_) {
         if (is_expert_tensor(kv.first)) return true;
@@ -91,7 +98,7 @@ bool Model::is_offloaded_expert(const std::string & name) const {
 size_t Model::offloaded_expert_bytes() const {
     size_t n = 0;
     for (auto & kv : tensors_)
-        if (is_offloaded_expert(kv.first)) n += ggml_nbytes(kv.second);
+        if (selected_weight(kv.first) && is_offloaded_expert(kv.first)) n += ggml_nbytes(kv.second);
     return n;
 }
 
@@ -138,10 +145,10 @@ static bool need_embd_fallback(ggml_backend_t backend, const ggml_tensor * te,
 
 size_t Model::weight_bytes(ggml_backend_t backend) const {
     size_t n = 0;
-    for (auto & kv : tensors_) n += ggml_nbytes(kv.second);
+    for (auto & kv : tensors_) if (selected_weight(kv.first)) n += ggml_nbytes(kv.second);
     // The get_rows fallback copy is an extra resident tensor, not a replacement:
     // load_weights_* keeps the quantized original for the output head.
-    ggml_tensor * te = tensor("token_embd.weight");
+    ggml_tensor * te = window_first_ < 0 ? tensor("token_embd.weight") : nullptr;
     if (backend && need_embd_fallback(backend, te, /*verbose=*/false))
         n += ggml_row_size(embd_q8_ ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, te->ne[0]) * te->ne[1];
     return n;
@@ -359,7 +366,7 @@ void Model::load_weights_split(
     const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // ---- Prep embedding fallback copy (same as single-backend path) ----
-    ggml_tensor * te = tensor("token_embd.weight");
+    ggml_tensor * te = window_first_ < 0 ? tensor("token_embd.weight") : nullptr;
     tok_embd_rows_ = te;
     const bool need_f32_embd = need_embd_fallback(gpu_backend, te);
     if (need_f32_embd) {
@@ -385,6 +392,7 @@ void Model::load_weights_split(
     std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     std::vector<ggml_tensor *> exp_tensors;     // offloaded experts (kept ordered)
     for (auto & kv : tensors_) {
+        if (!selected_weight(kv.first)) continue;
         if (is_offloaded_expert(kv.first)) exp_tensors.push_back(kv.second);
         else gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
@@ -420,6 +428,7 @@ void Model::load_weights_split(
     size_t gpu_bytes = 0, cpu_bytes = 0;
 
     for (auto & kv : tensors_) {
+        if (!selected_weight(kv.first)) continue;
         ggml_tensor * t = kv.second;
         const size_t nb = ggml_nbytes(t);
         buf.resize(nb);
@@ -491,7 +500,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
     const size_t n_dev = (plan && plan->n_dev() > 1) ? plan->n_dev() : 1;
 
     // token-embedding fallback (same as load_weights)
-    ggml_tensor * te = tensor("token_embd.weight");
+    ggml_tensor * te = window_first_ < 0 ? tensor("token_embd.weight") : nullptr;
     tok_embd_rows_ = te;
     const bool need_f32_embd = need_embd_fallback(gpu_backend, te);
     if (need_f32_embd) {
@@ -513,6 +522,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
 
     std::vector<std::vector<ggml_tensor *>> gpu_tensors(n_dev);
     for (auto & kv : tensors_) {
+        if (!selected_weight(kv.first)) continue;
         if (is_offloaded_expert(kv.first)) continue;   // stays on SSD
         gpu_tensors[n_dev > 1 ? (size_t) plan->dev_of_name(kv.first) : 0].push_back(kv.second);
     }
@@ -539,6 +549,7 @@ void Model::load_weights_ssd(ggml_backend_t gpu_backend,
     size_t gpu_bytes = 0, ssd_bytes = 0;
 
     for (auto & kv : tensors_) {
+        if (!selected_weight(kv.first)) continue;
         ggml_tensor * t = kv.second;
         const size_t nb = ggml_nbytes(t);
         if (is_offloaded_expert(kv.first)) { ssd_bytes += nb; continue; }   // not loaded

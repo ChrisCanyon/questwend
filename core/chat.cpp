@@ -270,9 +270,19 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
     const bool has_system = !messages.empty() && messages[0].role == "system";
     if (has_system && has_image(messages[0]))
         throw std::runtime_error("chat: system message cannot contain images");
+    std::string reasoning_instructions;
+    if (opts.qwen38_template && opts.reasoning) {
+        if (opts.reasoning_effort == "xhigh")
+            reasoning_instructions = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+        else if (opts.reasoning_effort == "low")
+            reasoning_instructions = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+        else if (opts.reasoning_effort != "medium")
+            throw std::runtime_error("chat: reasoning effort must be xhigh, medium, or low");
+    }
     if (!opts.tools_json.empty()) {
         emit_tok(im_start);
         emit_text("system\n");
+        if (!reasoning_instructions.empty()) emit_text(reasoning_instructions + "\n\n");
         emit_text("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for (const auto & t : opts.tools_json) emit_text("\n" + t);
         emit_text("\n</tools>");
@@ -285,11 +295,23 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
         emit_tok(im_end);
         emit_text("\n");
     } else if (has_system) {
+        const std::string content = trim_ws(flat_text(messages[0]));
+        if (!opts.qwen38_template || !content.empty() || !reasoning_instructions.empty()) {
+            emit_tok(im_start);
+            emit_text("system\n" + reasoning_instructions);
+            if (!content.empty()) {
+                if (!reasoning_instructions.empty()) emit_text("\n\n");
+                emit_text(content);
+            }
+            emit_tok(im_end);
+            emit_text("\n");
+        }
+        msg_begin = 1;
+    } else if (!reasoning_instructions.empty()) {
         emit_tok(im_start);
-        emit_text("system\n" + trim_ws(flat_text(messages[0])));
+        emit_text("system\n" + reasoning_instructions);
         emit_tok(im_end);
         emit_text("\n");
-        msg_begin = 1;
     }
 
     // ---- last "real" user query index (tool responses don't count) ----
@@ -345,7 +367,7 @@ ChatPrompt build_qwen_prompt(const Tokenizer & tok,
             // clients that never echo reasoning (e.g. OpenCode), so it is not kept.
             const bool keep_think =
                 ((int) i > last_query_index ||
-                 (opts.preserve_thinking && !reasoning.empty())) &&
+                 (opts.preserve_thinking && (opts.qwen38_template || !reasoning.empty()))) &&
                 think_open >= 0 && think_close >= 0;
             if (keep_think) {
                 emit_text("assistant\n");

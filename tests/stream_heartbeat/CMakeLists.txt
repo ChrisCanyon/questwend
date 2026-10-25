@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(stream_heartbeat_regression LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+enable_testing()
+add_executable(qw-stream-heartbeat-test ../stream_heartbeat_test.cpp)
+target_include_directories(qw-stream-heartbeat-test PRIVATE ../../server)
+add_test(NAME stream-heartbeat COMMAND qw-stream-heartbeat-test)

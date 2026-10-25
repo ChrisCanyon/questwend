@@ -53,6 +53,8 @@ struct ChatPromptOptions {
     bool add_generation_prompt = true;
     bool reasoning             = true;   // enable_thinking (generation prompt only)
     bool preserve_thinking     = false;  // keep <think> blocks of all past assistant turns
+    bool qwen38_template       = false;  // Flash-Next's current official template
+    std::string reasoning_effort = "xhigh";
     bool add_vision_id         = false;  // prefix images with "Picture N: "
     int  n_image_tokens        = 1;      // <|image_pad|> repetitions per image (e.g. 576)
     std::vector<std::string> tools_json; // pre-serialized JSON, one per tool

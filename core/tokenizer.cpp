@@ -86,6 +86,7 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
     ignore_merges_ = pre_ == Pre::LLAMA3;
 
     id_to_token_ = vocab.tokens;
+    control_token_.assign(vocab.tokens.size(), false);
     token_ids_.reserve(vocab.tokens.size());
     for (int32_t i = 0; i < (int32_t) vocab.tokens.size(); ++i) {
         token_ids_[vocab.tokens[i]] = i;
@@ -98,6 +99,7 @@ Tokenizer::Tokenizer(const Vocab & vocab) {
     // input rather than byte-encoded and merged.
     for (size_t i = 0; i < vocab.tokens.size() && i < vocab.token_types.size(); ++i) {
         const int t = vocab.token_types[i];
+        control_token_[i] = t == 3;
         if ((t == 3 || t == 4) && !vocab.tokens[i].empty()) {
             special_.emplace_back(vocab.tokens[i], (int32_t) i);
             special_first_[(uint8_t) vocab.tokens[i][0]] = true;
@@ -377,9 +379,11 @@ std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) cons
     return ids;
 }
 
-int32_t Tokenizer::match_special(const std::string & text, size_t pos, size_t * len) const {
+int32_t Tokenizer::match_special(const std::string & text, size_t pos, size_t * len,
+                                bool parse_special) const {
     if (!special_first_[(uint8_t) text[pos]]) return -1;
     for (const auto & sp : special_) {                 // longest first
+        if (!parse_special && control_token_[sp.second]) continue;
         if (text.compare(pos, sp.first.size(), sp.first) == 0) {
             *len = sp.first.size();
             return sp.second;
@@ -410,9 +414,9 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text, bool add_bos,
     // Split on special tokens first; everything between them goes through the
     // pre-tokenizer as usual.
     size_t run = 0;
-    for (size_t i = 0; parse_special && i < text.size(); ) {
+    for (size_t i = 0; i < text.size(); ) {
         size_t len = 0;
-        const int32_t sp = match_special(text, i, &len);
+        const int32_t sp = match_special(text, i, &len, parse_special);
         if (sp < 0) { ++i; continue; }
         flush(run, i);
         ids.push_back(sp);

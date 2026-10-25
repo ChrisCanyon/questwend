@@ -24,7 +24,23 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
 
     if      (a == "-m"        && has_val) o.model_path = next();
     else if (a == "--n-ctx"   && has_val) o.n_ctx = std::stoi(next());
+    else if (a == "--kv-cache-type" && has_val) {
+        const std::string value = next();
+        if (value != "f16" && value != "q8_0") {
+            fprintf(stderr, "error: --kv-cache-type takes f16 or q8_0\n");
+            return ArgResult::Error;
+        }
+        o.kv_cache_type = value;
+    }
     else if (a == "--cpu")                o.force_cpu = true;
+    else if (a == "--expert-ram-cache" && has_val) {
+        const size_t mib = parse_vram_budget_mb(next());
+        if (mib > 1024ull * 1024ull) {
+            fprintf(stderr, "error: expert RAM cache budget exceeds the supported bound\n");
+            return ArgResult::Error;
+        }
+        set_knob("QWEN_EXPERT_RAM_CACHE_MB", std::to_string(mib).c_str());
+    }
     else if (a == "--mmproj"  && has_val) o.mmproj_path = next();
     else if (a == "--cache-profile" && has_val) o.cache_profile = next();
     else if (a == "--ngram"   && has_val) o.ngram_mode = next();
@@ -48,6 +64,21 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
             fprintf(stderr, "error: --experts takes ram, ssd or auto (got %s)\n", v.c_str());
             return ArgResult::Error;
         }
+    }
+    else if (a == "--rpc" && has_val) {
+        const std::string endpoints = next();
+        size_t start = 0;
+        do {
+            const size_t end = endpoints.find(',', start);
+            const std::string endpoint = endpoints.substr(start, end == std::string::npos ? end : end - start);
+            if (endpoint.rfind("127.0.0.1:", 0) != 0 || endpoint.size() <= 10) {
+                fprintf(stderr, "error: --rpc requires loopback SSH forwarding endpoints\n");
+                return ArgResult::Error;
+            }
+            o.rpc_endpoints.push_back(endpoint);
+            if (end == std::string::npos) break;
+            start = end + 1;
+        } while (start < endpoints.size());
     }
     else if (a == "--gpus" && has_val) {
         const std::string v = next();
@@ -143,6 +174,7 @@ void reserve_vision_tower_vram(CommonOptions & o, size_t tower_bytes) {
 }
 
 bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
+    cfg.kv_cache_type = o.kv_cache_type;
     cfg.n_ctx    = o.n_ctx;
     cfg.use_cuda = !o.force_cpu;
     if (!build_gpu_plan(o.gpu_ids, o.gpu_split, o.gpu_split_given, o.vram_list, cfg.gpus))
@@ -152,6 +184,7 @@ bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
     cfg.vram_budget_mb = 0;
     if (cfg.gpus.size() <= 1 && !o.vram_list.empty() && o.vram_list[0] != VRAM_BUDGET_AUTO)
         cfg.vram_budget_mb = o.vram_list[0];
+    cfg.rpc_endpoints = o.rpc_endpoints;
     cfg.cache_profile  = o.cache_profile;
     cfg.expert_tier    = o.tier();
     cfg.ngram_mode     = o.ngram_mode;
@@ -166,12 +199,14 @@ void print_common_help(FILE * out) {
         "model and runtime:\n"
         "  -m <file>           model .gguf (required)\n"
         "  --n-ctx <N>         context length (default: the model's trained length)\n"
+        "  --kv-cache-type <f16|q8_0>  attention K/V storage (default f16); Q8 requires CUDA flash attention\n"
         "  --reasoning <on|off>  thinking mode (default on)\n"
         "  --repeat-penalty <f>  repetition penalty over the recent tokens (default 1 = off)\n"
         "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
         "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
         "  --draft <N>         MTP draft length (default 1)\n"
         "  --embd-q8           use Q8_0 (not F16) for the embedding fallback (saves ~45%% VRAM)\n"
+        "  --expert-ram-cache <GB>  bounded RAM victim cache below local GPU pools (default off)\n"
         "  --cpu               force CPU backend\n"
         "GPU memory:\n"
         "  --vram-budget <GB>  VRAM the model may use (default: what the device has free)\n"
@@ -180,6 +215,7 @@ void print_common_help(FILE * out) {
         "                      auto = that GPU's free VRAM (same as omitting it);\n"
         "                      0 = that GPU is not used at all (13.5,auto and 5g,0\n"
         "                      are both valid)\n"
+        "  --rpc <endpoints>   experimental loopback RPC workers; requires matching ggml RPC backend\n"
         "  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n"
         "                      Naming two devices -- here or via --vram-budget --\n"
         "                      is what asks for two GPUs; without a --vram-budget\n"

@@ -1,5 +1,13 @@
 #include "expert_cache.h"
+#include "cache_memory_budget.h"
+#include "workspace_partition.h"
+#include "gpu_lru_pool_hooks.h"
+#include "expert_io_workers.h"
+#include "expert_install_check.h"
+#include "expert_readiness.h"
+#include "expert_weight_audit.h"
 #include "model.h"
+#include "rpc_weights.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -28,8 +36,26 @@
 #define NOMINMAX
 #include <windows.h>
 #endif
+#include "expert_ssd_windows.h"
 
 namespace questwend {
+
+// Protect every expert referenced by the current graph until its slot mapping
+// is complete. Nested promotion/ensure calls preserve the outer protection.
+struct ActiveExpertGuard {
+    std::vector<uint8_t> & flags;
+    std::vector<size_t> changed;
+    ActiveExpertGuard(std::vector<uint8_t> & protected_ids, int layer, int width,
+                     const int32_t * ids, int count) : flags(protected_ids) {
+        if (flags.empty()) return;
+        for (int index = 0; index < count; ++index) {
+            const size_t key = (size_t) layer * width + ids[index];
+            if (key >= flags.size()) throw std::out_of_range("Invalid protected expert");
+            if (!flags[key]) { flags[key] = 1; changed.push_back(key); }
+        }
+    }
+    ~ActiveExpertGuard() { for (size_t key : changed) flags[key] = 0; }
+};
 
 #ifdef __APPLE__
 // Is `p` a dereferenceable host pointer (mapped in our address space)?
@@ -45,35 +71,18 @@ static bool ptr_is_mapped(const void * p) {
 }
 #endif
 
-#ifdef _WIN32
-// Positioned read with FILE_FLAG_NO_BUFFERING semantics: offset, length and
-// buffer must be sector-aligned, so read the covering aligned range into an
-// (over-allocated) aligned staging vector and copy the slab out. Bypasses the
-// OS page cache — true SSD reads even when the GGUF fits in RAM.
-static bool win_direct_read(void * h, void * dst, size_t nbytes, uint64_t off,
-                            std::vector<uint8_t> & abuf) {
-    const uint64_t SEC = 4096;
-    const uint64_t a0   = off & ~(SEC - 1);
-    const uint64_t a1   = (off + nbytes + SEC - 1) & ~(SEC - 1);
-    const size_t   alen = (size_t) (a1 - a0);
-    if (abuf.size() < alen + SEC) abuf.resize(alen + SEC);
-    uint8_t * ap = (uint8_t *) (((uintptr_t) abuf.data() + SEC - 1) & ~(uintptr_t) (SEC - 1));
-    OVERLAPPED ov{};
-    ov.Offset     = (DWORD) (a0 & 0xffffffffull);
-    ov.OffsetHigh = (DWORD) (a0 >> 32);
-    DWORD got = 0;
-    if (!ReadFile((HANDLE) h, ap, (DWORD) alen, &got, &ov)) return false;
-    if ((uint64_t) got + a0 < off + nbytes) return false;   // short read (EOF)
-    memcpy(dst, ap + (off - a0), nbytes);
-    return true;
-}
 
-static void * win_direct_open(const std::string & path) {
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
-    return h == INVALID_HANDLE_VALUE ? nullptr : (void *) h;
-}
+
+static ExpertIOClosers expert_io_closers() {
+    ExpertIOClosers result;
+#ifdef __APPLE__
+    result.descriptor = [](int fd) { close(fd); };
 #endif
+#ifdef _WIN32
+    result.direct = [](void * handle) { CloseHandle((HANDLE) handle); };
+#endif
+    return result;
+}
 
 static const char * role_fmt(ExpertCache::Role r) {
     switch (r) {
@@ -102,8 +111,75 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     };
 
     backend_ = gpu_backend;
+    if (const char * enabled = getenv("QWEN_GPU_LRU_INDEX")) {
+        const std::string selected(enabled);
+        if (selected != "0" && selected != "1")
+            throw std::invalid_argument("QWEN_GPU_LRU_INDEX must be 0 or 1");
+        gpu_lru_index_enabled_ = selected == "1";
+    }
     if (getenv("QWEN_SYNC_FETCH")) async_fetch_ = false;   // A/B: force synchronous H2D
 
+    if (const char * value = getenv("QWEN_EXPERT_RAM_CACHE_MB")) {
+        const size_t mib = std::stoull(value);
+        if (mib) {
+            if (!ssd_ || std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0)
+                throw std::runtime_error("Bounded RAM victim caching currently requires a local SSD-tier GPU");
+            cache_min_free_bytes_ = parse_cache_min_free_mb(getenv("QWEN_CACHE_MIN_FREE_MB"));
+            host_cache_ = std::make_unique<HostExpertCache>(mib * 1024ull * 1024ull);
+            batch_victims_ = getenv("QWEN_RAM_DEMOTE_BATCH") != nullptr;
+            const char * policy = getenv("QWEN_EXPERT_RAM_POLICY");
+            readthrough_ram_ = policy && std::string(policy) == "readthrough";
+            fprintf(stderr, "expert RAM cache: %zu MiB maximum, %s\n", mib,
+                readthrough_ram_ ? "read-through (no GPU downloads)" : "exclusive victim");
+        }
+    }
+
+    weight_audit_ = ExpertWeightAudit::from_environment(n_layer_);
+    if (weight_audit_ && (!ssd_ || std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0))
+        throw std::runtime_error("Expert byte audit requires local SSD-tier execution");
+
+    const char * preserve_decode = getenv("QWEN_PRESERVE_DECODE_CACHE");
+    prefill_cache_policy_.set_enabled(preserve_decode && std::string(preserve_decode) != "0");
+    transient_admission_ = getenv("QWEN_TINYLFU_ADMISSION") != nullptr;
+    phase_workspace_ = transient_admission_ && getenv("QWEN_PHASE_WORKSPACE") != nullptr;
+    if (transient_admission_ && (!host_cache_ || readthrough_ram_ || getenv("QWEN_FASTCACHE")))
+        throw std::runtime_error("Transient admission requires the exclusive RAM tier and exact segmented execution");
+    infinity_policy_ = getenv("QWEN_MOE_INFINITY") != nullptr;
+    activation_scores_ = infinity_policy_ && !getenv("QWEN_DISABLE_ACTIVATION_SCORES");
+    activation_prefetch_ = infinity_policy_ && !getenv("QWEN_DISABLE_ACTIVATION_PREFETCH");
+    // RAM replacement is independent of GPU TinyLFU admission/victim policy.
+    if (const char * replacement = getenv("QWEN_RAM_REPLACEMENT")) {
+        const std::string selected(replacement);
+        if (selected != "lru" && selected != "s3fifo-role-slabs")
+            throw std::invalid_argument("QWEN_RAM_REPLACEMENT must be lru or s3fifo-role-slabs");
+        if (selected == "s3fifo-role-slabs") {
+            if (!host_cache_ || readthrough_ram_)
+                throw std::invalid_argument("S3FIFO experiment requires an exclusive RAM victim cache");
+            if (activation_scores_)
+                throw std::invalid_argument("S3FIFO RAM replacement conflicts with activation scores");
+            const uint64_t keys = static_cast<uint64_t>(N_ROLE) * n_layer_ * n_expert_;
+            if (!keys || keys >= RamS3FifoMetadata::none)
+                throw std::invalid_argument("RAM S3FIFO dense key count is out of range");
+            size_t largest_role = 0;
+            for (int layer = 0; layer < n_layer_; ++layer) {
+                if (!owns(layer)) continue;
+                for (int role = 0; role < N_ROLE; ++role)
+                    largest_role = std::max(largest_role, role_tensor(model, (Role) role, layer)->nb[2]);
+            }
+            host_cache_->enable_s3fifo_role_slabs(static_cast<uint32_t>(keys), largest_role);
+            fprintf(stderr, "expert RAM replacement: s3fifo-role-slabs (experimental)\n");
+        }
+    }
+    if (infinity_policy_ && !transient_admission_)
+        throw std::runtime_error("Activation policy needs the tested exclusive/transient execution path");
+    if (infinity_policy_ || getenv("QWEN_ACTIVATION_TRACE")) {
+        activation_ = std::make_unique<ActivationPolicy>(n_layer, n_expert);
+        predicted_.resize(n_layer);
+        if (const char * manifest = getenv("QWEN_ACTIVATION_REFERENCES")) activation_->load_references(manifest);
+        if (activation_scores_) host_cache_->set_priority([this](uint64_t key) {
+            return activation_->priority(key % ((uint64_t) n_layer_ * n_expert_));
+        }, getenv("QWEN_INDEXED_RAM_EVICTION") != nullptr);
+    }
     n_used_ = n_used;
     l_hits_.assign(n_layer, 0);  l_misses_.assign(n_layer, 0); l_evict_.assign(n_layer, 0);
     l_want_.assign(n_layer, 0);  l_wmiss_.assign(n_layer, 0);
@@ -123,6 +199,8 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 #ifdef _WIN32
         if (getenv("QWEN_SSD_DIRECT")) {
             direct_ = true;
+            if (ssd_read_phase_.buffered_source_enabled())
+                fprintf(stderr, "expert cache: buffered SOURCE prefill; direct decode/verification\n");
             fprintf(stderr, "expert cache: direct (unbuffered) SSD reads — OS page cache bypassed\n");
         }
 #endif
@@ -136,6 +214,12 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
                 foff_[r][il]  = model.tensor_file_offset(name);
                 fpath_[r][il] = model.tensor_file(name);
             }
+        }
+        const char * persistent_io = getenv("QWEN_PERSISTENT_EXPERT_IO");
+        if (persistent_io && std::string(persistent_io) != "0" &&
+            std::string(ggml_backend_name(backend_)).rfind("RPC", 0) != 0) {
+            io_workers_ = std::make_unique<PersistentExpertIO>(prefetch_threads_, expert_io_closers());
+            fprintf(stderr, "expert I/O: %d persistent workers, worker-local file handles\n", prefetch_threads_);
         }
     }
 
@@ -195,14 +279,35 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 
         pools_[s].t = t;
         pools_[s].role = sigs[s].role;
-        pools_[s].n_slots = n_slots;
-        pools_[s].slot2key.assign(n_slots, -1);
-        pools_[s].clk.assign(n_slots, 0);
+        // Physical pool size stays within the existing GPU budget. Reserve a
+        // full layer's possible experts as transient workspace so batched
+        // prefill can bypass admission without serializing into single tokens.
+        pools_[s].scratch_slots = transient_admission_ ? n_expert : 0;
+        if (n_slots <= pools_[s].scratch_slots + n_used)
+            throw std::runtime_error("GPU pool cannot fit transient workspace plus retained experts");
+        pools_[s].n_slots = n_slots - pools_[s].scratch_slots;
+        pools_[s].slot2key.assign(pools_[s].n_slots, -1);
+        pools_[s].clk.assign(pools_[s].n_slots, 0);
         pools_[s].slot_of.assign((size_t) n_layer * n_expert, 0);
         pools_[s].quota.assign(n_layer, -1);
         pools_[s].occ.assign(n_layer, 0);
+        if (gpu_lru_index_enabled_)
+            pools_[s].lru_index = std::make_unique<GpuLruIndex>(static_cast<size_t>(t->ne[2]));
     }
+    rebuild_gpu_lru_indexes();
 
+    if (transient_admission_) {
+        size_t role_slots = 0;
+        for (const auto & pool : pools_) role_slots += pool.n_slots;
+        admission_ = std::make_unique<ExpertAdmission>((size_t) n_layer * n_expert, role_slots / 3);
+        active_demands_.assign((size_t) n_layer * n_expert, 0);
+        fprintf(stderr, "expert admission: TinyLFU dense demand counts, transient GPU workspace, whole-expert eviction\n");
+    }
+    // Capture this opt-in policy once. An enabled policy requires the existing
+    // logical demand counters; a missing counter must not reject every expert.
+    ram_ssd_admission_ = RamSsdAdmission::from_environment(admission_ != nullptr);
+    if (ram_ssd_admission_.enabled())
+        fprintf(stderr, "RAM SSD admission: minimum %u logical hits\n", ram_ssd_admission_.minimum_hits());
     buf_ = ggml_backend_alloc_ctx_tensors(ctx_, gpu_backend);
     if (!buf_) {
         size_t want = 0;
@@ -237,6 +342,14 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 }
 
 ExpertCache::~ExpertCache() {
+    // Speculation owns private buffers and file handles. It never touches CUDA
+    // or managed residency from its thread; finish before destroying metadata.
+    if (prediction_future_.valid()) prediction_future_.wait();
+    io_workers_.reset(); // Join CPU I/O workers before their captured metadata/staging can be destroyed.
+    // Normal fetches drain all victims before overwriting a GPU slot. A failed
+    // fetch can leave queued downloads; drain before releasing their buffer.
+    if (!pending_victims_.empty()) ggml_backend_synchronize(backend_);
+    if (victim_stage_) ggml_backend_buffer_free(victim_stage_);
     for (auto & kv : files_) if (kv.second) fclose((FILE *) kv.second);
 #ifdef __APPLE__
     for (auto & kv : fds_) if (kv.second >= 0) close(kv.second);
@@ -303,6 +416,57 @@ ggml_tensor * ExpertCache::tensor(Role role, int layer) const {
         throw std::runtime_error("ExpertCache::tensor on layer " + std::to_string(layer) +
                                  " which this device does not serve");
     return pools_[layer_pool_[role][layer]].t;
+}
+
+void ExpertCache::set_phase_workspace(bool batched, int token_count, bool source_prefill) {
+    // Owner boundary: all prior foreground CPU readers have joined.
+    // Record genuine source phase even if the physical partition stays unchanged.
+    ssd_read_phase_.enter_phase(source_prefill);
+    // Record both phases even when physical workspace resizing is disabled.
+    prefill_cache_policy_.enter_phase(source_prefill);
+    if (!phase_workspace_) return;
+    const int scratch = bounded_workspace_scratch(n_expert_, n_used_, batched ? token_count : 1);
+    const auto plan = plan_workspace_partition(pools_, scratch, n_used_);
+    if (!plan.changed) return;
+    require_workspace_boundary(active_demands_);
+    // Allocate metadata before demoting any weights. Physical tensors and their
+    // dimensions are unchanged, so persistent graphs still reference the same buffers.
+    for (size_t index = 0; index < pools_.size(); ++index) {
+        auto & pool = pools_[index];
+        if (pool.t->ne[2] != pool.n_slots + pool.scratch_slots)
+            throw std::logic_error("Physical expert pool size changed");
+        pool.slot2key.reserve(plan.retained[index]);
+        pool.clk.reserve(plan.retained[index]);
+    }
+    flush_victims();
+    ggml_backend_synchronize(backend_);
+    coal_async_pending_ = false;
+    retire_workspace_tail(pools_, plan, [this](size_t index, int slot) {
+        release_victim(pools_[index], slot);
+    });
+    // Every demotion must finish before the old retained tail becomes scratch.
+    flush_victims();
+    ggml_backend_synchronize(backend_);
+    coal_async_pending_ = false;
+    commit_workspace_partition(pools_, plan);
+    // Retired tails were removed using the old prefix. Rebuild only after every
+    // retained vector has its new size; the physical pool/index allocation stays.
+    rebuild_gpu_lru_indexes();
+    size_t role_slots = 0, scratch_bytes = 0;
+    for (auto & pool : pools_) {
+        role_slots += pool.n_slots;
+        scratch_bytes += (size_t) pool.scratch_slots * pool.t->nb[2];
+        // These quotas were derived from the previous retained capacity. Keep
+        // demand counts but use unconstrained LRU until a later rebalance.
+        std::fill(pool.quota.begin(), pool.quota.end(), -1);
+    }
+    quota_on_ = false;
+    // Do not age preserved decode history against the temporary, smaller
+    // prefill retained capacity. Decode restores its own horizon.
+    if (prefill_cache_policy_.record_decode_frequency())
+        admission_->set_capacity(role_slots / N_ROLE);
+    fprintf(stderr, "expert workspace: %s, %d scratch slots per pool, %.1f MiB transient\n",
+        batched ? "batch" : "decode", scratch, scratch_bytes / 1048576.0);
 }
 
 int ExpertCache::min_slots() const {
@@ -471,6 +635,9 @@ void ExpertCache::rebalance(size_t fill_budget) {
 // Copy one expert's slab from the slower tier into a VRAM slot.
 // This is the tiering seam: RAM (tensor_get) vs SSD (pread from the GGUF file).
 void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst, int slot) {
+    const auto io_phase = ssd_read_phase_.begin_fetch(direct_);
+    const bool direct_read = io_phase.direct();
+    flush_victims();
     const auto t0 = std::chrono::steady_clock::now();
     ggml_tensor * src = role_tensor(model_, role, layer);
     const size_t nb2 = src->nb[2];
@@ -480,6 +647,12 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
     const void * hsrc;
     if (ssd_) {
         const size_t off = foff_[role][layer] + (size_t) expert * nb2;
+        if (fill_remote_expert(backend_, dst, fpath_[role][layer], off, nb2, (size_t) slot * nb2)) {
+            stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            stats_.fetch_bytes += nb2;
+            return;
+        }
 #ifdef __APPLE__
         // unified memory: pread straight into the slot (no staging, no memcpy)
         if (uint8_t * hp = host_of(dst)) {
@@ -501,8 +674,15 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 #endif
         // SSD tier: read the slab into a pinned staging buffer, then H2D from it.
         void * stage = stage_host(nb2);
+        if (host_cache_ && (readthrough_ram_ ? host_cache_->read(ram_key(role, layer, expert), stage, nb2) : host_cache_->take(ram_key(role, layer, expert), stage, nb2))) {
+            ggml_backend_tensor_set(dst, stage, (size_t) slot * nb2, nb2);
+            stats_.fetch_bytes += nb2;
+            stats_.fetch_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            return;
+        }
 #ifdef _WIN32
-        if (direct_) {
+        if (direct_read) {
             void *& hv = hfiles_[fpath_[role][layer]];
             if (!hv) hv = win_direct_open(fpath_[role][layer]);
             if (!hv || !win_direct_read(hv, stage, nb2, off, abuf_))
@@ -527,6 +707,7 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
 #ifdef _WIN32
         }
 #endif
+        remember_ssd_slab(role, layer, expert, stage, nb2);
     } else {
         // RAM tier: the expert weights live in a (pinned) CPU buffer -> H2D straight
         // from the source, no intermediate staging copy.
@@ -546,16 +727,402 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
     stats_.fetch_bytes += nb2;
 }
 
+uint64_t ExpertCache::ram_key(int role, int layer, int expert) const {
+    return ((uint64_t) role * n_layer_ + layer) * n_expert_ + expert;
+}
+
+bool ExpertCache::host_resident(int layer, int expert, bool touch) {
+    if (!host_cache_) return false;
+    for (int role = 0; role < N_ROLE; ++role)
+        if (!(touch ? host_cache_->contains_and_touch(ram_key(role, layer, expert)) :
+                      host_cache_->contains(ram_key(role, layer, expert)))) return false;
+    return true;
+}
+
+void ExpertCache::copy_host_slab(Role role, int layer, int expert, void * destination, size_t bytes) {
+    if (!host_cache_ || !host_cache_->copy(ram_key(role, layer, expert), destination, bytes))
+        throw std::runtime_error("CPU expert lost a required RAM slab before execution");
+}
+
+std::shared_ptr<const uint8_t[]> ExpertCache::borrow_host_slab(Role role, int layer, int expert, size_t bytes) {
+    auto view = host_cache_ ? host_cache_->borrow(ram_key(role, layer, expert), bytes) : nullptr;
+    if (!view) throw std::runtime_error("CPU expert lost a required RAM slab before borrowing");
+    return view;
+}
+
+void ExpertCache::remember_ssd_slab(int role, int layer, int expert, const void * data, size_t bytes, bool retain) {
+    if (!host_cache_ || (!readthrough_ram_ && !retain)) return;
+    const uint64_t key = ram_key(role, layer, expert);
+    if (host_cache_->contains_and_touch(key)) return;
+    // Existing RAM reads/takes retain their normal semantics. New SSD
+    // prefill copies execute in GPU slots but need not evict decode-hot RAM.
+    if (!prefill_cache_policy_.admit_new_ssd_copy()) return;
+    // All three roles consult the same logical expert count. This gates only
+    // new optional SSD-to-RAM copies; GPU computation, demotions and leases stay
+    // unchanged. Existing roles were touched above, before this predicate.
+    if (ram_ssd_admission_.enabled() && !ram_ssd_admission_.accepts(
+            admission_->frequency((size_t) layer * n_expert_ + expert))) {
+        ++ram_ssd_rejected_copies_;
+        ram_ssd_rejected_bytes_ += bytes;
+        return;
+    }
+#ifdef _WIN32
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (cache_min_free_bytes_ > 0 && GlobalMemoryStatusEx(&memory) &&
+        cache_headroom_exhausted(memory.ullAvailPhys, bytes, cache_min_free_bytes_)) {
+        const auto saved = host_cache_->stats();
+        host_cache_->trim(saved.resident_bytes - std::min<uint64_t>(saved.resident_bytes, 512ull << 20));
+        return;
+    }
+#endif
+    const auto started = std::chrono::steady_clock::now();
+    host_cache_->put(key, bytes, [&](void * destination) { std::memcpy(destination, data, bytes); });
+    admission_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void ExpertCache::flush_victims() {
+    if (pending_victims_.empty()) return;
+    const auto started = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(backend_);
+    coal_async_pending_ = false;
+    const auto * source = (const uint8_t *) ggml_backend_buffer_get_base(victim_stage_);
+    for (const auto & victim : pending_victims_) {
+        const bool admitted = host_cache_->put(victim.key, victim.bytes,
+            [&](void * destination) { std::memcpy(destination, source + victim.offset, victim.bytes); });
+        if (admitted) demotion_bytes_ += victim.bytes;
+    }
+    pending_victims_.clear();
+    victim_used_ = 0;
+    ++victim_batches_;
+    demotion_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void ExpertCache::demote_to_ram(Pool & pool, int slot, int key) {
+    if (!host_cache_ || readthrough_ram_) return;
+    const size_t bytes = pool.t->nb[2];
+#ifdef _WIN32
+    // Honor the configurable system-headroom reserve (default 2560 MiB).
+    // Explicit zero leaves only the independent cache-capacity bound.
+    // Otherwise trim a bounded batch; SSD remains the immutable backing.
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (cache_min_free_bytes_ > 0 && GlobalMemoryStatusEx(&memory) &&
+        cache_headroom_exhausted(memory.ullAvailPhys, bytes, cache_min_free_bytes_)) {
+        const auto saved = host_cache_->stats();
+        const size_t trim = std::min<uint64_t>(saved.resident_bytes, 512ull << 20);
+        host_cache_->trim((size_t) saved.resident_bytes - trim);
+        return;
+    }
+#endif
+    constexpr size_t VICTIM_BUFFER_BYTES = 64ull << 20;
+    if (batch_victims_ && host_buft_ && bytes <= VICTIM_BUFFER_BYTES) {
+        if (!victim_stage_) victim_stage_ = ggml_backend_buft_alloc_buffer(host_buft_, VICTIM_BUFFER_BYTES);
+        if (victim_stage_) {
+            if (victim_used_ + bytes > VICTIM_BUFFER_BYTES) flush_victims();
+            auto * destination = (uint8_t *) ggml_backend_buffer_get_base(victim_stage_) + victim_used_;
+            ggml_backend_tensor_get_async(backend_, pool.t, destination, (size_t) slot * bytes, bytes);
+            pending_victims_.push_back({ram_key(pool.role, key / n_expert_, key % n_expert_), victim_used_, bytes});
+            victim_used_ += bytes;
+            return;
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    const bool admitted = host_cache_->put(ram_key(pool.role, key / n_expert_, key % n_expert_), bytes,
+        [&](void * destination) {
+            if (coal_async_pending_) {
+                ggml_backend_synchronize(backend_);
+                coal_async_pending_ = false;
+            }
+            ggml_backend_tensor_get(pool.t, destination, (size_t) slot * bytes, bytes);
+        });
+    if (admitted) demotion_bytes_ += bytes;
+    demotion_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+bool ExpertCache::save_tier_stats(const std::string & path) const {
+    validate_gpu_lru_indexes(); // Explicit owner profile boundary; no hot-path full scan.
+    if (activation_) {
+        activation_->save_trace(path + ".activation.tsv");
+        std::ofstream metrics(path + ".activation.json");
+        metrics << "{\"policy_enabled\":" << (infinity_policy_ ? "true" : "false")
+                << ",\"prediction_calls\":" << prediction_calls_
+                << ",\"predicted_experts\":" << prediction_candidates_
+                << ",\"next_layer_hits\":" << prediction_hits_
+                << ",\"bytes_read\":" << prediction_bytes_
+                << ",\"bytes_inserted\":" << prediction_inserted_bytes_
+                << ",\"prefetch_errors\":" << prediction_errors_
+                << ",\"planning_ms\":" << prediction_plan_ms_
+                << ",\"ranking_ms\":" << prediction_rank_ms_
+                << ",\"commit_ms\":" << prediction_commit_ms_
+                << ",\"submit_ms\":" << prediction_submit_ms_
+                << ",\"observe_ms\":" << activation_observe_ms_
+                << ",\"gpu_victim_ms\":" << gpu_victim_selection_ms_
+                << ",\"gpu_victim_calls\":" << gpu_victim_calls_
+                << ",\"gpu_victim_candidates\":" << gpu_victim_candidates_
+                << ",\"ram_victim_ms\":" << (host_cache_ ? host_cache_->stats().eviction_selection_ms : 0)
+                << ",\"ram_victim_candidates\":" << (host_cache_ ? host_cache_->stats().eviction_candidates : 0)
+                << ",\"ram_priority_refresh_ms\":" << (host_cache_ ? host_cache_->stats().priority_refresh_ms : 0)
+                << ",\"ram_priority_refresh_entries\":" << (host_cache_ ? host_cache_->stats().priority_refresh_entries : 0)
+                << ",\"scores_enabled\":" << (activation_scores_ ? "true" : "false")
+                << ",\"prefetch_enabled\":" << (activation_prefetch_ ? "true" : "false") << "}\n";
+    }
+    uint64_t partial = 0, overlapping_slabs = 0, scratch_bytes = 0;
+    uint64_t complete_ram_experts = 0, partial_ram_slabs = 0;
+    for (const auto & pool : pools_) scratch_bytes += (uint64_t) pool.scratch_slots * pool.t->nb[2];
+    if (admission_) {
+        for (int layer = 0; layer < n_layer_; ++layer) {
+            if (!serves(layer)) continue;
+            for (int expert = 0; expert < n_expert_; ++expert) {
+                int roles = 0, ram_roles = 0;
+                for (int role = 0; role < N_ROLE; ++role) {
+                    const bool on_gpu = resident((Role) role, layer, expert);
+                    roles += on_gpu;
+                    const bool in_ram = host_cache_->contains(ram_key(role, layer, expert));
+                    ram_roles += in_ram;
+                    if (on_gpu && in_ram) ++overlapping_slabs;
+                }
+                if (roles != 0 && roles != N_ROLE) ++partial;
+                if (ram_roles == N_ROLE) ++complete_ram_experts;
+                else partial_ram_slabs += ram_roles;
+            }
+        }
+        if (partial || overlapping_slabs)
+            throw std::runtime_error("Exclusive whole-expert cache ownership failed");
+    }
+    FILE * file = fopen(path.c_str(), "wb");
+    if (!file) return false;
+    const auto saved = host_cache_ ? host_cache_->stats() : HostExpertCache::Stats{};
+    fprintf(file, "{\"enabled\":%s,\"capacity_bytes\":%llu,\"resident_bytes\":%llu,"
+        "\"peak_bytes\":%llu,\"hits\":%llu,\"misses\":%llu,\"hit_bytes\":%llu,"
+        "\"admissions\":%llu,\"admitted_bytes\":%llu,\"evictions\":%llu,"
+        "\"evicted_bytes\":%llu,\"demotion_bytes\":%llu,\"demotion_ms\":%.3f,"
+        "\"cpu_reads\":%llu,\"cpu_read_bytes\":%llu,\"admission_ms\":%.3f,\"fetch_ms\":%.3f,\"fetch_bytes\":%llu,\"victim_batches\":%llu,"
+        "\"pooled_bytes\":%llu,\"allocations\":%llu,\"reused_allocations\":%llu,\"allocation_ms\":%.3f,\"fill_ms\":%.3f,\"cpu_copy_ms\":%.3f,\"transient_role_fills\":%llu,\"retained_role_fills\":%llu,\"proactive_promotions\":%llu,\"partial_gpu_experts\":%llu,\"overlapping_managed_slabs\":%llu,\"transient_workspace_bytes\":%llu,\"complete_ram_experts\":%llu,\"partial_ram_slabs\":%llu,\"retired_leased_bytes\":%llu,\"ram_ssd_min_hits\":%u,\"ram_ssd_rejected_copies\":%llu,\"ram_ssd_rejected_bytes\":%llu,\"pipeline_batches\":%llu,\"pipeline_jobs\":%llu,\"pipeline_ram_bytes\":%llu,\"pipeline_file_bytes\":%llu,\"pipeline_owner_wait_ms\":%.3f,\"pipeline_owner_work_ms\":%.3f,\"policy\":\"%s\"",
+        host_cache_ ? "true" : "false", (unsigned long long) saved.capacity_bytes,
+        (unsigned long long) saved.resident_bytes, (unsigned long long) saved.peak_bytes,
+        (unsigned long long) saved.hits, (unsigned long long) saved.misses,
+        (unsigned long long) saved.hit_bytes, (unsigned long long) saved.admissions,
+        (unsigned long long) saved.admitted_bytes, (unsigned long long) saved.evictions,
+        (unsigned long long) saved.evicted_bytes, (unsigned long long) demotion_bytes_, demotion_ms_,
+        (unsigned long long) saved.cpu_reads, (unsigned long long) saved.cpu_read_bytes, admission_ms_,
+        stats_.fetch_ms, (unsigned long long) stats_.fetch_bytes, (unsigned long long) victim_batches_,
+        (unsigned long long) saved.pooled_bytes, (unsigned long long) saved.allocations,
+        (unsigned long long) saved.reused_allocations, saved.allocation_ms, saved.fill_ms, saved.cpu_copy_ms,
+        (unsigned long long) transient_role_fills_, (unsigned long long) retained_role_fills_,
+        (unsigned long long) proactive_promotions_, (unsigned long long) partial,
+        (unsigned long long) overlapping_slabs, (unsigned long long) scratch_bytes,
+        (unsigned long long) complete_ram_experts, (unsigned long long) partial_ram_slabs,
+        (unsigned long long) saved.retired_leased_bytes,
+        ram_ssd_admission_.minimum_hits(), (unsigned long long) ram_ssd_rejected_copies_,
+        (unsigned long long) ram_ssd_rejected_bytes_,
+        (unsigned long long) stats_.pipeline_batches, (unsigned long long) stats_.pipeline_jobs,
+        (unsigned long long) stats_.pipeline_ram_bytes, (unsigned long long) stats_.pipeline_file_bytes,
+        stats_.pipeline_owner_wait_ms, stats_.pipeline_owner_work_ms,
+        admission_ ? "tiny_lfu_admission_exclusive_experts" : readthrough_ram_ ? "readthrough_lru" : "exclusive_victim_lru");
+    fprintf(file, ",\"direct_covering_requested\":%s,\"direct_covering_batches\":%llu,"
+        "\"direct_covering_fallback_batches\":%llu,\"direct_covering_read_jobs\":%llu,"
+        "\"direct_covering_payload_bytes\":%llu,\"direct_covering_requested_bytes\":%llu",
+        stats_.direct_covering_requested ? "true" : "false",
+        (unsigned long long) stats_.direct_covering_batches,
+        (unsigned long long) stats_.direct_covering_fallback_batches,
+        (unsigned long long) stats_.direct_covering_read_jobs,
+        (unsigned long long) stats_.direct_covering_payload_bytes,
+        (unsigned long long) stats_.direct_covering_requested_bytes);
+    size_t lru_metadata = 0;
+    for (const auto & pool : pools_)
+        if (pool.lru_index) lru_metadata += pool.lru_index->metadata_allocation_bytes();
+    fprintf(file, ",\"gpu_lru_index_enabled\":%s,\"gpu_lru_index_calls\":%llu,"
+        "\"gpu_lru_index_candidates\":%llu,\"gpu_lru_bitmap_words\":%llu,"
+        "\"gpu_lru_index_rebuilds\":%llu,\"gpu_lru_index_rebuild_ms\":%.3f,"
+        "\"gpu_lru_index_metadata_bytes\":%llu",
+        gpu_lru_index_enabled_ ? "true" : "false",
+        (unsigned long long) gpu_lru_index_calls_, (unsigned long long) gpu_lru_index_candidates_,
+        (unsigned long long) gpu_lru_bitmap_words_, (unsigned long long) gpu_lru_index_rebuilds_,
+        gpu_lru_index_rebuild_ms_, (unsigned long long) lru_metadata);
+    fprintf(file, ",\"ram_replacement\":\"%s\",\"ram_replacement_metadata_bytes\":%llu,"
+        "\"ram_s3_small_bytes\":%llu,\"ram_s3_main_bytes\":%llu,\"ram_s3_ghost_bytes\":%llu,"
+        "\"ram_s3_small_entries\":%u,\"ram_s3_main_entries\":%u,\"ram_s3_ghost_entries\":%u",
+        saved.replacement_policy, (unsigned long long) saved.replacement_metadata_bytes,
+        (unsigned long long) saved.s3_small_bytes, (unsigned long long) saved.s3_main_bytes,
+        (unsigned long long) saved.s3_ghost_bytes,
+        saved.s3_small_entries, saved.s3_main_entries, saved.s3_ghost_entries);
+    ssd_read_phase_.append_json(file, direct_);
+    fprintf(file, ",\"skip_unused_retain_enabled\":%s,\"unused_retention_decisions_skipped\":%llu",
+        skip_unused_retain_requested() ? "true" : "false",
+        (unsigned long long) unused_retention_decisions_skipped_);
+    if (io_workers_) io_workers_->append_batch_stats(file);
+    fputs("}\n", file);
+    fclose(file);
+    return true;
+}
+
 // Release a slot's current occupant (no-op if already empty).
+void ExpertCache::activation_lookahead(int current_layer) {
+    if (!activation_prefetch_) return;
+    const auto started = std::chrono::steady_clock::now();
+    if (prediction_future_.valid() &&
+        prediction_future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+        try {
+            SchedulerTimer timing(prediction_commit_ms_);
+            auto slabs = prediction_future_.get();
+            for (auto & slab : slabs) {
+                prediction_bytes_ += slab.data.size();
+                // Recheck on the owner thread: demand may have loaded the same
+                // expert since speculation began. Never publish duplicate tiers.
+                if (resident((Role) slab.role, slab.layer, slab.expert) ||
+                    host_cache_->contains(ram_key(slab.role, slab.layer, slab.expert))) continue;
+                if (host_cache_->put(ram_key(slab.role, slab.layer, slab.expert), slab.data.size(),
+                    [&](void * destination) { std::memcpy(destination, slab.data.data(), slab.data.size()); }))
+                    prediction_inserted_bytes_ += slab.data.size();
+            }
+        } catch (const std::exception &) {
+            ++prediction_errors_; // Demand execution still uses the authoritative GGUF.
+        }
+    }
+    if (!prediction_future_.valid() && current_layer + 1 < n_layer_ && serves(current_layer + 1)) {
+        ++prediction_calls_;
+        const int future_layer = current_layer + 1;
+        std::vector<int> candidates;
+        { SchedulerTimer timing(prediction_rank_ms_); candidates = activation_->predict_next(current_layer, 2); }
+        predicted_[future_layer] = candidates;
+        prediction_candidates_ += candidates.size();
+        struct ReadPlan { int role, layer, expert; std::string path; uint64_t offset; size_t bytes; };
+        std::vector<ReadPlan> reads;
+        for (int expert : candidates) {
+            for (int role = 0; role < N_ROLE; ++role) {
+                if (resident((Role) role, future_layer, expert) ||
+                    host_cache_->contains(ram_key(role, future_layer, expert))) continue;
+                const size_t bytes = tensor((Role) role, future_layer)->nb[2];
+                reads.push_back({role, future_layer, expert, fpath_[role][future_layer],
+                                 foff_[role][future_layer] + bytes * (uint64_t) expert, bytes});
+            }
+        }
+        if (!reads.empty()) {
+            SchedulerTimer timing(prediction_submit_ms_);
+            prediction_future_ = std::async(std::launch::async, [reads = std::move(reads)] {
+                std::vector<PredictedSlab> slabs;
+                for (const auto & read : reads) {
+                    PredictedSlab slab{read.role, read.layer, read.expert, std::vector<uint8_t>(read.bytes)};
+                    std::ifstream input(read.path, std::ios::binary);
+                    input.seekg((std::streamoff) read.offset);
+                    if (!input.read((char *) slab.data.data(), (std::streamsize) read.bytes))
+                        throw std::runtime_error("Speculative local GGUF read failed");
+                    slabs.push_back(std::move(slab));
+                }
+                return slabs;
+            });
+        }
+    }
+    prediction_plan_ms_ += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+void ExpertCache::note_demands(int layer, const int32_t * ids, int count) {
+    if (activation_) { SchedulerTimer timing(activation_observe_ms_); activation_->observe(layer, ids, count); }
+    if (activation_scores_)
+        for (int role = 0; role < N_ROLE; ++role)
+            host_cache_->refresh_priority_range(ram_key(role, layer, 0), n_expert_);
+    if (infinity_policy_ && !predicted_[layer].empty()) {
+        for (int expert : predicted_[layer])
+            if (std::find(ids, ids + count, expert) != ids + count) ++prediction_hits_;
+        predicted_[layer].clear();
+    }
+    if (!admission_) return;
+    const bool record_frequency = prefill_cache_policy_.record_decode_frequency();
+    for (int index = 0; index < count; ++index) {
+        if (ids[index] < 0 || ids[index] >= n_expert_) throw std::out_of_range("Invalid logical expert demand");
+        if (record_frequency) admission_->observe((size_t) layer * n_expert_ + ids[index]);
+    }
+}
+
+bool ExpertCache::can_retain(int layer, int expert) {
+    if (!admission_) return true;
+    const size_t candidate = (size_t) layer * n_expert_ + expert;
+    for (int role = 0; role < N_ROLE; ++role) {
+        auto & pool = pools_[layer_pool_[role][layer]];
+        if (pool.key2slot.count((int) candidate)) continue;
+        const int slot = pick_victim(pool, layer);
+        if (slot < 0) return false;
+        const int victim = pool.slot2key[slot];
+        if (victim >= 0 && (activation_scores_ ? activation_->priority(candidate) <= activation_->priority(victim) :
+                                             !admission_->admit(candidate, victim))) return false;
+    }
+    return true;
+}
+
+void ExpertCache::promote_hot_demand(int layer, const int32_t * ids, int count) {
+    if (!admission_) return;
+    ActiveExpertGuard protected_selection(active_demands_, layer, n_expert_, ids, count);
+    int best = -1;
+    // Scan all RAM candidates in this rotating layer, not only this token's
+    // selected IDs. Otherwise an expert can miss every reconciliation window.
+    for (int expert = 0; expert < n_expert_; ++expert) {
+        if (!host_resident(layer, expert, false)) continue;
+        const auto frequency = admission_->frequency((size_t) layer * n_expert_ + expert);
+        if (frequency < 2 || !can_retain(layer, expert)) continue;
+        if (best < 0 || frequency > admission_->frequency((size_t) layer * n_expert_ + best)) best = expert;
+    }
+    if (best >= 0) { ensure_resident(layer, best); ++proactive_promotions_; }
+}
+
+void ExpertCache::release_victim(Pool & pool, int slot) {
+    const int key = pool.slot2key[slot];
+    if (!admission_ || key < 0) { drop_slot(pool, slot); return; }
+    const int layer = key / n_expert_;
+    // Eviction is at complete-expert granularity. A role miss must not strand
+    // the other two immutable slabs in a different managed memory tier.
+    for (int role = 0; role < N_ROLE; ++role) {
+        auto & other = pools_[layer_pool_[role][layer]];
+        const auto found = other.key2slot.find(key);
+        if (found != other.key2slot.end()) drop_slot(other, found->second);
+    }
+}
+
 void ExpertCache::drop_slot(Pool & pool, int slot) {
-    const int k = pool.slot2key[slot];
+    // Diagnose stale occupancy BEFORE demotion can change managed RAM ownership.
+    const int k = validate_gpu_lru_drop(pool, slot, n_expert_);
     if (k < 0) return;
+    demote_to_ram(pool, slot, k); // A failed demotion leaves both indexes untouched.
+    drop_gpu_lru_slot(pool, slot, n_expert_);
     l_evict_[k / n_expert_]++;
-    pool.occ[k / n_expert_]--;
-    pool.slot_of[k] = 0;             // evicted key -> sentinel
-    pool.key2slot.erase(k);
-    pool.slot2key[slot] = -1;
     stats_.evictions++;
+}
+
+void ExpertCache::touch_slot(Pool & pool, int slot) {
+    record_gpu_lru_access(pool, slot, clock_);
+}
+
+void ExpertCache::rebuild_gpu_lru_indexes() {
+    if (!gpu_lru_index_enabled_) return;
+    SchedulerTimer timing(gpu_lru_index_rebuild_ms_);
+    for (auto & pool : pools_) {
+        pool.lru_index->rebuild(pool.n_slots, pool.slot2key, pool.clk);
+        ++gpu_lru_index_rebuilds_;
+    }
+}
+
+void ExpertCache::validate_gpu_lru_indexes() const {
+    if (!gpu_lru_index_enabled_) return;
+    for (const auto & pool : pools_) {
+        if (!pool.lru_index || pool.slot2key.size() != static_cast<size_t>(pool.n_slots) ||
+            pool.clk.size() != static_cast<size_t>(pool.n_slots) ||
+            !pool.lru_index->invariant(pool.slot2key, pool.clk))
+            throw std::logic_error("GPU LRU index disagrees with retained pool clocks/slots");
+        size_t occupied = 0;
+        for (int slot = 0; slot < pool.n_slots; ++slot) {
+            const int key = pool.slot2key[slot];
+            if (key < 0) continue;
+            const auto found = pool.key2slot.find(key);
+            if (found == pool.key2slot.end() || found->second != slot ||
+                static_cast<size_t>(key) >= pool.slot_of.size() || pool.slot_of[key] != slot)
+                throw std::logic_error("GPU LRU authoritative slot/key/remap maps disagree");
+            ++occupied;
+        }
+        if (occupied != pool.key2slot.size())
+            throw std::logic_error("GPU LRU reverse map has an extra key");
+    }
 }
 
 // Which slot should `layer` take? Free slots first, then LRU. With quotas on,
@@ -563,48 +1130,64 @@ void ExpertCache::drop_slot(Pool & pool, int slot) {
 // below quota takes the LRU slot of some *over*-quota layer. If no layer is
 // over quota (cold pool, or quotas just widened) it degrades to global LRU.
 int ExpertCache::pick_victim(Pool & pool, int layer) {
+    SchedulerTimer timing(gpu_victim_selection_ms_);
+    ++gpu_victim_calls_;
+    if (pool.lru_index && !quota_on_ && !activation_scores_) {
+        const auto selected = pool.lru_index->pick([&](int slot) {
+            const int key = pool.slot2key[slot];
+            return !active_demands_.empty() && active_demands_[key];
+        });
+        ++gpu_lru_index_calls_;
+        gpu_lru_index_candidates_ += selected.occupied_examined;
+        gpu_lru_bitmap_words_ += selected.bitmap_words_examined;
+        return selected.slot;
+    }
     const bool self = quota_on_ && pool.quota[layer] >= 0 &&
                       pool.occ[layer] >= pool.quota[layer];
     int victim = -1;
     uint64_t best = UINT64_MAX;
+    double lowest_priority = std::numeric_limits<double>::infinity();
     for (int s = 0; s < pool.n_slots; ++s) {
+        ++gpu_victim_candidates_;
         const int k = pool.slot2key[s];
         if (k < 0) return s;                     // free slot
+        if (!active_demands_.empty() && active_demands_[k]) continue;
         if (quota_on_) {
             const int kl = k / n_expert_;
             if (self) { if (kl != layer) continue; }        // recycle own slot
             else if (pool.occ[kl] <= pool.quota[kl]) continue;  // donor must be over quota
         }
-        if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
+        const double score = activation_scores_ ? activation_->priority(k) : 0;
+        if ((activation_scores_ && score < lowest_priority) ||
+            ((!activation_scores_ || score == lowest_priority) && pool.clk[s] < best)) {
+            lowest_priority = score; best = pool.clk[s]; victim = s;
+        }
     }
     if (victim >= 0) return victim;
-    for (int s = 0; s < pool.n_slots; ++s)       // no eligible victim: global LRU
+    for (int s = 0; s < pool.n_slots; ++s) {     // no quota donor: global LRU
+        const int key = pool.slot2key[s];
+        if (!active_demands_.empty() && key >= 0 && active_demands_[key]) continue;
         if (pool.clk[s] < best) { best = pool.clk[s]; victim = s; }
+    }
     return victim;
 }
 
 // Fetch (layer,expert) into a free (or LRU-evicted) slot; updates residency maps.
 int ExpertCache::install(Pool & pool, int key, int layer, int expert, Role role) {
     const int victim = pick_victim(pool, layer);
-    drop_slot(pool, victim);
+    if (victim < 0) throw std::runtime_error("No unprotected GPU cache victim");
+    release_victim(pool, victim);
     fetch_slab(role, layer, expert, pool.t, victim);
-    pool.slot2key[victim] = key;
-    pool.occ[layer]++;
-    pool.clk[victim] = ++clock_;
-    pool.key2slot[key] = victim;
-    pool.slot_of[key] = victim;
+    publish_gpu_lru_slot(pool, victim, key, layer, clock_);
     return victim;
 }
 
 // Claim a slot for `key` (evicting the LRU occupant) without loading data yet.
 int ExpertCache::reserve_victim(Pool & pool, int key) {
     const int victim = pick_victim(pool, key / n_expert_);
-    drop_slot(pool, victim);
-    pool.occ[key / n_expert_]++;
-    pool.slot2key[victim] = key;
-    pool.clk[victim] = ++clock_;
-    pool.key2slot[key] = victim;
-    pool.slot_of[key] = victim;
+    if (victim < 0) throw std::runtime_error("No unprotected GPU cache victim");
+    release_victim(pool, victim);
+    publish_gpu_lru_slot(pool, victim, key, key / n_expert_, clock_);
     return victim;
 }
 
@@ -612,6 +1195,31 @@ int ExpertCache::reserve_victim(Pool & pool, int key) {
 // file handles). On unified memory the workers pread straight into the VRAM
 // slot (zero-copy); otherwise they stage and the slabs are uploaded serially.
 void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
+    const auto io_phase = ssd_read_phase_.begin_fetch(direct_);
+    const bool direct_read = io_phase.direct();
+    flush_victims();
+    // The remote node owns its own disk/RAM reads. Do not read or coalesce its
+    // expert payloads on the coordinator before issuing the identifier request.
+    if (std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0) {
+        const auto started = std::chrono::steady_clock::now();
+        std::vector<ggml_tensor *> destinations;
+        std::vector<uint64_t> hashes;
+        std::vector<size_t> offsets, sizes;
+        uint64_t bytes = 0;
+        for (const auto & job : jobs) {
+            const size_t size = job.pool->t->nb[2];
+            destinations.push_back(job.pool->t);
+            hashes.push_back(remote_expert_hash(fpath_[job.role][layer],
+                foff_[job.role][layer] + (uint64_t) job.expert * size, size));
+            offsets.push_back((size_t) job.slot * size);
+            sizes.push_back(size);
+            bytes += size;
+        }
+        fill_remote_experts(destinations, hashes, offsets, sizes);
+        stats_.fetch_bytes += bytes;
+        stats_.fetch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        return;
+    }
     const int n = (int) jobs.size();
     if (n == 0) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -637,7 +1245,7 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     std::vector<Run> runs;
     std::vector<FetchJob> singles;
 
-    if (!use_coal) {
+    if (!use_coal || host_cache_) {
         singles = jobs;
     } else {
         for (int r = 0; r < N_ROLE; ++r) {
@@ -711,11 +1319,11 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
 
         std::atomic<size_t> seg_next{0};
         std::atomic<bool>   seg_ok{true};
-        auto rworker = [&]() {
+        auto rworker = [&, direct_read]() {
             FILE * f = nullptr;
 #ifdef _WIN32
             void * h = nullptr;
-            if (direct_) { h = win_direct_open(path); if (!h) { seg_ok = false; return; } }
+            if (direct_read) { h = win_direct_open(path); if (!h) { seg_ok = false; return; } }
             if (!h)
 #endif
             { f = fopen(path.c_str(), "rb"); if (!f) { seg_ok = false; return; } }
@@ -797,89 +1405,228 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     for (const auto & j : singles) max_nb2 = std::max(max_nb2, (size_t) j.pool->t->nb[2]);
     const int batch = std::max<int>(1, (int) ((64u << 20) / max_nb2));
 
+    static const bool request_covering = [] {
+        const char * value = getenv("QWEN_DIRECT_PINNED_COVERING");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    stats_.direct_covering_requested = request_covering;
+    static const bool request_pipeline = [] {
+        const char * value = getenv("QWEN_DEMAND_IO_PIPELINE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+
     for (int b0 = 0; b0 < ns; b0 += batch) {
         const int bn = std::min(batch, ns - b0);
         if (coal_async_pending_) {   // staging still feeding async H2D: drain first
             ggml_backend_synchronize(backend_);
             coal_async_pending_ = false;
         }
-        uint8_t * cbuf = (uint8_t *) coal_host((size_t) bn * max_nb2);
+        size_t staging_stride = max_nb2;
+        bool use_covering = false;
+#ifdef _WIN32
+        std::vector<DirectCoveringRead> covering_plans;
+        if (request_covering && direct_read && !request_pipeline &&
+            std::all_of(singles.begin() + b0, singles.begin() + b0 + bn,
+                        [](const FetchJob & job) { return job.pool->host == nullptr; })) {
+            size_t candidate_stride = 0;
+            if (direct_covering_stride(max_nb2, candidate_stride)) {
+                covering_plans.resize(bn);
+                use_covering = true;
+                for (int j = 0; j < bn; ++j) {
+                    const auto & job = singles[b0 + j];
+                    const size_t bytes = job.pool->t->nb[2];
+                    const uint64_t offset = foff_[job.role][layer] + static_cast<uint64_t>(job.expert) * bytes;
+                    if (!direct_covering_range(offset, bytes, covering_plans[j]) ||
+                        covering_plans[j].read_bytes > candidate_stride) {
+                        use_covering = false;
+                        break;
+                    }
+                }
+                if (use_covering) staging_stride = candidate_stride;
+            }
+        }
+#endif
+        uint8_t * cbuf = (uint8_t *) coal_host(static_cast<size_t>(bn) * staging_stride);
+        // Unsupported modes/layouts explicitly retain the original bounce path.
+        if (use_covering && (!coal_pinned_ || (reinterpret_cast<uintptr_t>(cbuf) & 4095))) {
+            use_covering = false;
+            staging_stride = max_nb2;
+        }
+        if (use_covering) ++stats_.direct_covering_batches;
+        else if (request_covering) ++stats_.direct_covering_fallback_batches;
+        std::vector<uint8_t> covering_completed(use_covering ? bn : 0, 0);
 
         std::atomic<bool> ok{true};
         const int nthreads = std::min(bn, prefetch_threads_);
-        auto worker = [&](int tid) {
-            std::unordered_map<std::string, FILE *> tf;   // per-thread file cache
+        // This patch only changes the separate-memory singles path. The old
+        // unified-memory and temporary-thread paths retain their behavior.
+        const bool pipeline = request_pipeline && io_workers_ &&
+            std::all_of(singles.begin() + b0, singles.begin() + b0 + bn,
+                        [](const FetchJob & job) { return job.pool->host == nullptr; });
+        std::unique_ptr<ExpertReadiness> readiness;
+        std::vector<std::shared_ptr<const uint8_t[]>> ram_sources;
+        if (pipeline) {
+            readiness = std::make_unique<ExpertReadiness>(static_cast<size_t>(bn));
+            ++stats_.pipeline_batches;
+            stats_.pipeline_jobs += bn;
+            ram_sources.resize(bn);
+            for (int j = 0; j < bn; ++j) {
+                const auto & job = singles[b0 + j];
+                const size_t bytes = job.pool->t->nb[2];
+                if (host_cache_)
+                    ram_sources[j] = host_cache_->transfer_lease(ram_key(job.role, layer, job.expert), bytes,
+                        !(readthrough_ram_ || transient_slot(*job.pool, job.slot)));
+                if (ram_sources[j]) stats_.pipeline_ram_bytes += bytes;
+                else stats_.pipeline_file_bytes += bytes;
+            }
+        }
+        auto read_jobs = [&, direct_read](int tid, ExpertIOFiles & files) {
+            auto & tf = files.buffered;
 #ifdef __APPLE__
-            std::unordered_map<std::string, int> tfd;     // per-thread fd cache (direct path)
+            auto & tfd = files.descriptors;
 #endif
 #ifdef _WIN32
-            std::unordered_map<std::string, void *> th;   // per-thread HANDLE cache (direct path)
-            std::vector<uint8_t> tabuf;                   // per-thread aligned bounce
+            auto & th = files.direct;
+            auto & tabuf = files.aligned;
 #endif
-            for (int j = tid; j < bn; j += nthreads) {
+            auto read_one = [&, direct_read](int j) {
                 const FetchJob & job = singles[b0 + j];
                 const size_t nb2 = job.pool->t->nb[2];
                 const std::string & path = fpath_[job.role][layer];
                 const size_t off = foff_[job.role][layer] + (size_t) job.expert * nb2;
-                uint8_t * dst = cbuf + (size_t) j * max_nb2;
+                uint8_t * range = cbuf + static_cast<size_t>(j) * staging_stride;
+                uint8_t * dst = range;
 #ifdef _WIN32
-                if (direct_) {
+                if (use_covering) dst += covering_plans[j].payload_delta;
+#endif
+                if (pipeline && ram_sources[j]) {
+                    std::memcpy(dst, ram_sources[j].get(), nb2);
+                    return;
+                }
+                if (!pipeline && host_cache_ && ((readthrough_ram_ || transient_slot(*job.pool, job.slot)) ? host_cache_->read(ram_key(job.role, layer, job.expert), dst, nb2) : host_cache_->take(ram_key(job.role, layer, job.expert), dst, nb2)))
+                    return;
+#ifdef _WIN32
+                if (direct_read) {
                     void *& hv = th[path];
                     if (!hv) hv = win_direct_open(path);
-                    if (!hv || !win_direct_read(hv, dst, nb2, off, tabuf)) ok = false;
-                    continue;
+                    if (use_covering) {
+                        if (!hv || !win_direct_read_covering(hv, range, staging_stride, covering_plans[j])) ok = false;
+                        else covering_completed[j] = 1; // One writer; owner reads only after worker barrier.
+                    } else if (!hv || !win_direct_read(hv, dst, nb2, off, tabuf)) ok = false;
+                    return;
                 }
 #endif
 #ifdef __APPLE__
                 if (job.pool->host) {   // unified memory: straight into the slot
                     auto it = tfd.find(path);
                     int fd;
-                    if (it == tfd.end()) { fd = open(path.c_str(), O_RDONLY); tfd[path] = fd; }
+                    if (it == tfd.end() || it->second < 0) { fd = open(path.c_str(), O_RDONLY); tfd[path] = fd; }
                     else fd = it->second;
                     if (fd < 0 ||
                         pread(fd, job.pool->host + (size_t) job.slot * nb2, nb2, (off_t) off) != (ssize_t) nb2)
                         ok = false;
-                    continue;
+                    return;
                 }
 #endif
                 FILE *& f = tf[path];
-                if (!f) { f = fopen(path.c_str(), "rb"); if (!f) { ok = false; continue; } }
+                if (!f) { f = fopen(path.c_str(), "rb"); if (!f) { ok = false; return; } }
 #ifdef _WIN32
                 if (_fseeki64(f, (long long) off, SEEK_SET) != 0 ||
 #else
                 if (fseeko(f, (off_t) off, SEEK_SET) != 0 ||
 #endif
                     fread(dst, 1, nb2, f) != nb2) ok = false;
+            };
+            for (int j = tid; j < bn; j += nthreads) {
+                try {
+                    read_one(j);
+                    if (pipeline) readiness->publish(static_cast<size_t>(j));
+                } catch (...) {
+                    if (pipeline) readiness->fail(std::current_exception());
+                    throw;
+                }
             }
-            for (auto & kv : tf) if (kv.second) fclose(kv.second);
-#ifdef __APPLE__
-            for (auto & kv : tfd) if (kv.second >= 0) close(kv.second);
-#endif
-#ifdef _WIN32
-            for (auto & kv : th) if (kv.second) CloseHandle((HANDLE) kv.second);
-#endif
         };
 
-        std::vector<std::thread> ts;
-        ts.reserve(nthreads > 0 ? nthreads - 1 : 0);
-        for (int t = 1; t < nthreads; ++t) ts.emplace_back(worker, t);
-        worker(0);
-        for (auto & t : ts) t.join();
-        if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
-
-        for (int j = 0; j < bn; ++j) {
+        auto upload_one = [&](int j) {
             const FetchJob & job = singles[b0 + j];
             const size_t nb2 = job.pool->t->nb[2];
             stats_.fetch_bytes += nb2;
-            if (job.pool->host) continue;   // already written in place
-            const uint8_t * src = cbuf + (size_t) j * max_nb2;
+            if (job.pool->host) return;   // already written in place
+            const uint8_t * src = cbuf + static_cast<size_t>(j) * staging_stride;
+#ifdef _WIN32
+            if (use_covering) src += covering_plans[j].payload_delta;
+#endif
+            if (weight_audit_ && weight_audit_->active())
+                weight_audit_->source(fpath_[job.role][layer],
+                    foff_[job.role][layer] + static_cast<uint64_t>(job.expert) * nb2,
+                    src, nb2, job.role, job.expert, job.slot);
+            remember_ssd_slab(job.role, layer, job.expert, src, nb2, transient_slot(*job.pool, job.slot));
             if (coal_pinned_) {
                 ggml_backend_tensor_set_async(backend_, job.pool->t, src, (size_t) job.slot * nb2, nb2);
                 coal_async_pending_ = true;
             } else {
                 ggml_backend_tensor_set(job.pool->t, src, (size_t) job.slot * nb2, nb2);
             }
+        };
+        if (pipeline) {
+            try {
+                io_workers_->run_with_owner_progress(nthreads, read_jobs, [&] {
+                    for (int j = 0; j < bn; ++j) {
+                        const auto waiting = std::chrono::steady_clock::now();
+                        readiness->wait(static_cast<size_t>(j));
+                        stats_.pipeline_owner_wait_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - waiting).count();
+                        if (!ok) throw std::runtime_error("ExpertCache: pipelined SSD read failed");
+                        // Completion acquires the staging writes; no worker
+                        // touches this lease again after publishing completion.
+                        ram_sources[j].reset();
+                        const auto processing = std::chrono::steady_clock::now();
+                        upload_one(j);
+                        stats_.pipeline_owner_work_ms += std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - processing).count();
+                    }
+                }, bn);
+            } catch (...) {
+                // run_with_owner_progress already joined all CPU writers.
+                // Drain even when a backend enqueue itself threw after issuing
+                // work: this staging buffer must not be recycled while in use.
+                ggml_backend_synchronize(backend_);
+                coal_async_pending_ = false;
+                throw;
+            }
+        } else {
+            if (io_workers_) {
+                // Every reader completes before the owner uploads from this batch.
+                // Workers only read CPU bytes and use the existing host-cache lock.
+                io_workers_->run(nthreads, read_jobs, bn);
+            } else {
+                // Keep the temporary-thread baseline and per-batch file lifetime.
+                auto worker = [&](int tid) {
+                    ExpertIOFiles files(expert_io_closers());
+                    read_jobs(tid, files);
+                };
+                std::vector<std::thread> ts;
+                ts.reserve(nthreads > 0 ? nthreads - 1 : 0);
+                for (int t = 1; t < nthreads; ++t) ts.emplace_back(worker, t);
+                worker(0);
+                for (auto & t : ts) t.join();
+            }
+            if (!ok) throw std::runtime_error("ExpertCache: parallel SSD read failed");
+            for (int j = 0; j < bn; ++j) upload_one(j);
         }
+#ifdef _WIN32
+        // These are completed direct-file jobs, not RAM hits or physical NAND
+        // counters. Requested bytes include alignment covering margins.
+        if (use_covering) {
+            for (int j = 0; j < bn; ++j) if (covering_completed[j]) {
+                ++stats_.direct_covering_read_jobs;
+                stats_.direct_covering_payload_bytes += covering_plans[j].payload_bytes;
+                stats_.direct_covering_requested_bytes += covering_plans[j].read_bytes;
+            }
+        }
+#endif
+
     }
     stats_.fetch_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
@@ -903,7 +1650,7 @@ void ExpertCache::touch(Role role, int layer, int expert) {
     auto it = pool.key2slot.find(key);
     if (it == pool.key2slot.end()) return;
     pool.count[key]++;
-    pool.clk[it->second] = ++clock_;
+    touch_slot(pool, it->second);
     stats_.hits++;
     l_hits_[layer]++;
 }
@@ -916,7 +1663,7 @@ int ExpertCache::slot_for(Pool & pool, int layer, int expert, Role role) {
     if (it != pool.key2slot.end()) {
         stats_.hits++;
         l_hits_[layer]++;
-        pool.clk[it->second] = ++clock_;
+        touch_slot(pool, it->second);
         return it->second;
     }
     stats_.misses++;
@@ -929,6 +1676,7 @@ int ExpertCache::slot_for(Pool & pool, int layer, int expert, Role role) {
 //   <n_layer> <n_expert>
 //   <role> <layer> <expert> <count>   (one per line, hot experts)
 bool ExpertCache::save_profile(const std::string & path) const {
+    validate_gpu_lru_indexes();
     FILE * f = fopen(path.c_str(), "wb");
     if (!f) return false;
     fprintf(f, "QWENEXPCACHE 1\n%d %d\n", n_layer_, n_expert_);
@@ -970,6 +1718,28 @@ size_t ExpertCache::load_prefetch(const std::string & path) {
               [](const Ent & a, const Ent & b) { return a.count > b.count; });
 
     size_t n_pref = 0;
+    if (ssd_ && std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0) {
+        // Reserve the same highest-ranked slots as the serial loader, then
+        // issue one identifier batch per layer. The worker reads its own GGUF
+        // and fills GPU or CPU buffers; no weight payload crosses the network.
+        std::vector<std::vector<FetchJob>> by_layer(n_layer_);
+        for (const auto & en : ents) {
+            Pool & pool = pools_[layer_pool_[en.role][en.layer]];
+            if ((int) pool.key2slot.size() >= pool.n_slots) continue;
+            const int key = en.layer * n_expert_ + en.expert;
+            if (pool.key2slot.count(key)) continue;
+            const int slot = reserve_victim(pool, key);
+            by_layer[en.layer].push_back({ &pool, en.role, en.expert, slot });
+            n_pref++;
+        }
+        for (int layer = 0; layer < n_layer_; ++layer) {
+            if (by_layer[layer].empty()) continue;
+            fetch_parallel(layer, by_layer[layer]);
+            fprintf(stderr, "RPC startup prefetch: layer %d, %zu slabs loaded locally\n",
+                    layer, by_layer[layer].size());
+        }
+        return n_pref;
+    }
     for (const auto & en : ents) {
         Pool & pool = pools_[layer_pool_[en.role][en.layer]];
         if ((int) pool.key2slot.size() >= pool.n_slots) continue;   // pool full
@@ -1052,6 +1822,13 @@ void ExpertCache::dump_layer_stats(const char * tag) const {
 
 void ExpertCache::ensure_resident(int layer, int expert) {
     if (!serves(layer)) return;
+    if (ssd_) {
+        // Preserve residency bookkeeping and batch all three role misses locally or remotely.
+        int32_t gate, up, down;
+        const int32_t expert_id = expert;
+        ensure(layer, &expert_id, 1, &gate, &up, &down, false);
+        return;
+    }
     for (int r = 0; r < N_ROLE; ++r) {
         Pool & pool = pools_[layer_pool_[r][layer]];
         const int key = layer * n_expert_ + expert;
@@ -1064,12 +1841,16 @@ void ExpertCache::ensure_resident(int layer, int expert) {
 }
 
 void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
-                         int32_t * slot_gate, int32_t * slot_up, int32_t * slot_down) {
+                         int32_t * slot_gate, int32_t * slot_up, int32_t * slot_down, bool record_demand) {
     // Routing bug rather than a runtime condition: fail loudly instead of
     // indexing pools_ with the -1 that marks another device's layer.
     if (!serves(layer))
         throw std::runtime_error("ExpertCache::ensure on layer " + std::to_string(layer) +
                                  " which this device does not serve");
+    if (record_demand) note_demands(layer, expert_ids, n);
+    const bool audit_group = weight_audit_ && weight_audit_->begin(layer, n, n_used_);
+    ActiveExpertGuard protected_selection(active_demands_, layer, n_expert_, expert_ids, n);
+    std::unordered_map<int, int> temporary[N_ROLE];
     Pool * pools3[N_ROLE] = {
         &pools_[layer_pool_[GATE][layer]],
         &pools_[layer_pool_[UP][layer]],
@@ -1090,9 +1871,16 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
     // SSD source: resolve hits, reserve victims for misses, then read the misses
     // in parallel (overlapping disk latency) before uploading them.
     std::vector<FetchJob> jobs;
+    const bool skip_unused_retain = skip_unused_retain_requested();
     for (int i = 0; i < n; ++i) {
         const int e = (int) expert_ids[i];
         const int key = layer * n_expert_ + e;
+        // Covered roles cannot install/evict in the unchanged loop below.
+        // A new installation still makes its decision at the original point.
+        const bool needs_install = !skip_unused_retain ||
+            expert_role_needs_install(key, pools3, temporary);
+        if (skip_unused_retain && !needs_install) ++unused_retention_decisions_skipped_;
+        const bool retain = needs_install && can_retain(layer, e);
         for (int r = 0; r < N_ROLE; ++r) {
             Pool & pool = *pools3[r];
             pool.count[key]++;
@@ -1100,18 +1888,56 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
             if (it != pool.key2slot.end()) {
                 stats_.hits++;
                 l_hits_[layer]++;
-                pool.clk[it->second] = ++clock_;
+                touch_slot(pool, it->second);
                 outs[r][i] = it->second;
             } else {
+                auto repeated = temporary[r].find(key);
+                if (repeated != temporary[r].end()) {
+                    outs[r][i] = repeated->second;
+                    stats_.hits++;
+                    l_hits_[layer]++;
+                    continue;
+                }
                 stats_.misses++;
                 l_misses_[layer]++;
-                const int slot = reserve_victim(pool, key);
+                int slot;
+                if (retain) {
+                    slot = reserve_victim(pool, key);
+                    ++retained_role_fills_;
+                } else {
+                    if ((int) temporary[r].size() >= pool.scratch_slots)
+                        throw std::runtime_error("Transient expert workspace exhausted");
+                    slot = pool.n_slots + (int) temporary[r].size();
+                    temporary[r][key] = slot;
+                    ++transient_role_fills_;
+                }
                 outs[r][i] = slot;
                 jobs.push_back({ &pool, r, e, slot });
             }
         }
     }
     fetch_parallel(layer, jobs);
+    if (audit_group) {
+        if (weight_audit_->wants_gpu()) {
+            // Diagnostic barrier, never a performance configuration. Include
+            // retained GPU hits as well as freshly uploaded slabs.
+            ggml_backend_synchronize(backend_);
+            for (int index = 0; index < n; ++index) {
+                const int expert = expert_ids[index];
+                for (int role = 0; role < N_ROLE; ++role) {
+                    auto * tensor = pools3[role]->t;
+                    const size_t bytes = tensor->nb[2];
+                    const int slot = outs[role][index];
+                    weight_audit_->destination(fpath_[role][layer],
+                        foff_[role][layer] + static_cast<uint64_t>(expert) * bytes,
+                        bytes, role, expert, slot, [&](void * destination, size_t count) {
+                            ggml_backend_tensor_get(tensor, destination, static_cast<size_t>(slot) * bytes, count);
+                        });
+                }
+            }
+        }
+        weight_audit_->end();
+    }
 }
 
 } // namespace questwend

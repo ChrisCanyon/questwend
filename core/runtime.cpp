@@ -1,7 +1,13 @@
 #include "runtime.h"
+#include "backend_loader.h"
 #include "model.h"
 #include "ngram_table.h"
 #include "expert_cache.h"
+#include "prompt_checkpoint_memory.h"
+#include "hybrid_schedule.h"
+#include "qsa_constant_inputs.h"
+#include "expert_demand_trace.h"
+#include <future>
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -37,6 +43,16 @@
 #include <vector>
 
 namespace questwend {
+
+// Quantized rows retain the same logical dimensions; GGML owns their byte stride.
+static ggml_type attention_cache_type(const RuntimeConfig & config) {
+    if (config.kv_cache_type == "f16") return GGML_TYPE_F16;
+    if (config.kv_cache_type == "q8_0") return GGML_TYPE_Q8_0;
+    throw std::runtime_error("attention cache type must be f16 or q8_0");
+}
+
+
+static size_t pk_max();
 
 static const int GRAPH_SIZE = 16384;
 
@@ -101,6 +117,57 @@ static ggml_backend_buffer_t alloc_tensor_list(ggml_backend_buffer_type_t buft,
 struct Runtime::Impl {
     Model & model;
     RuntimeConfig cfg;
+    std::unique_ptr<ExpertDemandTrace> demand_trace;
+    #include "grouped_experts_fields.h.inc"
+    Runtime::BlockFrame block_frame;
+    int remote_first = -1, remote_last = -1;
+    std::function<std::vector<float>(const Runtime::BlockFrame &)> block_executor;
+    int capture_first = -1, capture_last = -1;
+    std::function<void(const Runtime::BlockFrame &)> block_observer;
+    std::chrono::steady_clock::time_point block_started;
+    bool block_worker() const { return cfg.block_first >= 0; }
+    int block_begin() const { return block_worker() ? cfg.block_first : 0; }
+    int block_end() const { return block_worker() ? cfg.block_last : (int) model.hparams().n_main(); }
+    std::vector<std::pair<ggml_tensor *, size_t>> block_state_tensors(int first, int last, int position) const {
+        std::vector<std::pair<ggml_tensor *, size_t>> records;
+        for (int il = first; il < last; ++il) {
+            auto add = [&](ggml_tensor * tensor, bool prefix) {
+                const size_t bytes = !tensor ? 0 : prefix
+                    ? (size_t) position * tensor->nb[1] : ggml_nbytes(tensor);
+                records.emplace_back(tensor, bytes);
+            };
+            add(k_cache[il], true); add(v_cache[il], true);
+            add(idx_k_cache[il], true);
+            add(conv_state[il], false); add(ssm_state[il], false);
+            add(ple_conv_state[il], false);
+        }
+        return records;
+    }
+    void capture_begin(int layer, int32_t token) {
+        if (!block_observer || layer != capture_first) return;
+        block_frame = Runtime::BlockFrame{};
+        block_frame.first = capture_first; block_frame.last = capture_last;
+        block_frame.token = token; block_frame.position = n_past;
+        block_frame.rope_position = mrope_next;
+        block_frame.hidden.resize(ggml_nelements(p_h));
+        ggml_backend_tensor_get(p_h, block_frame.hidden.data(), 0, ggml_nbytes(p_h));
+        if (p_ple) {
+            block_frame.ple.resize(ggml_nelements(p_ple));
+            ggml_backend_tensor_get(p_ple, block_frame.ple.data(), 0, ggml_nbytes(p_ple));
+        }
+        block_started = std::chrono::steady_clock::now();
+    }
+    void capture_end(int layer) {
+        if (!block_observer || layer + 1 != capture_last) return;
+        // Synchronize before stopping the compute timer; boundary readback and
+        // observer/file serialization are reported separately by the harness.
+        ggml_backend_synchronize(backend);
+        block_frame.elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - block_started).count();
+        block_frame.output.resize(ggml_nelements(p_h));
+        ggml_backend_tensor_get(p_h, block_frame.output.data(), 0, ggml_nbytes(p_h));
+        block_observer(block_frame);
+    }
 
     // Primary compute backend (GPU or CPU).
     ggml_backend_t        backend     = nullptr;
@@ -311,6 +378,17 @@ struct Runtime::Impl {
     // CPU matmul. Every selected expert is still computed with its own weight,
     // so the result is the same model, not an approximation.
     bool           cpu_miss   = false;
+    bool bounded_cpu_miss = false;
+    int bounded_cpu_max = 512;
+    bool borrow_cpu_weights = false;
+    bool overlap_bounded_cpu = false;
+    bool overlap_cpu_io = false, hss_enabled = false;
+    double hss_cpu_ms = 0, hss_gpu_ms = 0, hss_ram_ms = 0, hss_ssd_ms = 0;
+    double cpu_join_ms = 0, cpu_submit_ms = 0;
+    uint64_t hss_decisions = 0;
+    std::map<std::string, bool> verified_cpu_borrow;
+    uint64_t cpu_borrow_checks = 0;
+    double cpu_prepare_ms = 0, cpu_graph_ms = 0;
     // Pinned staging for the per-layer host<->GPU traffic, so those copies can
     // be queued on the stream (cudaMemcpyAsync is only async from pinned
     // memory) and a layer pays one synchronisation instead of one per copy.
@@ -323,6 +401,7 @@ struct Runtime::Impl {
         ggml_cgraph  * gf  = nullptr;
         ggml_gallocr_t galloc = nullptr;
         ggml_tensor  * sel = nullptr;
+        QsaConstantInputs qsa_constants;  // same owner/lifetime as this graph
         ggml_tensor  * ids[3] = { nullptr, nullptr, nullptr };
         ggml_tensor  * w = nullptr;
         // attention seg A only: the KV bucket it was built for, and its inputs
@@ -330,14 +409,29 @@ struct Runtime::Impl {
         ggml_tensor  * pos = nullptr, * mask = nullptr, * kvidx = nullptr;
     };
     std::vector<HyGraph> hy_a, hy_b;
+    const bool qsa_constant_cache_enabled = QsaConstantInputs::enabled_from_environment();
+    const bool qsa_identity_key_view_enabled = [] {
+        const char * value = getenv("QWEN_QSA_IDENTITY_KEY_VIEW");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    uint64_t qsa_identity_key_view_graphs = 0; // Graph construction only; owner thread.
+    const bool qsa_pool4_exact_enabled = [] {
+        const char * host = getenv("QWEN_QSA_POOL4_EXACT");
+        const char * cuda = getenv("GGML_CUDA_QSA_POOL4_EXACT");
+        return host && cuda && std::strcmp(host, "1") == 0 && std::strcmp(cuda, "1") == 0;
+    }();
+    uint64_t qsa_pool4_exact_graphs = 0; // Owner graph construction, not token frequency.
+    uint64_t qsa_constant_upload_calls = 0, qsa_constant_upload_skips = 0;
     // kept CPU expert graphs, per (layer, number of CPU experts)
     struct CpuGraph {
         ggml_context * ctx = nullptr;
         ggml_cgraph  * gf  = nullptr;
         ggml_gallocr_t galloc = nullptr;
         ggml_tensor  * xin = nullptr, * idt = nullptr, * wt = nullptr, * res = nullptr;
+        ggml_tensor * compact[3] = { nullptr, nullptr, nullptr };
     };
     std::vector<CpuGraph> cpu_g;
+    std::unordered_map<std::string, CpuGraph> bounded_cpu_g;
     static const int HY_KV_BUCKET = 256;   // attention seg A is rebuilt once per bucket
     ggml_fp16_t * pin_mask = nullptr;      // [n_ctx]
     int32_t     * pin_pos  = nullptr;      // [4] (M-RoPE needs 4 per token)
@@ -354,7 +448,8 @@ struct Runtime::Impl {
     // The routed experts `ids` (weights `w`) of layer il applied to the host
     // copy of its FFN input `x`, summed into `out` [n_embd] on the CPU.
     void cpu_experts(int il, const float * x, const std::vector<int32_t> & ids,
-                     const std::vector<float> & w, std::vector<float> & out);
+                     const std::vector<float> & w, std::vector<float> & out,
+                     const std::vector<std::shared_ptr<const uint8_t[]>> * held_weights = nullptr);
     // Decide cpu_miss from QWEN_CPU_MISS (0 / 1 / auto, the default): auto
     // times one expert's PCIe fetch against computing it on the CPU at a few
     // thread counts, on this machine and this model, and picks from that.
@@ -388,7 +483,7 @@ struct Runtime::Impl {
     bool                  cache_fast_enabled = false;    // experimental; opt-in via QWEN_FASTCACHE
     // Resident-only routing (QWEN_RESIDENT_DECODE): a per-layer bias added to
     // the router logits (-inf for non-resident experts) makes every selection a
-    // cache hit by construction, so the single fused graph never misses — no
+    // cache hit by construction, so the single fused graph never misses â€” no
     // verify readback, no state backup, no fallback. Lossy: the router is
     // restricted to the experts the prefill/profile left resident.
     bool                  resident_decode = false;
@@ -632,6 +727,10 @@ struct Runtime::Impl {
             if (g.galloc) ggml_gallocr_free(g.galloc);
             if (g.ctx)    ggml_free(g.ctx);
         }
+        for (auto & entry : bounded_cpu_g) {
+            if (entry.second.galloc) ggml_gallocr_free(entry.second.galloc);
+            if (entry.second.ctx) ggml_free(entry.second.ctx);
+        }
         if (cpu_backend)    ggml_backend_free(cpu_backend);
         if (weights_buf_owned)
             for (auto b : weights_bufs) if (b) ggml_backend_buffer_free(b);
@@ -652,6 +751,7 @@ struct Runtime::Impl {
     // for --ngram off, which is what makes that flag a graph-level switch
     // rather than just a storage choice.
     bool use_ple() const {
+        if (block_worker()) return cfg.ngram_mode != "off" && model.hparams().has_ple();
         return ngram && ngram->mode() != NgramTable::Mode::OFF &&
                model.hparams().has_ple();
     }
@@ -833,8 +933,9 @@ struct Runtime::Impl {
     ggml_tensor * build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
                                  ggml_tensor * cur, ggml_tensor * inp_pos,
                                  ggml_tensor * mask, int n_tokens, int n_kv,
-                                 int kv_pos, QsaShared & shared);
-    void set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos);
+                                 int kv_pos, QsaShared & shared, bool retain_constants = false);
+    void set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos,
+                        QsaConstantInputs * constants = nullptr);
     ggml_tensor * build_moe(ggml_context * ctx, ggml_cgraph * gf, int il,
                             ggml_tensor * x, int n_tokens);
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -869,9 +970,21 @@ struct Runtime::Impl {
     struct PromptCkpt {
         int pos = 0, mtp_past = 0, mrope = 0;
         std::vector<float>   hidden;   // mtp_hidden at pos (nextn KV bridge)
-        std::vector<uint8_t> blob;     // conv+ssm states, layer order
+        std::vector<uint8_t> blob;     // conv, SSM, PLE, then ngram history
+        size_t ngram_count = 0;
     };
     std::vector<PromptCkpt> pk;        // sorted by pos ascending
+    bool prompt_stateful() const {
+        return model.hparams().has_recurrent() || use_ple();
+    }
+    std::vector<ggml_tensor *> prompt_state_tensors() const {
+        std::vector<ggml_tensor *> tensors;
+        for (size_t layer = 0; layer < conv_state.size(); ++layer) {
+            for (auto * tensor : {conv_state[layer], ssm_state[layer], ple_conv_state[layer]})
+                if (tensor) tensors.push_back(tensor);
+        }
+        return tensors;
+    }
     void pk_snapshot();
     int  pk_best(int n) const;
     int  pk_rewind(int n);
@@ -898,6 +1011,7 @@ struct Runtime::Impl {
 };
 
 std::vector<ggml_backend_dev_t> gpu_devices() {
+    initialize_backends();
     std::vector<ggml_backend_dev_t> devs;
     // `auto`, not `ggml_backend_dev_type`: ggml gives the enum and the getter
     // function the same name, and the function hides the type.
@@ -911,6 +1025,28 @@ std::vector<ggml_backend_dev_t> gpu_devices() {
 }
 
 void Runtime::Impl::init() {
+    const auto cache_type = attention_cache_type(cfg);
+    if (cache_type == GGML_TYPE_Q8_0 &&
+        (!cfg.use_cuda || model.hparams().n_embd_head % ggml_blck_size(cache_type) != 0))
+        throw std::runtime_error("Q8 KV requires CUDA and a head width divisible by its quantization block");
+    (void) pk_max(); // Validate explicit limit before backend allocation.
+    if (const char * ram = getenv("QWEN_EXPERT_RAM_CACHE_MB"))
+        if (std::stoull(ram) && (!cfg.rpc_endpoints.empty() || cfg.gpus.size() > 1))
+            throw std::runtime_error("Validate the bounded RAM tier on one local GPU before enabling distributed use");
+    initialize_backends();
+    if (!cfg.rpc_endpoints.empty()) {
+        auto registry = ggml_backend_reg_by_name("RPC");
+        if (!registry) throw std::runtime_error("RPC backend is unavailable in this build");
+        using AddServer = ggml_backend_reg_t (*)(const char *);
+        auto add = reinterpret_cast<AddServer>(ggml_backend_reg_get_proc_address(registry, "ggml_backend_rpc_add_server"));
+        if (!add) throw std::runtime_error("RPC backend cannot register remote devices");
+        for (const std::string & endpoint : cfg.rpc_endpoints) {
+            auto remote = add(endpoint.c_str());
+            if (!remote) throw std::runtime_error("Failed to register RPC worker " + endpoint);
+            ggml_backend_register(remote);
+            fprintf(stderr, "experimental RPC worker registered: %s\n", endpoint.c_str());
+        }
+    }
     if (const char * d = getenv("QWEN_DUMP_LAYERS")) {
         if (!strcmp(d, "all")) {
             dump_layers.push_back(-1);
@@ -1042,6 +1178,7 @@ void Runtime::Impl::init() {
     // otherwise let them offload with the rest (saves VRAM). Must be set before
     // any load_weights_* call -- and before plan_offload(), which counts the
     // bytes these two decide.
+    model.set_layer_window(cfg.block_first, cfg.block_last);
     model.set_keep_nextn_resident(cfg.use_mtp && model.hparams().has_mtp());
     model.set_embd_q8(cfg.embd_q8);
 
@@ -1050,6 +1187,33 @@ void Runtime::Impl::init() {
     // before plan_layers() because the layer split hands a pool-only device its
     // whole budget, which only means something when there are pools to place.
     plan_offload();
+    if (block_worker()) {
+        if (cfg.block_first < 0 || cfg.block_last <= cfg.block_first ||
+            cfg.block_last > (int) model.hparams().n_main() || multi_gpu())
+            throw std::runtime_error("invalid experimental block worker range/device plan");
+        if ((cfg.expert_tier != ExpertTier::Ssd && cfg.expert_tier != ExpertTier::Ram) || cfg.use_mtp)
+            throw std::runtime_error("block worker requires explicit SSD/RAM tier and no MTP");
+        if (cfg.block_cpu_experts && cfg.expert_tier != ExpertTier::Ram)
+            throw std::runtime_error("block CPU execution requires fully resident managed expert RAM");
+        if (cfg.expert_tier == ExpertTier::Ram) {
+            size_t available = 0, total = 0;
+            host_memory(available, total);
+            size_t largest_tensor = 0;
+            for (int layer = cfg.block_first; layer < cfg.block_last; ++layer) {
+                for (const char * format : {"blk.%d.ffn_gate_exps.weight", "blk.%d.ffn_up_exps.weight",
+                                           "blk.%d.ffn_down_exps.weight"}) {
+                    auto * tensor = Wopt(format, layer);
+                    if (tensor) largest_tensor = std::max(largest_tensor, ggml_nbytes(tensor));
+                }
+            }
+            // Account for the loader's largest temporary tensor, backend/graph
+            // bookkeeping and the ordinary 2 GiB available-RAM floor.
+            const size_t required = model.offloaded_expert_bytes() + largest_tensor + (2560ull << 20);
+            if (!available || available < required)
+                throw std::runtime_error("resident block RAM would breach load scratch plus 2 GiB floor");
+        }
+        offload = true; ssd_mode = cfg.expert_tier == ExpertTier::Ssd;
+    }
     const bool use_expert_offload = offload;
 
     // Decide which device computes which layer before any weight is placed.
@@ -1102,12 +1266,16 @@ void Runtime::Impl::init() {
         if (gpu_dev) {
             cpu_buft = ggml_backend_dev_host_buffer_type(gpu_dev);
         }
+        // The worker's entire owned expert set can exceed WDDM's practical
+        // pinned-memory allowance. Keep it pageable and let the existing expert
+        // loader use bounded pinned upload staging when GPU execution needs it.
+        if (block_worker()) cpu_buft = nullptr;
         if (!cpu_buft) {
             cpu_buft = ggml_backend_get_default_buffer_type(cpu_backend);
         }
 
-        // Load weights: non-expert → GPU (its layer's GPU under a split),
-        // expert → CPU (pinned).
+        // Load weights: non-expert â†’ GPU (its layer's GPU under a split),
+        // expert â†’ CPU (pinned).
         weights_buf_owned = true;   // set first: a throw mid-load still frees what was allocated
         DevicePlan plan = device_plan();
         try {
@@ -1139,7 +1307,7 @@ void Runtime::Impl::init() {
                                        (int) sched_be.size(), GRAPH_SIZE, false, false);
         if (!sched) throw std::runtime_error("failed to create backend scheduler");
 
-        // Disable persistent reuse graph — sched alloc is incompatible with it.
+        // Disable persistent reuse graph â€” sched alloc is incompatible with it.
         reuse_graph = false;
 
         fprintf(stderr, "expert offload: ON (experts stream into the VRAM cache;"
@@ -1181,8 +1349,8 @@ void Runtime::Impl::init() {
         const int hd = (int) hp0.n_embd_head, nh = (int) hp0.n_head;
         const int nkv = std::max(1, (int) hp0.n_head_kv);
         ggml_tensor * q = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, hd, 1, nh);
-        ggml_tensor * k = ggml_new_tensor_3d(pctx, GGML_TYPE_F16, hd, 256, nkv);
-        ggml_tensor * v = ggml_new_tensor_3d(pctx, GGML_TYPE_F16, hd, 256, nkv);
+        ggml_tensor * k = ggml_new_tensor_3d(pctx, cache_type, hd, 256, nkv);
+        ggml_tensor * v = ggml_new_tensor_3d(pctx, cache_type, hd, 256, nkv);
         ggml_tensor * m = ggml_new_tensor_2d(pctx, GGML_TYPE_F16, 256, 1);
         ggml_tensor * fa = ggml_flash_attn_ext(pctx, q, k, v, m, 1.0f, 0.0f, 0.0f);
         std::vector<ggml_backend_t> devs_used(gpus.begin(), gpus.end());
@@ -1193,6 +1361,8 @@ void Runtime::Impl::init() {
         if (!use_flash)
             fprintf(stderr, "flash attention: off (no kernel for head size %d on this device)\n", hd);
     }
+    if (cache_type == GGML_TYPE_Q8_0 && !use_flash)
+        throw std::runtime_error("Q8 KV requires a supported CUDA flash-attention kernel; refusing an unsupported fallback");
     if (getenv("QWEN_NO_REUSE")) reuse_graph = false;
 
     const auto & hp = model.hparams();
@@ -1203,9 +1373,11 @@ void Runtime::Impl::init() {
     const int S       = hp.ssm_d_state;
     const int H_v     = hp.ssm_dt_rank;
 
+    // Worker receives primary-gathered PLE rows and never needs the global
+    // ngram table or its file handles/cache. PLE layer graphs remain enabled.
     // The n-gram table is deliberately built after the weights: it is not one of
     // them. No backend buffer holds it in any mode.
-    {
+    if (!block_worker()) {
         NgramTable::Mode m = NgramTable::Mode::DISK;
         if (!NgramTable::parse_mode(cfg.ngram_mode, m)) {
             throw std::runtime_error("--ngram: expected off, disk or ram, got '"
@@ -1235,6 +1407,7 @@ void Runtime::Impl::init() {
     idx_k_cache.assign(n_layer, nullptr);
 
     for (int il = 0; il < n_layer; ++il) {
+        if (block_worker() && (il < block_begin() || il >= block_end())) continue;
         if (hp.is_recurrent(il) && hp.has_shortconv) {
             conv_state[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F32,
                                                 hp.shortconv_l_cache - 1, hp.n_embd);
@@ -1245,15 +1418,12 @@ void Runtime::Impl::init() {
             ggml_set_name(conv_state[il], ("conv_" + std::to_string(il)).c_str());
             ggml_set_name(ssm_state[il],  ("ssm_"  + std::to_string(il)).c_str());
         } else {
-            // F16 halves the KV cache, which is what bounds the usable context
-            // (and on offload builds it competes with the expert pool). Writes
-            // convert from F32 via set_rows / cpy; flash attention takes F16
-            // K/V natively, and the fallback path feeds them to mul_mat, which
-            // handles an F16 src0 against F32 activations.
+            // GGML converts F32 writes to the selected row format. Flash
+            // attention reads F16 or Q8_0 directly; the QSA index stays F32.
             // per-layer width: the kv head count may vary by layer (step35)
             const int gqa_l = (int) hp.head_count_kv(il) * (int) hp.n_embd_head;
-            k_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, gqa_l, n_ctx);
-            v_cache[il] = ggml_new_tensor_2d(st_ctx, GGML_TYPE_F16, gqa_l, n_ctx);
+            k_cache[il] = ggml_new_tensor_2d(st_ctx, cache_type, gqa_l, n_ctx);
+            v_cache[il] = ggml_new_tensor_2d(st_ctx, cache_type, gqa_l, n_ctx);
             ggml_set_name(k_cache[il], ("k_" + std::to_string(il)).c_str());
             ggml_set_name(v_cache[il], ("v_" + std::to_string(il)).c_str());
             if (hp.has_qsa() && hp.compress_ratio(il) > 0) {
@@ -1298,6 +1468,14 @@ void Runtime::Impl::init() {
     for (size_t d = 0; d < st_bufs.size() && d < dev_kv_bytes.size(); ++d)
         dev_kv_bytes[d] = st_bufs[d] ? ggml_backend_buffer_get_size(st_bufs[d]) : 0;
 
+    size_t kv_bytes = 0, index_bytes = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        if (k_cache[il]) kv_bytes += ggml_nbytes(k_cache[il]) + ggml_nbytes(v_cache[il]);
+        if (idx_k_cache[il]) index_bytes += ggml_nbytes(idx_k_cache[il]);
+    }
+    fprintf(stderr, "attention cache: type=%s context=%d KV_bytes=%zu index_F32_bytes=%zu flash=%s\n",
+            ggml_type_name(cache_type), n_ctx, kv_bytes, index_bytes, use_flash ? "on" : "off");
+
     if (!sched) {
         galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     }
@@ -1307,7 +1485,7 @@ void Runtime::Impl::init() {
         init_cache();   // dynamic per-expert VRAM cache for the decode hot path
     }
     // MTP: main forward exposes its last hidden, drafted by the nextn block
-    capture_hidden = model.hparams().has_mtp();
+    capture_hidden = !block_worker() && model.hparams().has_mtp();
     if (capture_hidden) {
         mtp_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         mtp_hidden.assign(model.hparams().n_embd, 0.0f);
@@ -1349,6 +1527,7 @@ void Runtime::Impl::report_compute_buffers() {
 }
 
 size_t Runtime::Impl::state_bytes(int il) const {
+    if (block_worker() && (il < block_begin() || il >= block_end())) return 0;
     const auto & hp = model.hparams();
     size_t n = 0;
     if (hp.is_recurrent(il) && hp.has_shortconv) {
@@ -1359,7 +1538,7 @@ size_t Runtime::Impl::state_bytes(int il) const {
         n += (size_t) hp.ssm_d_state * hp.ssm_d_state * hp.ssm_dt_rank * 4;
     } else {
         const size_t n_embd_gqa = (size_t) hp.head_count_kv((uint32_t) il) * hp.n_embd_head;
-        n += 2 * n_embd_gqa * (size_t) cfg.n_ctx * 2;      // F16 K and V
+        n += 2 * ggml_row_size(attention_cache_type(cfg), n_embd_gqa) * (size_t) cfg.n_ctx;
         if (hp.has_qsa() && hp.compress_ratio((uint32_t) il) > 0)
             n += (size_t) hp.indexer_head_dim * cfg.n_ctx * 4;
     }
@@ -1684,8 +1863,11 @@ void Runtime::Impl::init_cache() {
         const size_t avail   = budget > reserve ? budget - reserve : 0;
         fprintf(stderr, "VRAM budget %zu MB = weights %zu + KV %zu + compute %zu + expert pool %zu MB\n",
                 budget >> 20, gpu_w >> 20, kv_bytes >> 20, compute >> 20, avail >> 20);
+        std::vector<bool> owned_block_layers((size_t) n_main, false);
+        for (int il = block_begin(); il < block_end(); ++il) owned_block_layers[(size_t) il] = true;
         ecaches.push_back(std::make_unique<ExpertCache>(
-            backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode));
+            backend, model, n_main, hp.n_expert, n_used, avail, ssd_mode,
+            block_worker() ? &owned_block_layers : nullptr));
     } else {
         // One cache per device, each sized against that device's own budget and
         // covering the layers whose expert pool it holds. That is not always the
@@ -1833,6 +2015,24 @@ void Runtime::Impl::init_cache() {
                         n, path.c_str());
         }
     }
+    const char * trace_enabled = getenv("QWEN_DEMAND_TRACE");
+    if (trace_enabled && std::strcmp(trace_enabled, "1") == 0) {
+        if (multi_gpu() || block_worker() || cache_fast_enabled || resident_decode ||
+            n_main < 1 || n_main > 64 || hp.n_expert > 65535 || n_used > 65535)
+            throw std::runtime_error("Demand trace requires single-node segmented exact expert execution");
+        std::vector<uint64_t> expert_bytes(static_cast<size_t>(n_main) * 3, 0);
+        for (int layer = 0; layer < n_main; ++layer) {
+            if (!hp.is_moe_layer(layer)) continue;
+            for (int role = 0; role < 3; ++role)
+                expert_bytes[static_cast<size_t>(layer) * 3 + role] =
+                    ec_of(layer)->tensor(static_cast<ExpertCache::Role>(role), layer)->nb[2];
+        }
+        const char * prefill = getenv("QWEN_DEMAND_TRACE_PREFILL");
+        demand_trace = std::make_unique<ExpertDemandTrace>(static_cast<uint16_t>(n_main),
+            static_cast<uint16_t>(hp.n_expert), static_cast<uint16_t>(n_used),
+            std::move(expert_bytes), 16u << 20, prefill && std::strcmp(prefill, "1") == 0);
+    }
+
 }
 
 void Runtime::Impl::zero_states() {
@@ -1875,7 +2075,7 @@ int Runtime::Impl::fill_rope_pos_spans(std::vector<int32_t> & dst, int n_tokens,
     if (!hp.use_mrope) {
         dst.resize(n_tokens);
         for (int i = 0; i < n_tokens; ++i) dst[i] = n_past + i;
-        return rope_start;
+        return rope_start + n_tokens;
     }
     dst.assign((size_t) 4 * n_tokens, 0);
     int32_t * pt = dst.data();
@@ -1942,6 +2142,42 @@ ggml_tensor * Runtime::Impl::build_attn(ggml_context * ctx, ggml_cgraph * gf, in
         // fused: q=[head,n_tokens,n_head], k/v=[head,n_kv,n_head_kv], mask F16
         ggml_tensor * Qf = ggml_permute(ctx, Q, 0, 2, 1, 3);              // [head, n_tokens, n_head]
         ggml_tensor * r = ggml_flash_attn_ext(ctx, Qf, Kc, Vc, mask, kq_scale, 0.0f, 0.0f);
+        // This is a finite-mask COUNT BOUND, not a smaller context or budget.
+        // The CUDA backend may gather the same cells; unsupported shapes fall
+        // back to its existing dense path. Start with scalar decode only.
+        static const bool sparse_qsa = [] {
+            const char * value = getenv("QWEN_QSA_SPARSE_ATTN");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const int ratio = (int) hp.compress_ratio(il);
+        if (sparse_qsa && n_tokens == 1 && hp.has_qsa() && ratio > 0 && idx_k_cache[il]) {
+            const int64_t bound = std::min<int64_t>(n_kv,
+                (int64_t) hp.indexer_top_k + ratio - 1);
+            if (bound > 0) ggml_flash_attn_ext_set_n_kv_max(r, (int32_t) bound);
+        }
+        // Default-off, bounded diagnostic on the existing cached scalar path.
+        // Retained inputs prevent gallocr reuse after their final FA consumer.
+        // The returned/original FA still determines the model's continuation.
+        const char * capture_layer = getenv("QWEN_QSA_CAPTURE_LAYER");
+        const int64_t capture_bound = ratio > 0 ? std::min<int64_t>(n_kv,
+            (int64_t) hp.indexer_top_k + ratio - 1) : 0;
+        if (capture_layer && std::strcmp(capture_layer, "3") == 0 && il == 3 &&
+            n_tokens == 1 && hp.has_qsa() && idx_k_cache[il] &&
+            n_kv > capture_bound && n_kv <= 65536 && capture_bound > 0) {
+            auto retain = [&](ggml_tensor * tensor, const char * name) {
+                ggml_set_name(tensor, (std::string("qsa_capture_") + name + "_3").c_str());
+                ggml_set_output(tensor);
+            };
+            retain(Qf, "q"); retain(Kc, "k"); retain(Vc, "v"); retain(mask, "mask");
+            auto * dense_capture = ggml_flash_attn_ext(ctx, Qf, Kc, Vc, mask,
+                kq_scale, 0.0f, 0.0f);
+            auto * sparse_capture = ggml_flash_attn_ext(ctx, Qf, Kc, Vc, mask,
+                kq_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_n_kv_max(sparse_capture, (int32_t) capture_bound);
+            retain(dense_capture, "dense"); retain(sparse_capture, "sparse"); retain(r, "original");
+            ggml_build_forward_expand(gf, dense_capture);
+            ggml_build_forward_expand(gf, sparse_capture);
+        }
         return ggml_reshape_2d(ctx, r, n_embd_head * n_head, n_tokens);   // r: [head, n_head, n_tokens]
     }
 
@@ -2229,7 +2465,7 @@ void Runtime::Impl::fill_ple_input(ggml_cgraph * gf, const int32_t * tokens, int
 // them once.
 ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf, int il,
         ggml_tensor * cur, ggml_tensor * inp_pos, ggml_tensor * mask,
-        int n_tokens, int n_kv, int kv_pos, QsaShared & shared) {
+        int n_tokens, int n_kv, int kv_pos, QsaShared & shared, bool retain_constants) {
     const auto & hp = model.hparams();
     const int r = (int) hp.compress_ratio(il);
     if (!hp.has_qsa() || r <= 0 || !idx_k_cache[il]) return mask;
@@ -2291,6 +2527,12 @@ ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf
         ggml_set_input(shared.blk_cells); ggml_set_name(shared.blk_cells, "inp_qsa_blk_cells");
         ggml_set_input(shared.blk_pos);   ggml_set_name(shared.blk_pos,   "inp_qsa_blk_pos");
         ggml_set_input(shared.bias);      ggml_set_name(shared.bias,      "inp_qsa_bias");
+        // INPUT alone does not retain storage after the last graph consumer.
+        // OUTPUT additionally prevents gallocr freeing or reusing these bytes.
+        if (retain_constants) {
+            ggml_set_output(shared.blk_pos);
+            ggml_set_output(shared.blk_cells);
+        }
     }
     GGML_ASSERT(shared.n_blocks == n_blocks && shared.width == width &&
                 "QSA layers in one graph must share a compress ratio");
@@ -2298,19 +2540,52 @@ ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf
     // ---- pool each block's member keys, then norm and rotate the result ----
     ggml_tensor * k_all = ggml_view_2d(ctx, idx_k_cache[il], idx_dim, n_kv,
                                        idx_k_cache[il]->nb[1], 0);
-    ggml_tensor * members = ggml_get_rows(ctx, k_all, shared.blk_cells);
-    members = ggml_reshape_3d(ctx, members, idx_dim, r, n_blocks);
-
-    // r is small (4 in the released model), so summing slices beats transposing
-    // the tensor to reach ggml_sum_rows
+    // blk_cells is generated as the identity b*r+m by BOTH host input
+    // builders. For scalar decode, its gather is the unchanged contiguous
+    // prefix of the persistent raw key cache, not an arbitrary permutation.
+    const int64_t member_rows = static_cast<int64_t>(r) * n_blocks;
+    const bool identity_view_supported = n_tokens == 1 && r > 0 && n_blocks > 0 &&
+        k_all->type == GGML_TYPE_F32 && k_all->ne[0] == idx_dim &&
+        k_all->ne[2] == 1 && k_all->ne[3] == 1 &&
+        k_all->nb[0] == sizeof(float) &&
+        k_all->nb[1] == static_cast<size_t>(idx_dim) * sizeof(float) &&
+        ggml_is_contiguous(k_all) && member_rows > 0 && member_rows <= k_all->ne[1];
     ggml_tensor * pooled = nullptr;
-    for (int i = 0; i < r; ++i) {
-        ggml_tensor * slice = ggml_cont(ctx,
-                ggml_view_2d(ctx, members, idx_dim, n_blocks,
-                             members->nb[2], (size_t) i * members->nb[1]));
-        pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+    const bool exact_pool_supported = identity_view_supported && r == 4 && idx_dim == 128 && !dbg_on &&
+        std::strncmp(ggml_backend_name(be_of(il)), "CUDA", 4) == 0;
+    if (qsa_pool4_exact_enabled && exact_pool_supported) {
+        // Preserve the named input consumed by set_qsa_inputs shape inference.
+        ggml_build_forward_expand(gf, shared.blk_cells);
+        auto * prefix = ggml_view_2d(ctx, k_all, idx_dim, member_rows, k_all->nb[1], 0);
+        pooled = ggml_pool_2d(ctx, prefix, GGML_OP_POOL_AVG, 1, 4, 1, 4, 0.0f, 0.0f);
+        // Matched CUDA backend recognizes only this explicit exact contract.
+        ggml_set_name(pooled, ("qsa_pool4_exact_" + std::to_string(il)).c_str());
+        ++qsa_pool4_exact_graphs;
+    } else {
+        ggml_tensor * members;
+        if (qsa_identity_key_view_enabled && identity_view_supported) {
+            ++qsa_identity_key_view_graphs;
+            // Keep the named input as a graph leaf: set_qsa_inputs still locates
+            // it and infers r from its dimensions. Gallocr allocates graph leaves
+            // first; this adds no arithmetic node/kernel or new host input rule.
+            ggml_build_forward_expand(gf, shared.blk_cells);
+            members = ggml_view_2d(ctx, k_all, idx_dim, member_rows, k_all->nb[1], 0);
+            ggml_set_name(members, ("qsa_identity_key_view_" + std::to_string(il)).c_str());
+        } else {
+            members = ggml_get_rows(ctx, k_all, shared.blk_cells);
+        }
+        members = ggml_reshape_3d(ctx, members, idx_dim, r, n_blocks);
+
+        // r is small (4 in the released model), so summing slices beats transposing
+        // the tensor to reach ggml_sum_rows
+        for (int i = 0; i < r; ++i) {
+            ggml_tensor * slice = ggml_cont(ctx,
+                    ggml_view_2d(ctx, members, idx_dim, n_blocks,
+                                 members->nb[2], (size_t) i * members->nb[1]));
+            pooled = pooled ? ggml_add(ctx, pooled, slice) : slice;
+        }
+        pooled = ggml_scale(ctx, pooled, 1.0f / (float) r);
     }
-    pooled = ggml_scale(ctx, pooled, 1.0f / (float) r);
     dbg("kraw", k_raw);
     dbg("pool0", pooled);
     pooled = ggml_reshape_3d(ctx, pooled, idx_dim, 1, n_blocks);
@@ -2372,7 +2647,8 @@ ggml_tensor * Runtime::Impl::build_qsa_mask(ggml_context * ctx, ggml_cgraph * gf
 // Fill the QSA host inputs of a graph, for a batch whose first token sits at
 // `kv_pos`. Found by name so every call site can use it without threading the
 // QsaShared through; a no-op on a graph that has no QSA layer.
-void Runtime::Impl::set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos) {
+void Runtime::Impl::set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int kv_pos,
+                                     QsaConstantInputs * constants) {
     QsaShared shared;
     shared.cell_blk  = ggml_graph_get_tensor(gf, "inp_qsa_cell_blk");
     if (!shared.cell_blk) return;
@@ -2384,18 +2660,33 @@ void Runtime::Impl::set_qsa_inputs(ggml_cgraph * gf, int n_tokens, int n_kv, int
     const int r        = (int) (shared.blk_cells->ne[0] / n_blocks);
     const int n_valid  = kv_pos + n_tokens;
 
-    // block b covers [b*r, (b+1)*r), so it is rotated at the position of its
-    // first token. All four mrope sections carry the same value: exact for text.
-    std::vector<int32_t> blk_pos((size_t) 4 * n_blocks);
-    for (int sec = 0; sec < 4; ++sec)
-        for (int b = 0; b < n_blocks; ++b) blk_pos[(size_t) sec * n_blocks + b] = b * r;
-    ggml_backend_tensor_set(shared.blk_pos, blk_pos.data(), 0, blk_pos.size() * sizeof(int32_t));
+    if (qsa_constant_cache_enabled && constants) {
+        if (constants->needs_upload(n_blocks, r)) {
+            constants->prepare(n_blocks, r);
+            const auto & positions = constants->positions();
+            const auto & cells = constants->cells();
+            ggml_backend_tensor_set(shared.blk_pos, positions.data(), 0, positions.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(shared.blk_cells, cells.data(), 0, cells.size() * sizeof(int32_t));
+            qsa_constant_upload_calls += 2;
+            constants->mark_uploaded();
+        } else {
+            qsa_constant_upload_skips += 2;
+        }
+    } else {
+        // block b covers [b*r, (b+1)*r), so it is rotated at the position of its
+        // first token. All four mrope sections carry the same value: exact for text.
+        std::vector<int32_t> blk_pos((size_t) 4 * n_blocks);
+        for (int sec = 0; sec < 4; ++sec)
+            for (int b = 0; b < n_blocks; ++b) blk_pos[(size_t) sec * n_blocks + b] = b * r;
+        ggml_backend_tensor_set(shared.blk_pos, blk_pos.data(), 0, blk_pos.size() * sizeof(int32_t));
 
-    std::vector<int32_t> blk_cells((size_t) r * n_blocks);
-    for (int b = 0; b < n_blocks; ++b)
-        for (int m = 0; m < r; ++m) blk_cells[(size_t) b * r + m] = b * r + m;
-    ggml_backend_tensor_set(shared.blk_cells, blk_cells.data(), 0,
-                            blk_cells.size() * sizeof(int32_t));
+        std::vector<int32_t> blk_cells((size_t) r * n_blocks);
+        for (int b = 0; b < n_blocks; ++b)
+            for (int m = 0; m < r; ++m) blk_cells[(size_t) b * r + m] = b * r + m;
+        ggml_backend_tensor_set(shared.blk_cells, blk_cells.data(), 0,
+                                blk_cells.size() * sizeof(int32_t));
+        qsa_constant_upload_calls += 2;
+    }
 
     // cell -> block, or 0 for a cell no complete block covers (the gather has to
     // stay in range; the bias below is what actually rules those cells in or out)
@@ -2558,6 +2849,11 @@ Runtime::Impl::Route Runtime::Impl::route_experts(ggml_context * ctx, int il,
         if (rm) rank = ggml_add(ctx, rank, rm);
     }
 
+    if (n_tokens == 1 && getenv("QWEN_BLOCK_ROUTING_LOG")) {
+        const auto name = "block_router_rank_" + std::to_string(il);
+        ggml_set_name(rank, name.c_str());
+        ggml_set_output(rank); // retain the actual biased rank for readback
+    }
     Route r;
     r.selected = ggml_argsort_top_k(ctx, rank, n_used);                // [n_used, n_tokens] i32
 
@@ -3352,13 +3648,17 @@ void Runtime::Impl::decode_verify(const std::vector<int32_t> & toks) {
         throw std::runtime_error("decode_verify: compute failed");
 
     ggml_tensor * h  = ggml_graph_get_tensor(v_gf, "main_hidden");
-    const int n_embd = (int) h->ne[0];
     vA.assign(n_tokens, 0);
     ggml_backend_tensor_get(ggml_graph_get_tensor(v_gf, "verify_argmax"),
                             vA.data(), 0, n_tokens * sizeof(int32_t));
-    vH.assign(n_tokens, std::vector<float>(n_embd));
-    for (int i = 0; i < n_tokens; ++i)
-        ggml_backend_tensor_get(h, vH[i].data(), (size_t) i * h->nb[1], n_embd * sizeof(float));
+    vH.assign(n_tokens, {});
+    if (h) { // External drafting needs argmax, not MTP's hidden-state bridge.
+        const int n_embd = (int) h->ne[0];
+        vH.assign(n_tokens, std::vector<float>(n_embd));
+        for (int i = 0; i < n_tokens; ++i)
+            ggml_backend_tensor_get(h, vH[i].data(),
+                    (size_t) i * h->nb[1], n_embd * sizeof(float));
+    }
 
     n_past += n_tokens;
 }
@@ -3685,18 +3985,44 @@ ggml_tensor * Runtime::Impl::build_moe_cached(ggml_context * ctx, ggml_cgraph * 
 // CPU backend reads them where they are; only the 2048-float input and output
 // cross. One small graph per call: mul_mat_id over the selected rows only.
 void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32_t> & ids,
-                                const std::vector<float> & w, std::vector<float> & out) {
+                                const std::vector<float> & w, std::vector<float> & out,
+                                const std::vector<std::shared_ptr<const uint8_t[]>> * held_weights) {
     const auto & hp = model.hparams();
     const int n_embd = hp.n_embd;
     const int n = (int) ids.size();
     out.assign(n_embd, 0.0f);
     if (n == 0) return;
+    // Cached expert slabs are separately allocated. Execute those immutable
+    // slabs in place instead of packing megabytes into a contiguous scratch
+    // tensor for every CPU call. Only the small result vectors are accumulated.
+    if (bounded_cpu_miss && borrow_cpu_weights && n > 1) {
+        for (int index = 0; index < n; ++index) {
+            std::vector<float> part;
+            std::vector<std::shared_ptr<const uint8_t[]>> one_expert;
+            if (held_weights) one_expert.assign(held_weights->begin() + index * 3, held_weights->begin() + index * 3 + 3);
+            cpu_experts(il, x, {ids[index]}, {w[index]}, part, held_weights ? &one_expert : nullptr);
+            for (int column = 0; column < n_embd; ++column) out[column] += part[column];
+        }
+        return;
+    }
+    const auto preparing = std::chrono::steady_clock::now();
 
     // One kept graph per (layer, expert count), like the GPU segments: built
     // and allocated once, only its three inputs change.
     const int n_used = (int) hp.n_expert_used;
-    if (cpu_g.size() != (size_t) hp.n_layer * (n_used + 1)) cpu_g.assign((size_t) hp.n_layer * (n_used + 1), CpuGraph{});
-    CpuGraph & g = cpu_g[(size_t) il * (n_used + 1) + n];
+    ggml_tensor * source[3] = { W("blk.%d.ffn_gate_exps.weight", il),
+        W("blk.%d.ffn_up_exps.weight", il), W("blk.%d.ffn_down_exps.weight", il) };
+    std::string signature = std::to_string(n);
+    if (bounded_cpu_miss) {
+        for (auto * tensor : source) signature += "|" + std::to_string(tensor->type) + ":"
+            + std::to_string(tensor->ne[0]) + ":" + std::to_string(tensor->ne[1]);
+    } else if (cpu_g.size() != (size_t) hp.n_layer * (n_used + 1)) {
+        cpu_g.assign((size_t) hp.n_layer * (n_used + 1), CpuGraph{});
+    }
+    // Share compact scratch graphs across layers with the same tensor shapes.
+    // Keeping one full weight scratch per layer would defeat the RAM bound.
+    CpuGraph & g = bounded_cpu_miss ? bounded_cpu_g[signature]
+                                  : cpu_g[(size_t) il * (n_used + 1) + n];
     if (!g.gf) {
         ggml_init_params gp{};
         gp.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false);
@@ -3709,10 +4035,17 @@ void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32
         g.wt  = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, n, 1);
         ggml_set_input(g.xin); ggml_set_input(g.idt); ggml_set_input(g.wt);
 
-        ggml_tensor * up   = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_up_exps.weight",   il), g.xin, g.idt);
-        ggml_tensor * gate = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_gate_exps.weight", il), g.xin, g.idt);
+        if (bounded_cpu_miss) {
+            for (int role = 0; role < 3; ++role) {
+                g.compact[role] = ggml_new_tensor_3d(g.ctx, source[role]->type,
+                    source[role]->ne[0], source[role]->ne[1], n);
+                ggml_set_input(g.compact[role]);
+            }
+        }
+        ggml_tensor * up   = ggml_mul_mat_id(g.ctx, bounded_cpu_miss ? g.compact[1] : source[1], g.xin, g.idt);
+        ggml_tensor * gate = ggml_mul_mat_id(g.ctx, bounded_cpu_miss ? g.compact[0] : source[0], g.xin, g.idt);
         ggml_tensor * act  = ggml_swiglu_split(g.ctx, gate, up);                   // [ff_exp, n, 1]
-        ggml_tensor * experts = ggml_mul_mat_id(g.ctx, W("blk.%d.ffn_down_exps.weight", il), act, g.idt); // [n_embd, n, 1]
+        ggml_tensor * experts = ggml_mul_mat_id(g.ctx, bounded_cpu_miss ? g.compact[2] : source[2], act, g.idt); // [n_embd, n, 1]
         ggml_tensor * et  = ggml_cont(g.ctx, ggml_transpose(g.ctx, ggml_reshape_2d(g.ctx, experts, n_embd, n)));
         g.res = ggml_mul_mat(g.ctx, et, g.wt);                                    // [n_embd, 1]
         ggml_set_output(g.res);
@@ -3722,20 +4055,104 @@ void Runtime::Impl::cpu_experts(int il, const float * x, const std::vector<int32
         if (!ggml_gallocr_alloc_graph(g.galloc, g.gf))
             throw std::runtime_error("cpu_experts: gallocr alloc failed");
     }
+    struct BorrowedWeights {
+        ggml_tensor * tensor[3] = {nullptr, nullptr, nullptr};
+        void * original[3] = {nullptr, nullptr, nullptr};
+        std::shared_ptr<const uint8_t[]> owner[3];
+        void restore() {
+            for (int role = 0; role < 3; ++role) {
+                if (tensor[role]) tensor[role]->data = original[role];
+                tensor[role] = nullptr;
+            }
+        }
+        ~BorrowedWeights() { restore(); }
+    } borrowed;
+    std::vector<int32_t> compact_ids;
+    if (bounded_cpu_miss) {
+        compact_ids.resize(n);
+        for (int index = 0; index < n; ++index) {
+            compact_ids[index] = index;
+            for (int role = 0; role < 3; ++role) {
+                const size_t bytes = source[role]->nb[2];
+                if (borrow_cpu_weights) {
+                    borrowed.owner[role] = held_weights ? (*held_weights)[role] :
+                        ec_of(il)->borrow_host_slab((ExpertCache::Role) role, il, ids[index], bytes);
+                    borrowed.tensor[role] = g.compact[role];
+                    borrowed.original[role] = g.compact[role]->data;
+                    g.compact[role]->data = const_cast<uint8_t *>(borrowed.owner[role].get());
+                } else {
+                    ec_of(il)->copy_host_slab((ExpertCache::Role) role, il, ids[index],
+                        (char *) g.compact[role]->data + (size_t) index * bytes, bytes);
+                }
+            }
+        }
+    }
     ggml_backend_tensor_set(g.xin, x, 0, (size_t) n_embd * sizeof(float));
-    ggml_backend_tensor_set(g.idt, ids.data(), 0, (size_t) n * sizeof(int32_t));
+    ggml_backend_tensor_set(g.idt, bounded_cpu_miss ? compact_ids.data() : ids.data(), 0, (size_t) n * sizeof(int32_t));
     ggml_backend_tensor_set(g.wt,  w.data(),   0, (size_t) n * sizeof(float));
+    cpu_prepare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - preparing).count();
+    const auto computing = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(cpu_backend, g.gf) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("cpu_experts: compute failed");
     ggml_backend_tensor_get(g.res, out.data(), 0, (size_t) n_embd * sizeof(float));
+    cpu_graph_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - computing).count();
+    if (bounded_cpu_miss && borrow_cpu_weights && !verified_cpu_borrow[signature]) {
+        // Verify the actual routed-expert graph, not a substitute matmul. One
+        // check per quantization/shape signature compares direct reads with the
+        // original copied-weight graph using identical inputs and CPU kernels.
+        borrowed.restore();
+        for (int role = 0; role < 3; ++role)
+            std::memcpy(g.compact[role]->data, borrowed.owner[role].get(), source[role]->nb[2]);
+        if (ggml_backend_graph_compute(cpu_backend, g.gf) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("CPU borrowed-weight verification failed to execute");
+        std::vector<float> copied(n_embd);
+        ggml_backend_tensor_get(g.res, copied.data(), 0, (size_t) n_embd * sizeof(float));
+        if (copied != out) throw std::runtime_error("CPU borrowed weights changed numerical output");
+        verified_cpu_borrow[signature] = true;
+        ++cpu_borrow_checks;
+    }
 }
 
 void Runtime::Impl::setup_cpu_miss() {
     const auto & hp = model.hparams();
     const char * env  = getenv("QWEN_CPU_MISS");
-    const std::string mode = env ? env : "auto";
+    const std::string mode = block_worker() ? (cfg.block_cpu_experts ? "1" : "0") : (env ? env : "auto");
     if (mode == "0" || !ecache) return;
-    const bool eligible = !ssd_mode && cpu_backend && gpus.size() <= 1;
+    bounded_cpu_miss = ssd_mode && ecache->has_host_cache() && getenv("QWEN_BOUNDED_CPU_MISS");
+    if (bounded_cpu_miss) {
+        borrow_cpu_weights = getenv("QWEN_CPU_BORROW") != nullptr;
+        overlap_bounded_cpu = borrow_cpu_weights && getenv("QWEN_CPU_OVERLAP");
+        overlap_cpu_io = overlap_bounded_cpu && getenv("QWEN_CPU_IO_OVERLAP");
+        hss_enabled = getenv("QWEN_HYBRID_HSS") != nullptr;
+        if (hss_enabled) {
+            auto measured_cost = [](const char * name) {
+                const char * value = getenv(name);
+                if (!value) throw std::runtime_error(std::string("HSS requires calibrated cost: ") + name);
+                const double cost = std::stod(value);
+                if (!std::isfinite(cost) || cost <= 0) throw std::runtime_error("Invalid calibrated HSS cost");
+                return cost;
+            };
+            hss_cpu_ms = measured_cost("QWEN_HSS_CPU_MS");
+            hss_gpu_ms = measured_cost("QWEN_HSS_GPU_MS");
+            hss_ram_ms = measured_cost("QWEN_HSS_RAM_TRANSFER_MS");
+            hss_ssd_ms = measured_cost("QWEN_HSS_SSD_TRANSFER_MS");
+            if (!overlap_cpu_io) throw std::runtime_error("HSS requires CPU/I-O overlap for its queue model");
+        }
+        cm_refill = 0; // A RAM-resident CPU expert need not immediately migrate to GPU.
+        if (const char * maximum = getenv("QWEN_BOUNDED_CPU_MAX")) bounded_cpu_max = std::max(0, atoi(maximum));
+    }
+    if (bounded_cpu_miss && !cpu_backend) {
+        cpu_backend = ggml_backend_cpu_init();
+        if (!cpu_backend) throw std::runtime_error("Cannot initialize bounded CPU expert execution");
+    }
+    // The existing automatic full-RAM calibration dereferences every expert's
+    // host tensor. Bounded mode must use a separately validated profile/explicit
+    // test setting until its own startup/online calibration is connected.
+    if (bounded_cpu_miss && mode == "auto") {
+        fprintf(stderr, "bounded CPU experts: explicit calibrated setting required; disabled\n");
+        return;
+    }
+    const bool eligible = (!ssd_mode || bounded_cpu_miss) && cpu_backend && gpus.size() <= 1;
     if (!eligible) {
         if (mode != "auto")
             fprintf(stderr, "cpu-miss decode: needs the RAM tier on one GPU; ignored\n");
@@ -4019,6 +4436,10 @@ void Runtime::Impl::cm_tune_record(double ms) {
 void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool want_logits,
                                         bool verify,
                                         const Runtime::EmbdOverride * ovr, int n_ovr) {
+    auto demand_call = demand_trace ? demand_trace->begin(n_past, n_tokens,
+        verify ? ExpertDemandTrace::Phase::verify_batch : ExpertDemandTrace::Phase::prefill_batch)
+        : ExpertDemandTrace::Call{};
+    for (auto * cache : all_ecaches()) cache->set_phase_workspace(true, n_tokens, !verify);
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_exp       = hp.n_expert;
@@ -4333,7 +4754,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     };
 
     // QWEN_PREFILL_STATS=1 logs, per (chunk,layer), the distinct-expert union and
-    // the fetch cost of ensure() — diagnoses "traffic = n_chunks x full sweep".
+    // the fetch cost of ensure() â€” diagnoses "traffic = n_chunks x full sweep".
     // plan_slices() below flips quota enforcement per layer; restore whatever
     // the caller had on the way out so a batch cannot leave the mode changed.
     struct QuotaScope {
@@ -4367,6 +4788,8 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     static const int max_slice = []{ const char * c = getenv("QWEN_SEGB_SLICE");
                                      int v = c ? atoi(c) : 1024; return v < 1 ? 1024 : v; }();
     auto plan_slices = [&](int il) {
+        // Observe the original full routing matrix, not its residency union/slices.
+        demand_call.layer(il, sel.data(), T, n_used);
         // Pass 1: the layer's expert union over the whole chunk.
         plan_union = 0;
         plan_list.clear();
@@ -4453,7 +4876,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // eps of the layer's total. A dropped entry keeps its token slot (id remapped
     // to the token's heaviest kept expert) with weight 0, and the token's kept
     // weights are renormalized, so seg B computes the same weighted sum minus the
-    // dropped contributions. Lossy — quality knob, prefill only.
+    // dropped contributions. Lossy â€” quality knob, prefill only.
     static const float prune_eps = []{ const char * c = getenv("QWEN_PREFILL_PRUNE");
                                        return c ? (float) atof(c) : 0.0f; }();
     std::vector<float> wgt_host;
@@ -4590,12 +5013,15 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             // the pool: the per-slice ensures below then only hit, so the SSD
             // sweep happens once per layer as one dense coalesced read instead
             // of sparse per-slice residual fetches (which re-read the tensor).
-            if (nsl > 1 && plan_union <= ec_of(il)->capacity(il) - 8) {
+            // Transient mappings belong to one ensure() call. Warming their
+            // union would refetch rejected experts in every following slice.
+            if (nsl > 1 && !ec_of(il)->uses_transient_admission() &&
+                plan_union <= ec_of(il)->capacity(il) - 8) {
                 pre_g.resize(plan_list.size());
                 pre_u.resize(plan_list.size());
                 pre_d.resize(plan_list.size());
                 ec_of(il)->ensure(il, plan_list.data(), (int) plan_list.size(),
-                               pre_g.data(), pre_u.data(), pre_d.data());
+                               pre_g.data(), pre_u.data(), pre_d.data(), false);
             }
             for (int k = 0; k < nsl; ++k) {
                 const auto [st0, slen] = slices[k];
@@ -4727,14 +5153,26 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
     // matching draft prefix. Full logits are never read back (T x n_vocab
     // floats would dominate the readback cost on large-vocab models).
     if (verify) {
-        vH.assign(T, std::vector<float>(n_embd));
-        for (int i = 0; i < T; ++i)
-            ggml_backend_tensor_get(h_b, vH[i].data(), (size_t) i * n_embd * sizeof(float), n_embd * sizeof(float));
+        vH.assign(T, {});
+        if (!hc_on) {
+            vH.assign(T, std::vector<float>(n_embd));
+            for (int i = 0; i < T; ++i)
+                ggml_backend_tensor_get(h_b, vH[i].data(),
+                        (size_t) i * n_embd * sizeof(float), n_embd * sizeof(float));
+        }
 
         ggml_context * ctx = new_ctx();
         ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-        ggml_tensor * cur = ggml_rms_norm(ctx, h_b, eps);                        // [n_embd, T]
-        cur = ggml_mul(ctx, cur, out_norm_w());
+        ggml_tensor * cur;
+        if (hc_on) {
+            cur = build_hc_mix(ctx, h_b,
+                    model.tensor("output_hc_norm.weight"),
+                    model.tensor("output_hc_down.weight"),
+                    model.tensor("output_hc_up.weight"), nullptr, nullptr);
+        } else {
+            cur = ggml_rms_norm(ctx, h_b, eps);
+            cur = ggml_mul(ctx, cur, out_norm_w());
+        }
         ggml_tensor * output_w = out_proj_w();
         cur = ggml_mul_mat(ctx, output_w, cur);                                 // [n_vocab, T]
         ggml_tensor * am = ggml_argmax(ctx, cur);                               // [T] i32
@@ -4765,6 +5203,9 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
 // Correctness follows the *actual* routing; the cache only changes where the
 // expert weights are fetched from (VRAM hit vs CPU/SSD miss).
 const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const float * embd_override) {
+    auto demand_call = demand_trace ? demand_trace->begin(n_past, 1, ExpertDemandTrace::Phase::single_forward)
+                                    : ExpertDemandTrace::Call{};
+    for (auto * cache : all_ecaches()) cache->set_phase_workspace(false, 1, false);
     const auto & hp = model.hparams();
     const int n_embd      = hp.n_embd;
     const int n_used      = hp.n_expert_used;
@@ -4803,7 +5244,11 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     };
 
     // ---- seg 0: token embedding -> p_h ----
-    if (embd_override) {
+    if (block_worker()) {
+        if (block_frame.hidden.size() != (size_t) ggml_nelements(p_h))
+            throw std::runtime_error("block residual width mismatch (hyperstreams must be preserved)");
+        ggml_backend_tensor_set(p_h, block_frame.hidden.data(), 0, ggml_nbytes(p_h));
+    } else if (embd_override) {
         // vision: this position's embedding is a precomputed image embedding
         ggml_backend_tensor_set(p_h, embd_override, 0, (size_t) n_embd * sizeof(float));
     } else {
@@ -4822,7 +5267,11 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         ggml_free(ctx);
     }
 
-    if (p_ple) {
+    if (p_ple && block_worker()) {
+        if (block_frame.ple.size() != (size_t) ggml_nelements(p_ple))
+            throw std::runtime_error("block PLE input width mismatch");
+        ggml_backend_tensor_set(p_ple, block_frame.ple.data(), 0, ggml_nbytes(p_ple));
+    } else if (p_ple) {
         ngram_rows.clear();
         ngram->hash_rows(&token, 1, ngram_hist, ngram_rows);
         ngram_embd.resize(ngram_rows.size() * hp.ple_head_dim);
@@ -4854,7 +5303,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // KV columns seg A attends over: n_kv, except while cpu_miss builds a kept
     // graph, which is sized for a whole bucket and masks the unwritten rows.
     int seg_nkv = n_kv;
-    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il) -> ggml_tensor * {
+    auto build_segA = [&](ggml_context * ctx, ggml_cgraph * gf, int il, bool retain_qsa_constants = false) -> ggml_tensor * {
         QsaShared qsa;
         const int n_head    = (int) hp.head_count(il);       // per-layer on step35
         const int n_head_kv = (int) hp.head_count_kv(il);
@@ -4918,7 +5367,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             Q = apply_rope(ctx, Q, inp_pos);
             K = apply_rope(ctx, K, inp_pos);
             ggml_tensor * m = build_qsa_mask(ctx, gf, il, cur, inp_pos, inp_mask,
-                                             1, seg_nkv, n_past, qsa);
+                                             1, seg_nkv, n_past, qsa, retain_qsa_constants);
             ggml_tensor * att = build_attn(ctx, gf, il, Q, K, V, m, 1, seg_nkv);
             if (gated) att = ggml_mul(ctx, att, ggml_sigmoid(ctx, gate_t));
             cur = ggml_mul_mat(ctx, W("blk.%d.attn_output.weight", il), att);
@@ -4988,15 +5437,63 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         set_qsa_inputs(gf, 1, n_kv, n_past);
     };
     // Read back layer `il`'s router selection and make those experts resident.
-    auto ensure_layer = [&](ggml_tensor * selected, int il) {
+    auto ensure_layer = [&](ggml_tensor * selected, int il, ggml_cgraph * gf) {
         ggml_backend_tensor_get(selected, sel.data(), 0, n_used * sizeof(int32_t));
+        demand_call.layer(il, sel.data(), 1, n_used);
+
+        if (getenv("QWEN_BLOCK_ROUTING_LOG")) {
+            const std::string rank_name = "block_router_rank_" + std::to_string(il);
+            ggml_tensor * rank = ggml_graph_get_tensor(gf, rank_name.c_str());
+            if (!rank) throw std::runtime_error("Diagnostic router rank was not preserved");
+            std::vector<float> ranked(hp.n_expert), weights(n_used);
+            ggml_backend_tensor_get(rank, ranked.data(), 0, ranked.size() * sizeof(float));
+            ggml_backend_tensor_get(carry_wgt(il), weights.data(), 0, weights.size() * sizeof(float));
+            auto fingerprint = [&](ggml_tensor * tensor) {
+                if (!tensor) { fprintf(stderr, "null"); return; }
+                std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+                ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+                uint64_t hash = 14695981039346656037ull;
+                for (uint8_t byte : bytes) { hash ^= byte; hash *= 1099511628211ull; }
+                double sum = 0, squared = 0;
+                if (tensor->type == GGML_TYPE_F32) {
+                    const auto * values = reinterpret_cast<const float *>(bytes.data());
+                    for (size_t index = 0; index < bytes.size() / sizeof(float); ++index) {
+                        sum += values[index]; squared += (double) values[index] * values[index];
+                    }
+                }
+                fprintf(stderr, "{\"bytes\":%zu,\"hash\":%llu,\"sum\":%.17g,\"squared\":%.17g}",
+                    bytes.size(), (unsigned long long) hash, sum, squared);
+            };
+            float selected_min = INFINITY, unselected_max = -INFINITY;
+            for (int expert = 0; expert < (int) ranked.size(); ++expert) {
+                if (std::find(sel.begin(), sel.end(), expert) != sel.end())
+                    selected_min = std::min(selected_min, ranked[(size_t) expert]);
+                else unselected_max = std::max(unselected_max, ranked[(size_t) expert]);
+            }
+            fprintf(stderr, "block_router {\"position\":%d,\"layer\":%d,\"rank_margin\":%.9g,\"selected\":[",
+                n_past, il, (double) selected_min - unselected_max);
+            for (int index = 0; index < n_used; ++index) fprintf(stderr, "%s%d", index ? "," : "", sel[index]);
+            fprintf(stderr, "],\"weights\":[");
+            for (int index = 0; index < n_used; ++index) fprintf(stderr, "%s%.9g", index ? "," : "", weights[index]);
+            fprintf(stderr, "],\"rank\":[");
+            for (size_t index = 0; index < ranked.size(); ++index) fprintf(stderr, "%s%.9g", index ? "," : "", ranked[index]);
+            fprintf(stderr, "],\"ffn\":"); fingerprint(carry_ffn(il));
+            fprintf(stderr, ",\"conv\":"); fingerprint(conv_state[il]);
+            fprintf(stderr, ",\"ssm\":"); fingerprint(ssm_state[il]);
+            fprintf(stderr, ",\"ple\":"); fingerprint(ple_conv_state[il]);
+            fprintf(stderr, "}\n");
+        }
+
         ec_of(il)->ensure(il, sel.data(), n_used, slot_g.data(), slot_u.data(), slot_d.data());
         ggml_backend_tensor_set(p_slot_g, slot_g.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_u, slot_u.data(), 0, n_used * sizeof(int32_t));
         ggml_backend_tensor_set(p_slot_d, slot_d.data(), 0, n_used * sizeof(int32_t));
     };
 
-    const int N = (int) hp.n_main();
+    const int N = block_end();
+    const int first = block_begin();
+    if ((block_observer || block_executor) && cpu_miss)
+        throw std::runtime_error("block capture gate requires GPU-only exact segmented execution");
 
     // seg A(0) on its own, then fuse segB(L)+segA(L+1) per step so each layer
     // boundary is a single GPU submit instead of two (~halves the dispatches).
@@ -5008,6 +5505,8 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // seg B finds its inputs and slot ids local. Leaves the carry members
     // pointing at the pool device.
     auto do_segA = [&](int il) {
+        if (block_executor && il == remote_first) return;
+        capture_begin(il, token);
         const int a = dev_of(il);
         use_carry(a);
         ggml_context * ctx = new_ctx();
@@ -5021,7 +5520,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         const int p = pdev_of(il);
         hop_carry_ab(a, p, il);
         use_carry(p);
-        ensure_layer(selected, il);
+        ensure_layer(selected, il, gf);
         ggml_free(ctx);
     };
 
@@ -5122,7 +5621,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             ggml_build_forward_expand(gf, ggml_cpy(ctx, h_new, p_h));
         };
 
-        for (int il = 0; il < N; ++il) {
+        for (int il = first; il < N; ++il) {
             auto t0 = hclk::now();
 
             // ---- seg A ----
@@ -5166,7 +5665,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                     const bool sv_p = persistent;
                     ggml_tensor * sv_d = d_kvidx;
                     persistent = true;  d_kvidx = g.kvidx;  seg_nkv = nb;
-                    g.sel = build_segA(g.ctx, g.gf, il);
+                    g.sel = build_segA(g.ctx, g.gf, il, qsa_constant_cache_enabled);
                     persistent = sv_p;  d_kvidx = sv_d;     seg_nkv = n_kv;
                     g.pos  = ggml_graph_get_tensor(g.gf, "inp_pos");
                     g.mask = ggml_graph_get_tensor(g.gf, "inp_mask");
@@ -5184,7 +5683,7 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                 ggml_backend_tensor_set_async(be, g.pos,   pin_pos,   0, posv.size() * sizeof(int32_t));
                 ggml_backend_tensor_set_async(be, g.mask,  pin_mask,  0, (size_t) nb * sizeof(ggml_fp16_t));
                 ggml_backend_tensor_set_async(be, g.kvidx, pin_kvidx, 0, sizeof(int64_t));
-                set_qsa_inputs(g.gf, 1, nb, n_past);   // no-op without QSA
+                set_qsa_inputs(g.gf, 1, nb, n_past, &g.qsa_constants);   // same graph owns upload state
                 gf = g.gf;
                 selected = g.sel;
             } else {
@@ -5214,10 +5713,95 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 
             // ---- split the selection by residency ----
             ExpertCache * ec = ec_of(il);
+            demand_call.layer(il, pin_sel, 1, n_used);
+            ec->note_demands(il, pin_sel, n_used);
+            ec->activation_lookahead(il);
+            // Bounded, rotating hot-RAM reconciliation, separate from execution
+            // choice. A repeatedly used RAM expert can earn GPU residency even
+            // when the CPU scheduler would otherwise keep executing it there.
+            if (il == n_past % N) ec->promote_hot_demand(il, pin_sel, n_used);
             const int32_t * rg = ec->slot_of_row(ExpertCache::GATE, il);
             const int32_t * ru = ec->slot_of_row(ExpertCache::UP,   il);
             const int32_t * rd = ec->slot_of_row(ExpertCache::DOWN, il);
             cids.clear(); cw.clear(); gsg.clear(); gsu.clear(); gsd.clear(); gw.clear();
+            // Identify the entire GPU batch before any fetch. SSD misses use
+            // the normal parallel loader rather than three serial reads/expert.
+            std::vector<int32_t> gpu_ids;
+            std::vector<float> gpu_weights;
+            for (int k = 0; k < n_used; ++k) {
+                const int e = pin_sel[k];
+                const bool gpu_resident = ec->resident(ExpertCache::GATE, il, e) && ec->resident(ExpertCache::UP, il, e) &&
+                                          ec->resident(ExpertCache::DOWN, il, e);
+                const bool cpu_eligible = !bounded_cpu_miss ||
+                    ((int) cids.size() < bounded_cpu_max && ec->host_resident(il, e));
+                if (gpu_resident || !cpu_eligible) {
+                    gpu_ids.push_back(e); gpu_weights.push_back(pin_w[k]);
+                } else {
+                    cids.push_back(e); cw.push_back(pin_w[k]);
+                }
+            }
+            if (hss_enabled) {
+                std::vector<HybridExpertTask> tasks;
+                for (int k = 0; k < n_used; ++k) {
+                    const int expert = pin_sel[k];
+                    const bool resident = ec->resident(ExpertCache::GATE, il, expert) &&
+                        ec->resident(ExpertCache::UP, il, expert) && ec->resident(ExpertCache::DOWN, il, expert);
+                    const bool on_cpu = std::find(cids.begin(), cids.end(), expert) != cids.end();
+                    const bool in_ram = !resident && ec->host_resident(il, expert);
+                    tasks.push_back({expert, 1, resident, on_cpu, hss_gpu_ms, hss_cpu_ms,
+                        resident ? 0 : in_ram ? hss_ram_ms : hss_ssd_ms});
+                }
+                const auto plan = schedule_hybrid_experts(tasks, 0, 0, HybridGpuTimeline::BatchBarrier);
+                ++hss_decisions;
+                cids.clear(); cw.clear(); gpu_ids.clear(); gpu_weights.clear();
+                // Preserve router order for the numerical summation. The plan
+                // assigns devices; each device still batches its own experts.
+                for (int k = 0; k < n_used; ++k) {
+                    const int expert = pin_sel[k];
+                    if (std::find(plan.cpu.begin(), plan.cpu.end(), expert) != plan.cpu.end()) {
+                        cids.push_back(expert); cw.push_back(pin_w[k]);
+                    } else {
+                        gpu_ids.push_back(expert); gpu_weights.push_back(pin_w[k]);
+                    }
+                }
+            }
+            #include "grouped_experts_partition.h.inc"
+            // Immutable leases keep selected CPU slabs valid even if GPU miss
+            // loading evicts their cache entries. Then CPU math can overlap seg B.
+            std::vector<std::shared_ptr<const uint8_t[]>> held_cpu_weights;
+            if (overlap_bounded_cpu) {
+                for (int expert : cids) {
+                    for (int role = 0; role < 3; ++role) {
+                        auto * source = ec->tensor((ExpertCache::Role) role, il);
+                        held_cpu_weights.push_back(ec->borrow_host_slab((ExpertCache::Role) role, il, expert, source->nb[2]));
+                    }
+                }
+            }
+            std::future<std::pair<std::vector<float>, double>> cpu_future;
+            #include "grouped_experts_submit.h.inc"
+            if (overlap_cpu_io && !cids.empty()) {
+                const auto submitting = hclk::now();
+                cpu_future = std::async(std::launch::async,
+                    [this, il, input = std::vector<float>(pin_x, pin_x + n_embd),
+                     ids = cids, weights = cw, held = held_cpu_weights]() {
+                        const auto started = hclk::now();
+                        std::vector<float> output;
+                        cpu_experts(il, input.data(), ids, weights, output, &held);
+                        const double duration = std::chrono::duration<double, std::milli>(hclk::now() - started).count();
+                        return std::make_pair(std::move(output), duration);
+                    });
+                cpu_submit_ms += ms_since(submitting);
+            }
+            auto cpu_started = hclk::now();
+            if (bounded_cpu_miss && !overlap_bounded_cpu && !cids.empty() && !cpu_future.valid())
+                cpu_experts(il, pin_x, cids, cw, corr);
+            cm_cpu_ms += ms_since(cpu_started);
+            if (bounded_cpu_miss) {
+                gsg.resize(gpu_ids.size()); gsu.resize(gpu_ids.size()); gsd.resize(gpu_ids.size());
+                gw = gpu_weights;
+                ec->ensure(il, gpu_ids.data(), (int) gpu_ids.size(), gsg.data(), gsu.data(), gsd.data(), false);
+            } else {
+            cids.clear(); cw.clear();
             for (int k = 0; k < n_used; ++k) {
                 const int e = pin_sel[k];
                 if (ec->resident(ExpertCache::GATE, il, e) && ec->resident(ExpertCache::UP, il, e) &&
@@ -5227,9 +5811,16 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
                     ec->touch(ExpertCache::GATE, il, e);
                     ec->touch(ExpertCache::UP,   il, e);
                     ec->touch(ExpertCache::DOWN, il, e);
+                } else if (bounded_cpu_miss && !ec->host_resident(il, e)) {
+                    // A RAM miss still follows the exact GPU/SSD path. Only
+                    // complete RAM-resident experts are eligible for CPU work.
+                    ec->ensure_resident(il, e);
+                    gsg.push_back(rg[e]); gsu.push_back(ru[e]); gsd.push_back(rd[e]);
+                    gw.push_back(pin_w[k]);
                 } else {
                     cids.push_back(e); cw.push_back(pin_w[k]);
                 }
+            }
             }
             cm_gpu += gsg.size();
             cm_cpu += cids.size();
@@ -5276,10 +5867,22 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 
             // ---- the CPU's share, while the GPU works ----
             auto tc = hclk::now();
-            if (!cids.empty()) cpu_experts(il, pin_x, cids, cw, corr);
+            const bool asynchronous_cpu = cpu_future.valid();
+            if (asynchronous_cpu) {
+                auto completed = cpu_future.get();
+                corr = std::move(completed.first);
+                cm_cpu_ms += completed.second;
+                cpu_join_ms += ms_since(tc);
+                if (hss_enabled) {
+                    const double per_expert = completed.second / cids.size();
+                    hss_cpu_ms = 0.95 * hss_cpu_ms + 0.05 * per_expert;
+                }
+            } else if ((!bounded_cpu_miss || overlap_bounded_cpu) && !cids.empty()) {
+                cpu_experts(il, pin_x, cids, cw, corr, overlap_bounded_cpu ? &held_cpu_weights : nullptr);
+            }
             auto tw = hclk::now();
             ggml_backend_synchronize(be);
-            cm_cpu_ms  += std::chrono::duration<double, std::milli>(tw - tc).count();
+            if (!asynchronous_cpu) cm_cpu_ms += std::chrono::duration<double, std::milli>(tw - tc).count();
             cm_wait_ms += ms_since(tw);
             if (tctx) { ggml_free(tctx); tctx = nullptr; }
             upload_corr(!cids.empty());
@@ -5325,8 +5928,27 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
             }
         }
     } else {
-    do_segA(0);
-    for (int il = 0; il < N; ++il) {
+    do_segA(first);
+    for (int il = first; il < N; ++il) {
+        if (block_executor && il == remote_first) {
+            Runtime::BlockFrame frame;
+            frame.first = remote_first; frame.last = remote_last; frame.token = token;
+            frame.position = n_past; frame.rope_position = mrope_next;
+            frame.hidden.resize(ggml_nelements(p_h));
+            ggml_backend_tensor_get(p_h, frame.hidden.data(), 0, ggml_nbytes(p_h));
+            if (p_ple) {
+                frame.ple.resize(ggml_nelements(p_ple));
+                ggml_backend_tensor_get(p_ple, frame.ple.data(), 0, ggml_nbytes(p_ple));
+            }
+            auto output = block_executor(frame);
+            if (output.size() != frame.hidden.size() ||
+                !std::all_of(output.begin(), output.end(), [](float value) { return std::isfinite(value); }))
+                throw std::runtime_error("remote block returned invalid complete residual");
+            ggml_backend_tensor_set(p_h, output.data(), 0, ggml_nbytes(p_h));
+            il = remote_last - 1;
+            if (il + 1 < N) do_segA(il + 1);
+            continue;
+        }
         const int anxt = (il + 1 < N) ? dev_of(il + 1) : -1;    // next attention device
         if (!hp.is_moe_layer(il)) {
             // Dense block: seg A finished it, so there is no seg B to fuse the
@@ -5340,7 +5962,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         const int p    = pdev_of(il);                          // seg B runs at the pool
         // Keep the segB(L)+segA(L+1) fusion (one submit per layer instead of
         // two) whenever the next layer's attention runs where this seg B does.
-        const bool fuse = anxt >= 0 && anxt == p;
+        const bool capture_boundary = block_observer &&
+            (il + 1 == capture_first || il + 1 == capture_last);
+        const bool remote_boundary = block_executor && il + 1 == remote_first;
+        const bool fuse = anxt >= 0 && anxt == p && !capture_boundary && !remote_boundary;
 
         use_carry(p);
         ggml_context * ctx = new_ctx();
@@ -5351,11 +5976,12 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
         set_attn_inputs(gf);
         compute(gf, p, "fused segB/segA compute failed");
         dump_flush("segBA");
+        capture_end(il);
         if (fuse && nsel) {
             const int p1 = pdev_of(il + 1);
             hop_carry_ab(p, p1, il + 1);
             use_carry(p1);
-            ensure_layer(nsel, il + 1);
+            ensure_layer(nsel, il + 1, gf);
         } else if (fuse) {
             use_carry(dev_of(il + 1));   // fused seg A was a dense block
         }
@@ -5370,6 +5996,13 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
     // the final norm and output head are model-global, so they live on the primary
     hop_carry(h_dev(N - 1), 0);
     use_carry(0);
+
+    if (block_worker()) {
+        block_frame.output.resize(ggml_nelements(p_h));
+        ggml_backend_tensor_get(p_h, block_frame.output.data(), 0, ggml_nbytes(p_h));
+        n_past += 1; mrope_next += 1;
+        return block_frame.output;
+    }
 
     // ---- final norm + output projection ----
     std::vector<float> out;
@@ -5421,6 +6054,10 @@ const std::vector<float> & Runtime::Impl::decode_cached(int32_t token, const flo
 void Runtime::Impl::init_state_backup() {
     const auto & hp = model.hparams();
     if (!hp.has_recurrent() || bak_buf) return;
+    // An owned attention-only block has no recurrent tensors even when the
+    // complete model does. Do not allocate an empty ggml backup context.
+    if (std::none_of(conv_state.begin(), conv_state.end(),
+            [](ggml_tensor * tensor) { return tensor != nullptr; })) return;
     ggml_init_params bp{};
     bp.mem_size = ggml_tensor_overhead() * hp.n_layer * 2 + 256;
     bp.no_alloc = true;
@@ -5460,7 +6097,7 @@ void Runtime::Impl::restore_states() {
 // (T-1 snapshots: state after verify token t, t = 0..T-2).
 void Runtime::Impl::init_ckpts(int T) {
     const auto & hp = model.hparams();
-    if (!hp.has_recurrent() || ckpt_T >= T) return;
+    if (T <= 1 || !hp.has_recurrent() || ckpt_T >= T) return;
     if (ckpt_buf) { ggml_backend_buffer_free(ckpt_buf); ckpt_buf = nullptr; }
     if (ckpt_ctx) { ggml_free(ckpt_ctx); ckpt_ctx = nullptr; }
     const int n_layer = (int) hp.n_layer;
@@ -5495,11 +6132,14 @@ void Runtime::Impl::restore_ckpt(int t) {
 // ---- prompt-position checkpoints (prefix-cache rewind) ----
 // A history edit (e.g. a client dropping the previous turn's reasoning) makes
 // the new prompt diverge mid-way through the cached tokens. The attention KV
-// prefix stays valid in place, but GDN states cannot be truncated — they are
+// prefix stays valid in place, but GDN states cannot be truncated â€” they are
 // restored from the newest host snapshot at or before the divergence point,
 // and only the tail after it is re-prefilled.
 static size_t pk_max() {
     static const size_t v = []{
+        if (const char * limit = getenv("QWEN_PROMPT_CHECKPOINT_LIMIT"))
+            return parse_prompt_checkpoint_limit(limit);
+        // Preserve the existing legacy override when the new flag is absent.
         const char * c = getenv("QWEN_PROMPT_CKPTS");
         return (size_t) (c ? atoi(c) : 8);
     }();
@@ -5508,37 +6148,40 @@ static size_t pk_max() {
 
 void Runtime::Impl::pk_snapshot() {
     const auto & hp = model.hparams();
-    if (!hp.has_recurrent() || pk_max() == 0) return;   // attention-only: truncation is free
-    if (n_past <= 0) return;
-    if (!pk.empty() && pk.back().pos == n_past) return;
+    const size_t limit = pk_max();
+    if (!should_save_prompt_checkpoint(prompt_stateful(), limit, n_past,
+            pk.empty() ? -1 : pk.back().pos)) return;
     PromptCkpt c;
     c.pos      = n_past;
     c.mtp_past = mtp_past;
     c.mrope    = mrope_next;
     c.hidden   = mtp_hidden;
-    size_t total = 0;
-    for (int il = 0; il < (int) hp.n_layer; ++il)
-        if (conv_state[il]) total += ggml_nbytes(conv_state[il]) + (ssm_state[il] ? ggml_nbytes(ssm_state[il]) : 0);
+    const auto tensors = prompt_state_tensors();
+    c.ngram_count = ngram_hist.size();
+    size_t total = c.ngram_count * sizeof(int32_t);
+    for (auto * tensor : tensors) total += ggml_nbytes(tensor);
     c.blob.resize(total);
-    size_t off = 0;
-    for (int il = 0; il < (int) hp.n_layer; ++il) {
-        if (!conv_state[il]) continue;
-        ggml_backend_tensor_get(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
-        off += ggml_nbytes(conv_state[il]);
-        if (!ssm_state[il]) continue;
-        ggml_backend_tensor_get(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
-        off += ggml_nbytes(ssm_state[il]);
+    size_t offset = 0;
+    for (auto * tensor : tensors) {
+        const size_t bytes = ggml_nbytes(tensor);
+        ggml_backend_tensor_get(tensor, c.blob.data() + offset, 0, bytes);
+        offset += bytes;
     }
+    if (c.ngram_count)
+        std::memcpy(c.blob.data() + offset, ngram_hist.data(), c.ngram_count * sizeof(int32_t));
     auto it = std::lower_bound(pk.begin(), pk.end(), c.pos,
                                [](const PromptCkpt & a, int p) { return a.pos < p; });
     if (it != pk.end() && it->pos == c.pos) *it = std::move(c);
     else pk.insert(it, std::move(c));
-    // evict the checkpoint whose removal leaves the smallest gap to its
-    // predecessor (never the newest) — keeps positions spread over the prefix
-    while (pk.size() > pk_max()) {
+    // Keep both the generation boundary and the final prompt checkpoint.
+    // Their positions can differ by only a few template tokens; evicting the
+    // former makes an ordinary history append rewind a large earlier chunk.
+    // A one-checkpoint configuration still retains only the newest snapshot.
+    const size_t keep_recent = std::min<size_t>(2, limit);
+    while (pk.size() > limit) {
         size_t worst = 0;
         int wgap = pk[0].pos;
-        for (size_t i = 1; i + 1 < pk.size(); ++i) {
+        for (size_t i = 1; i + keep_recent < pk.size(); ++i) {
             const int gap = pk[i].pos - pk[i-1].pos;
             if (gap < wgap) { wgap = gap; worst = i; }
         }
@@ -5549,7 +6192,7 @@ void Runtime::Impl::pk_snapshot() {
 int Runtime::Impl::pk_best(int n) const {
     if (n <= 0) return -1;
     const auto & hp = model.hparams();
-    if (!hp.has_recurrent())   // attention-only: any position works (text-only lineage)
+    if (!prompt_stateful())   // stateless attention: text-only prefixes can be truncated
         return mrope_next == n_past ? std::min(n, n_past) : -1;
     int best = -1;
     for (const auto & c : pk) { if (c.pos > n) break; best = c.pos; }
@@ -5559,7 +6202,7 @@ int Runtime::Impl::pk_best(int n) const {
 int Runtime::Impl::pk_rewind(int n) {
     const auto & hp = model.hparams();
     if (n >= (int) kv_toks.size()) return (int) kv_toks.size();   // nothing to rewind
-    if (!hp.has_recurrent()) {
+    if (!prompt_stateful()) {
         if (mrope_next != n_past) return -1;   // image lineage: positions ambiguous
         n_past = n;
         mrope_next = n;
@@ -5571,15 +6214,20 @@ int Runtime::Impl::pk_rewind(int n) {
     for (int i = 0; i < (int) pk.size(); ++i) { if (pk[i].pos > n) break; bi = i; }
     if (bi < 0) return -1;
     const PromptCkpt & c = pk[bi];
-    size_t off = 0;
-    for (int il = 0; il < (int) hp.n_layer; ++il) {
-        if (!conv_state[il]) continue;
-        ggml_backend_tensor_set(conv_state[il], c.blob.data() + off, 0, ggml_nbytes(conv_state[il]));
-        off += ggml_nbytes(conv_state[il]);
-        if (!ssm_state[il]) continue;
-        ggml_backend_tensor_set(ssm_state[il], c.blob.data() + off, 0, ggml_nbytes(ssm_state[il]));
-        off += ggml_nbytes(ssm_state[il]);
+    const auto tensors = prompt_state_tensors();
+    size_t expected = c.ngram_count * sizeof(int32_t);
+    for (auto * tensor : tensors) expected += ggml_nbytes(tensor);
+    if (expected != c.blob.size())
+        throw std::runtime_error("prompt checkpoint state size mismatch");
+    size_t offset = 0;
+    for (auto * tensor : tensors) {
+        const size_t bytes = ggml_nbytes(tensor);
+        ggml_backend_tensor_set(tensor, c.blob.data() + offset, 0, bytes);
+        offset += bytes;
     }
+    ngram_hist.resize(c.ngram_count);
+    if (c.ngram_count)
+        std::memcpy(ngram_hist.data(), c.blob.data() + offset, c.ngram_count * sizeof(int32_t));
     n_past     = c.pos;
     mtp_past   = c.mtp_past;
     mrope_next = c.mrope;
@@ -5669,12 +6317,12 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     };
     // Refresh the router residency mask; true iff every layer is masked. A
     // layer joins the mask only once it has a decent resident palette
-    // (QWEN_RESIDENT_MIN, default 32) — until then it stays unmasked so its
+    // (QWEN_RESIDENT_MIN, default 32) â€” until then it stays unmasked so its
     // misses keep warming the cache via the fallback path. Layers with
     // concentrated routing may never reach that palette on a short prompt, so
     // after QWEN_RESIDENT_WARMUP fast-decode tokens (default 16) the floor
     // drops to n_used and whatever is resident gets frozen ("warm a few
-    // tokens, then pin" — the original design intent).
+    // tokens, then pin" â€” the original design intent).
     static const int res_min = []{ const char * c = getenv("QWEN_RESIDENT_MIN");
                                    const int v = c ? atoi(c) : 32; return v < 1 ? 32 : v; }();
     static const int warm_tok = []{ const char * c = getenv("QWEN_RESIDENT_WARMUP");
@@ -5719,7 +6367,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
 
     // Residency only changes through fetches/evictions, so the mask and remap
     // uploads are versioned by the miss+eviction count (and the warmup floor)
-    // and skipped while stale-free — steady-state resident decode uploads
+    // and skipped while stale-free â€” steady-state resident decode uploads
     // nothing but token/pos/mask.
     ++fast_warm_tokens;
     const uint64_t stamp = ec_stats_sum().misses + ec_stats_sum().evictions;
@@ -5731,7 +6379,7 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
     }
     // Resident-only routing with a complete mask cannot miss: the run is not
     // speculative, so state backup, the sel_all verify readback and the
-    // fallback are all skipped — one graph submit + one logits readback.
+    // fallback are all skipped â€” one graph submit + one logits readback.
     const bool masked = resident_decode && fast_mask_complete;
 
     if (!masked) backup_states();   // so a speculative miss can be rolled back
@@ -5873,7 +6521,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
         // union-bounded seg B slicing), so the chunk no longer needs to fit the
         // expert pools. Bigger chunks amortize each layer's expert fetch over
         // more tokens: expert traffic scales with the number of chunks, not T.
-        // 4096 tokens ≈ 100 MB of carry tensors (7 x n_embd x T floats).
+        // 4096 tokens â‰ˆ 100 MB of carry tensors (7 x n_embd x T floats).
         // Same reading as compute_headroom()'s: the headroom is reserved for
         // exactly the graph this chunk builds, so the two must agree.
         const int chunk = batch_chunk();
@@ -6090,7 +6738,45 @@ Runtime::Runtime(Model & model, const RuntimeConfig & cfg)
 }
 Runtime::~Runtime() = default;
 
+void Runtime::capture_block(int first, int last,
+        std::function<void(const BlockFrame &)> observer) {
+    if (impl_->block_worker() || first < 0 || last <= first ||
+        last > (int) impl_->model.hparams().n_main())
+        throw std::runtime_error("invalid capture block range");
+    impl_->capture_first = first; impl_->capture_last = last;
+    impl_->block_observer = std::move(observer);
+}
+
+const std::vector<float> & Runtime::block_step(const BlockFrame & frame) {
+    if (!impl_->block_worker() || frame.first != impl_->cfg.block_first ||
+        frame.last != impl_->cfg.block_last || frame.position != impl_->n_past ||
+        frame.position < 0 || frame.position >= impl_->n_ctx || frame.rope_position < 0 ||
+        frame.token < 0 || frame.token >= (int32_t) impl_->model.hparams().n_vocab)
+        throw std::runtime_error("block range/sequence/context mismatch");
+    if (impl_->cpu_miss && !impl_->cfg.block_cpu_experts)
+        throw std::runtime_error("unexpected CPU execution in GPU-only block gate");
+    impl_->mrope_next = frame.rope_position;
+    impl_->block_frame = frame;
+    const auto & result = impl_->decode_cached(frame.token);
+    impl_->kv_toks.push_back(frame.token);
+    impl_->report_compute_buffers();
+    return result;
+}
+
+void Runtime::execute_remote_block(int first, int last,
+        std::function<std::vector<float>(const BlockFrame &)> executor) {
+    if (impl_->block_worker() || impl_->multi_gpu() || impl_->cpu_miss || impl_->block_observer ||
+        !impl_->ecache || first < 0 || last <= first || last > (int) impl_->model.hparams().n_main() ||
+        !executor)
+        throw std::runtime_error("remote relay requires one local GPU, exact cache path and valid block");
+    impl_->remote_first = first; impl_->remote_last = last;
+    impl_->block_executor = std::move(executor);
+    impl_->cache_fast_enabled = false; impl_->resident_decode = false;
+}
+
 const std::vector<float> & Runtime::decode(const std::vector<int32_t> & tokens) {
+    if (impl_->block_executor && tokens.size() != 1)
+        throw std::runtime_error("initial remote relay supports only post-prefill single-token decode");
     const std::vector<float> & l = impl_->decode(tokens);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
     impl_->report_compute_buffers();
@@ -6107,6 +6793,8 @@ void Runtime::generate_mtp(const std::vector<int32_t> & prompt, int max_new, int
     impl_->generate_mtp(prompt, max_new, n_draft, on_token, out_pending, ckpt_after_prefill);
 }
 void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
+    if (impl_->block_executor)
+        throw std::runtime_error("remote relay must be established after ordinary prefill");
     impl_->prefill(tokens, mtp_kv);
     impl_->kv_toks.insert(impl_->kv_toks.end(), tokens.begin(), tokens.end());
     impl_->report_compute_buffers();   // the batched prefill graph is the biggest one
@@ -6114,7 +6802,9 @@ void Runtime::prefill(const std::vector<int32_t> & tokens, bool mtp_kv) {
 void Runtime::snapshot_ckpt()          { impl_->pk_snapshot(); }
 int  Runtime::best_ckpt(int n) const   { return impl_->pk_best(n); }
 int  Runtime::rewind_to(int n)         { return impl_->pk_rewind(n); }
-void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
+#include "grouped_experts_methods.cpp.inc"
+
+void Runtime::reset()        { impl_->grouped_expert_executor = {}; impl_->grouped_expert_count = 0; impl_->grouped_expert_layers.clear(); impl_->block_executor = {}; impl_->remote_first = -1; impl_->remote_last = -1; impl_->n_past = 0; impl_->mtp_past = 0; impl_->mrope_next = 0; impl_->kv_toks.clear(); impl_->pk.clear(); impl_->zero_states(); }
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
@@ -6126,6 +6816,51 @@ Runtime::CacheStats Runtime::cache_stats() const {
     }
     return c;
 }
+void Runtime::save_expert_profile(const std::string & prefix) const {
+    // Explicit existing profile boundary; no trace file I/O during generation.
+    if (impl_->demand_trace && !impl_->demand_trace->save(prefix + ".demands.bin"))
+        fprintf(stderr, "Demand trace export failed or was requested during an active forward\n");
+    if (FILE * execution = fopen((prefix + ".execution.json").c_str(), "wb")) {
+        fprintf(execution, "{\"cpu_experts\":%llu,\"gpu_experts\":%llu,\"cpu_ms\":%.3f,"
+            "\"gpu_wait_ms\":%.3f,\"segment_a_ms\":%.3f,\"split_ms\":%.3f,\"segment_b_ms\":%.3f,\"correction_ms\":%.3f,\"cpu_prepare_ms\":%.3f,\"cpu_graph_ms\":%.3f,\"cpu_borrow_checks\":%llu,\"cpu_submit_ms\":%.3f,\"cpu_join_ms\":%.3f,\"hss_decisions\":%llu,\"hss_cpu_estimate_ms\":%.6f,\"bounded_cpu_enabled\":%s,\"qsa_constant_cache_enabled\":%s,\"qsa_constant_upload_calls\":%llu,\"qsa_constant_upload_skips\":%llu",
+            (unsigned long long) impl_->cm_cpu, (unsigned long long) impl_->cm_gpu,
+            impl_->cm_cpu_ms, impl_->cm_wait_ms, impl_->cm_a_ms, impl_->cm_split_ms, impl_->cm_b_ms, impl_->cm_add_ms,
+            impl_->cpu_prepare_ms, impl_->cpu_graph_ms, (unsigned long long) impl_->cpu_borrow_checks,
+            impl_->cpu_submit_ms, impl_->cpu_join_ms, (unsigned long long) impl_->hss_decisions, impl_->hss_cpu_ms,
+            impl_->bounded_cpu_miss && impl_->cpu_miss ? "true" : "false",
+            impl_->qsa_constant_cache_enabled ? "true" : "false",
+            (unsigned long long) impl_->qsa_constant_upload_calls,
+            (unsigned long long) impl_->qsa_constant_upload_skips);
+        fprintf(execution, ",\"qsa_identity_key_view_enabled\":%s,\"qsa_identity_key_view_graphs\":%llu",
+            impl_->qsa_identity_key_view_enabled ? "true" : "false",
+            (unsigned long long) impl_->qsa_identity_key_view_graphs);
+        fprintf(execution, ",\"qsa_pool4_exact_enabled\":%s,\"qsa_pool4_exact_graphs\":%llu",
+            impl_->qsa_pool4_exact_enabled ? "true" : "false",
+            (unsigned long long) impl_->qsa_pool4_exact_graphs);
+        const auto checkpoints = prompt_checkpoint_memory(impl_->pk);
+        size_t owner_pinned_requested = 0, owner_pageable_capacity = 0;
+        for (auto * cache : impl_->all_ecaches()) {
+            const auto staging = cache->owner_staging_capacity();
+            owner_pinned_requested += staging.pinned_requested_bytes;
+            owner_pageable_capacity += staging.pageable_vector_capacity_bytes;
+        }
+        fprintf(execution, ",\"prompt_checkpoint_limit\":%llu,\"prompt_checkpoint_count\":%llu,"
+            "\"prompt_checkpoint_payload_bytes\":%llu,\"prompt_checkpoint_vector_capacity_bytes\":%llu,"
+            "\"expert_owner_staging_pinned_requested_bytes\":%llu,\"expert_owner_staging_pageable_vector_capacity_bytes\":%llu,"
+            "\"staging_worker_private_buffers_included\":false,\"staging_os_memory_included\":false}\n",
+            (unsigned long long) pk_max(), (unsigned long long) checkpoints.count,
+            (unsigned long long) checkpoints.payload_bytes, (unsigned long long) checkpoints.vector_capacity_bytes,
+            (unsigned long long) owner_pinned_requested, (unsigned long long) owner_pageable_capacity);
+        fclose(execution);
+    }
+    for (size_t d = 0; d < impl_->ecaches.size(); ++d) {
+        if (impl_->ecaches[d]) {
+            impl_->ecaches[d]->save_profile(prefix + ".gpu" + std::to_string(d) + ".prof");
+            impl_->ecaches[d]->save_tier_stats(prefix + ".gpu" + std::to_string(d) + ".tiers.json");
+        }
+    }
+}
+
 void Runtime::set_progress_cb(std::function<void(int, int)> cb) { impl_->progress_cb = std::move(cb); }
 
 // ---- prompt-cache slot state save/load ----
@@ -6141,6 +6876,60 @@ struct StateHeader {
 // Bumped to QSS3 when the KV cache became F16: the per-row byte count halved,
 // so a QSS2 slot file on disk would pass the header check and then be misread.
 constexpr uint32_t STATE_MAGIC = 0x33535351;   // "QSS3" little-endian
+}
+
+// Probe-only raw FP16 cache inspection. Never used by normal inference.
+Runtime::ProbeKvWindow Runtime::probe_kv_window(int layer, const std::string & role,
+        uint64_t offset_bytes, uint64_t bytes) const {
+    if (layer < 0 || layer >= (int) impl_->model.hparams().n_layer ||
+        (role != "K" && role != "V") || bytes == 0 || bytes > 4096 ||
+        (offset_bytes & 1) || (bytes & 1))
+        throw std::runtime_error("KV window requires a valid layer/K-or-V and 2..4096 aligned bytes");
+    ggml_tensor * tensor = role == "K" ? impl_->k_cache[layer] : impl_->v_cache[layer];
+    if (!tensor || tensor->type != GGML_TYPE_F16 || !ggml_is_contiguous(tensor) ||
+        tensor->nb[0] != sizeof(uint16_t))
+        throw std::runtime_error("KV window requires a contiguous FP16 attention cache");
+    const int rows = layer >= (int) impl_->model.hparams().n_main()
+        ? impl_->mtp_past : impl_->n_past;
+    if (rows < 0 || rows > tensor->ne[1])
+        throw std::runtime_error("KV window has invalid saved-prefix rows");
+    const uint64_t prefix_bytes = static_cast<uint64_t>(rows) * tensor->nb[1];
+    if (offset_bytes > prefix_bytes || bytes > prefix_bytes - offset_bytes ||
+        offset_bytes > ggml_nbytes(tensor) || bytes > ggml_nbytes(tensor) - offset_bytes)
+        throw std::runtime_error("KV window exceeds the initialized saved prefix");
+    ProbeKvWindow result;
+    result.layer = layer; result.role = role; result.position = impl_->n_past;
+    result.saved_rows = rows; result.offset_bytes = offset_bytes;
+    result.prefix_bytes = prefix_bytes; result.tensor_bytes = ggml_nbytes(tensor);
+    result.tensor_name = ggml_get_name(tensor);
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+        result.shape.push_back(tensor->ne[dimension]);
+        result.strides_bytes.push_back(tensor->nb[dimension]);
+    }
+    // Buffer get uses cudaStreamPerThread, whereas computation may use another
+    // nonblocking stream. Explicitly fence every owned backend before the read.
+    std::vector<ggml_backend_t> backends;
+    auto add_backend = [&](ggml_backend_t backend) {
+        if (backend && std::find(backends.begin(), backends.end(), backend) == backends.end())
+            backends.push_back(backend);
+    };
+    add_backend(impl_->backend);
+    for (auto * backend : impl_->gpus) add_backend(backend);
+    add_backend(impl_->cpu_backend); add_backend(impl_->backend_mtp);
+    auto synchronize = [&] {
+        if (impl_->sched) ggml_backend_sched_synchronize(impl_->sched);
+        if (impl_->f_sched && impl_->f_sched != impl_->sched)
+            ggml_backend_sched_synchronize(impl_->f_sched);
+        for (auto * backend : backends) ggml_backend_synchronize(backend);
+    };
+    synchronize();
+    result.words.resize(static_cast<size_t>(bytes / sizeof(uint16_t)));
+    ggml_backend_tensor_get(tensor, result.words.data(), static_cast<size_t>(offset_bytes),
+                            static_cast<size_t>(bytes));
+    synchronize();
+    result.backends_synchronized = backends.size();
+    result.all_owned_backends_synchronized = true;
+    return result;
 }
 
 size_t Runtime::state_bytes() const {
@@ -6162,7 +6951,7 @@ size_t Runtime::state_bytes() const {
 void Runtime::save_state(const std::function<void(const void *, size_t)> & sink) const {
     const auto & hp = impl_->model.hparams();
     StateHeader h{};
-    h.magic      = STATE_MAGIC;
+    h.magic      = impl_->cfg.kv_cache_type == "q8_0" ? 0x34535351 : STATE_MAGIC; // QSS4 separates Q8 slot bytes
     h.n_layer    = (int32_t) hp.n_layer;
     h.n_ctx      = impl_->n_ctx;
     h.n_embd_gqa = (int32_t) (hp.n_head_kv * hp.n_embd_head);
@@ -6198,7 +6987,8 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     const auto & hp = impl_->model.hparams();
     StateHeader h{};
     src(&h, sizeof(h));
-    if (h.magic != STATE_MAGIC ||
+    const uint32_t expected_magic = impl_->cfg.kv_cache_type == "q8_0" ? 0x34535351 : STATE_MAGIC;
+    if (h.magic != expected_magic ||
         h.n_layer != (int32_t) hp.n_layer || h.n_ctx != impl_->n_ctx ||
         h.n_embd_gqa != (int32_t) (hp.n_head_kv * hp.n_embd_head) ||
         h.n_past < 0 || h.n_past > impl_->n_ctx || h.mtp_past < 0 ||
@@ -6234,6 +7024,88 @@ void Runtime::load_state(const std::function<void(void *, size_t)> & src) {
     impl_->mtp_hidden = std::move(hidden);
     impl_->pk.clear();   // checkpoints belong to the replaced lineage
 }
+
+// Versioned experimental owned-layer state. Unlike the older full-state stream,
+// this explicitly includes PLE convolution and QSA index state. Tensor payloads
+// are copied only once at setup, outside block-step timing.
+namespace {
+struct BlockStateHeader {
+    uint32_t magic = 0x31534251; // QBS1, Windows x86 little-endian experiment
+    uint32_t version = 1;
+    int32_t first = 0, last = 0, context = 0, layers = 0;
+    int32_t embedding = 0, hyperstreams = 0, experts = 0, used_experts = 0;
+    int32_t position = 0, rope_position = 0, history_count = 0, ngram_count = 0;
+};
+}
+
+void Runtime::save_block_state(int first, int last,
+        const std::function<void(const void *, size_t)> & sink) const {
+    const auto & hp = impl_->model.hparams();
+    if (first < 0 || last <= first || last > (int) hp.n_main() ||
+        impl_->kv_toks.size() != (size_t) impl_->n_past ||
+        (impl_->block_worker() && (first != impl_->cfg.block_first || last != impl_->cfg.block_last)))
+        throw std::runtime_error("invalid block state range or token lineage");
+    BlockStateHeader header;
+    header.first = first; header.last = last; header.context = impl_->n_ctx;
+    header.layers = hp.n_layer; header.embedding = hp.n_embd; header.hyperstreams = hp.hc_count;
+    header.experts = hp.n_expert; header.used_experts = hp.n_expert_used;
+    header.position = impl_->n_past; header.rope_position = impl_->mrope_next;
+    header.history_count = (int32_t) impl_->kv_toks.size();
+    header.ngram_count = (int32_t) impl_->ngram_hist.size();
+    sink(&header, sizeof(header));
+    if (header.history_count) sink(impl_->kv_toks.data(), (size_t) header.history_count * sizeof(int32_t));
+    if (header.ngram_count) sink(impl_->ngram_hist.data(), (size_t) header.ngram_count * sizeof(int32_t));
+    std::vector<uint8_t> buffer;
+    for (const auto & record : impl_->block_state_tensors(first, last, header.position)) {
+        const uint64_t bytes = record.second;
+        const int32_t type = record.first ? (int32_t) record.first->type : -1;
+        sink(&bytes, sizeof(bytes)); sink(&type, sizeof(type));
+        if (!bytes) continue;
+        buffer.resize((size_t) bytes);
+        ggml_backend_tensor_get(record.first, buffer.data(), 0, buffer.size());
+        sink(buffer.data(), buffer.size());
+    }
+}
+
+void Runtime::load_block_state(const std::function<void(void *, size_t)> & source) {
+    const auto & hp = impl_->model.hparams();
+    BlockStateHeader header;
+    source(&header, sizeof(header));
+    if (!impl_->block_worker() || header.magic != 0x31534251 || header.version != 1 ||
+        header.first != impl_->cfg.block_first || header.last != impl_->cfg.block_last ||
+        header.context != impl_->n_ctx || header.layers != (int32_t) hp.n_layer ||
+        header.embedding != (int32_t) hp.n_embd || header.hyperstreams != (int32_t) hp.hc_count ||
+        header.experts != (int32_t) hp.n_expert || header.used_experts != (int32_t) hp.n_expert_used ||
+        header.position < 0 || header.position >= impl_->n_ctx ||
+        header.rope_position < 0 || header.history_count != header.position ||
+        header.ngram_count < 0 || header.ngram_count > header.position + 16)
+        throw std::runtime_error("block state header/model/context mismatch");
+    std::vector<int32_t> tokens((size_t) header.history_count);
+    std::vector<int32_t> ngram((size_t) header.ngram_count);
+    if (!tokens.empty()) source(tokens.data(), tokens.size() * sizeof(int32_t));
+    if (!ngram.empty()) source(ngram.data(), ngram.size() * sizeof(int32_t));
+    // A failed/truncated load invalidates the session; the operator must reset
+    // and reload. The HTTP endpoint reports that requirement explicitly.
+    reset();
+    std::vector<uint8_t> buffer;
+    for (const auto & record : impl_->block_state_tensors(header.first, header.last, header.position)) {
+        uint64_t bytes = 0; int32_t type = -1;
+        source(&bytes, sizeof(bytes)); source(&type, sizeof(type));
+        const int32_t expected_type = record.first ? (int32_t) record.first->type : -1;
+        if (bytes != record.second || type != expected_type)
+            throw std::runtime_error("block state tensor length/type mismatch");
+        if (!bytes) continue;
+        buffer.resize((size_t) bytes);
+        source(buffer.data(), buffer.size());
+        ggml_backend_tensor_set(record.first, buffer.data(), 0, buffer.size());
+    }
+    impl_->n_past = header.position; impl_->mrope_next = header.rope_position;
+    impl_->kv_toks = std::move(tokens); impl_->ngram_hist = std::move(ngram);
+    impl_->pk.clear();
+}
+
+#include "speculation_runtime.inc"
+#include "qsa_capture_runtime.inc"
 
 size_t parse_vram_budget_mb(const std::string & arg, bool * legacy_mb) {
     if (legacy_mb) *legacy_mb = false;

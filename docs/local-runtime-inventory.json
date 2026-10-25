@@ -1,0 +1,1005 @@
+{
+  "source": "C:\\workspace\\questwend-rpc-test",
+  "base_commit": "86fc9da74a0d9d0ed4e70f57f0fada685a366ad7",
+  "files": [
+    {
+      "path": "CMakeLists.txt",
+      "new_file": false,
+      "bytes": 15935,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "4a0f8f31d8153977848caddbef220bc8a8fe5b49389183ffd9e82bb81f0cfa68",
+      "sha256": "4a0f8f31d8153977848caddbef220bc8a8fe5b49389183ffd9e82bb81f0cfa68",
+      "normalized_lf_sha256": "a79475d985d31b100bac0e527dba7d3414cec1b26ea25831dd6a678d82d45093"
+    },
+    {
+      "path": "core/activation_policy.h",
+      "new_file": true,
+      "bytes": 6139,
+      "category": "local-with-experimental-policy",
+      "reason": "Activation tracing is enabled in the saved profile; the MoE-Infinity-derived scheduling policy is a separate experiment.",
+      "original_worktree_sha256": "0221e72955f35dcbcb8dccfd64347926b2035a7be2712f1a16523af1bb141876",
+      "sha256": "de83c6bff87d7dca252647e79f7576c469d949855efab9c4da124fd4b89e46fa",
+      "normalized_lf_sha256": "0221e72955f35dcbcb8dccfd64347926b2035a7be2712f1a16523af1bb141876"
+    },
+    {
+      "path": "core/args.cpp",
+      "new_file": false,
+      "bytes": 14409,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "bf3180d49ac92e59f2ef30255bedfbe9dd1dc1941938cc863db0751c88b9a652",
+      "sha256": "9e05d1882d8e0c2ff00e44286bf0dc64612deb0ecb566479c3ad7a57d326cabd",
+      "normalized_lf_sha256": "bf3180d49ac92e59f2ef30255bedfbe9dd1dc1941938cc863db0751c88b9a652"
+    },
+    {
+      "path": "core/args.h",
+      "new_file": false,
+      "bytes": 4331,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "567baa3000c0a84b93e1ca163aca151176a214400052071ebc110bfe006c61bc",
+      "sha256": "78e521c559064d1e6686becde72c870a5eb0ad352b844f89ae2b3e1e796a066c",
+      "normalized_lf_sha256": "567baa3000c0a84b93e1ca163aca151176a214400052071ebc110bfe006c61bc"
+    },
+    {
+      "path": "core/backend_loader.h",
+      "new_file": true,
+      "bytes": 1603,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "2d973556d0e33fd5039d124a51886f57ae5da28cc6931f41c978560b1c38885b",
+      "sha256": "0181e05e82e358de51378a3bc2d850deec5880cd2e4a6688c60cb61263db95dc",
+      "normalized_lf_sha256": "2d973556d0e33fd5039d124a51886f57ae5da28cc6931f41c978560b1c38885b"
+    },
+    {
+      "path": "core/cache_memory_budget.h",
+      "new_file": true,
+      "bytes": 1615,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "3c246124e94c3960204eb126e397ad30ed324bb242763e282fb34b6649fe52af",
+      "sha256": "3c246124e94c3960204eb126e397ad30ed324bb242763e282fb34b6649fe52af",
+      "normalized_lf_sha256": "243f67251360d630be45bd13606b6cf46281e7191dc5c293419f64c684c4df83"
+    },
+    {
+      "path": "core/chat.cpp",
+      "new_file": false,
+      "bytes": 19519,
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper.",
+      "original_worktree_sha256": "9bb61df118d24237d590f17bc0e9d3548f85784a73e2b0ace5c596fb74a5f620",
+      "sha256": "9bb61df118d24237d590f17bc0e9d3548f85784a73e2b0ace5c596fb74a5f620",
+      "normalized_lf_sha256": "3d19140edee61e331ca93389944fa3f3f3c358846e414d73bfa825b50d1e7cae"
+    },
+    {
+      "path": "core/chat.h",
+      "new_file": false,
+      "bytes": 4614,
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper.",
+      "original_worktree_sha256": "f179950f59be4fa3a7e1957227d5a541cc0d558524c01376314d01d8247ca894",
+      "sha256": "f179950f59be4fa3a7e1957227d5a541cc0d558524c01376314d01d8247ca894",
+      "normalized_lf_sha256": "f65f2e94d5b3c2fff630ce4c2ca2ed4c49832aed91b15eb7cec018e12235050c"
+    },
+    {
+      "path": "core/expert_admission.h",
+      "new_file": true,
+      "bytes": 1881,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "46755534fd9c3cb6d4ab6824a773dbde0e53dfd034d2afd79b8a9f5cac6a6b97",
+      "sha256": "ec4cab6c499d155e252a70d3da8a8630e04df3f4d5b86509139afff81d7f192c",
+      "normalized_lf_sha256": "5cac8675bf7b3fc99a5eb7d6be2758cb13e14c6f369827587d837bfc2203543a"
+    },
+    {
+      "path": "core/expert_cache.cpp",
+      "new_file": false,
+      "bytes": 96545,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "5e488a5682f139308efb7707b5e67a9e996b0afb6ecda341306331029db00f8d",
+      "sha256": "5e488a5682f139308efb7707b5e67a9e996b0afb6ecda341306331029db00f8d",
+      "normalized_lf_sha256": "14b6b6cd9feec64387d0787a1ae2ca4a5bef208203cd3cfe673d45fd8e06b35f"
+    },
+    {
+      "path": "core/expert_cache.h",
+      "new_file": false,
+      "bytes": 18539,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "8cacedc831880a359339bfd2e44154a4d9daa70adebb9a42b34f48cfdb8cfabb",
+      "sha256": "8cacedc831880a359339bfd2e44154a4d9daa70adebb9a42b34f48cfdb8cfabb",
+      "normalized_lf_sha256": "bd12df7c219366520049792fedb02c72609d266ad249baba35b1b3ae0e7ed485"
+    },
+    {
+      "path": "core/expert_demand_trace.h",
+      "new_file": true,
+      "bytes": 9139,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "806fe0fd0943093555204038158924fab6cbc6ca4609e8825a3145a50a783a9c",
+      "sha256": "806fe0fd0943093555204038158924fab6cbc6ca4609e8825a3145a50a783a9c",
+      "normalized_lf_sha256": "a6e1e9002f4ee21886061bb1424c5d73b0c57b6674cedc6832dc96a0a67415d3"
+    },
+    {
+      "path": "core/expert_install_check.h",
+      "new_file": true,
+      "bytes": 994,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "a5d2a01c8e6508c54b0a1b802e5e47da071cf0f4a1ac1737dd33018501985073",
+      "sha256": "a5d2a01c8e6508c54b0a1b802e5e47da071cf0f4a1ac1737dd33018501985073",
+      "normalized_lf_sha256": "d07021a67d05bf3775c54e6b031ad94751610b7214148d9ba438130c14289931"
+    },
+    {
+      "path": "core/expert_io_workers.h",
+      "new_file": true,
+      "bytes": 9950,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "ae118aff363bdc2da638e769a17461a3f46f183fd5bcd3f6affbf62a7270208c",
+      "sha256": "ae118aff363bdc2da638e769a17461a3f46f183fd5bcd3f6affbf62a7270208c",
+      "normalized_lf_sha256": "eca394cb2d6de44faaa8c2e9f76cc7c5585ed00a4ea34b31b514a75273eea82b"
+    },
+    {
+      "path": "core/expert_readiness.h",
+      "new_file": true,
+      "bytes": 1407,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "7c902d7eefd4734fbab8bd30f68e16484be93331b89de4e2303ae7454cdfec81",
+      "sha256": "7c902d7eefd4734fbab8bd30f68e16484be93331b89de4e2303ae7454cdfec81",
+      "normalized_lf_sha256": "a5ce2ea4b7943bc4d9528cf18e85f6506d3e90c124fcb0b4ead9746c0291709c"
+    },
+    {
+      "path": "core/expert_ssd_read_phase.h",
+      "new_file": true,
+      "bytes": 3588,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "4bdb3d17b070602c3247b270db8228c5e8d3e4dd374040404cec21d474c38591",
+      "sha256": "4bdb3d17b070602c3247b270db8228c5e8d3e4dd374040404cec21d474c38591",
+      "normalized_lf_sha256": "5f6ff7ea2245a31fc0bb7171e9cfdba701e79246d8e59f2af91012597680e17c"
+    },
+    {
+      "path": "core/expert_ssd_windows.h",
+      "new_file": true,
+      "bytes": 4225,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "445d13b07bef6b6d5894be72a98b3498d6ec45daca49974f476434aac70c9d15",
+      "sha256": "445d13b07bef6b6d5894be72a98b3498d6ec45daca49974f476434aac70c9d15",
+      "normalized_lf_sha256": "e6f2f2a4c0baf6f0179bbe8548e66c2860c3e3cf2cdbee135f1d5a79385076fe"
+    },
+    {
+      "path": "core/expert_weight_audit.h",
+      "new_file": true,
+      "bytes": 6284,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "615c809ae9929932c831766e3a78adbea21775a16b0debbd57dcb4cef64eb333",
+      "sha256": "615c809ae9929932c831766e3a78adbea21775a16b0debbd57dcb4cef64eb333",
+      "normalized_lf_sha256": "d8d8ac5a43227e1e87ce63907787d22a37982a5d01765b4e7ddff6de9de04918"
+    },
+    {
+      "path": "core/gpu_lru_index.h",
+      "new_file": true,
+      "bytes": 9088,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "7974306bb3e893cef640d5f7ca5444fa5b98583700c048a7428e02ca2d2dba70",
+      "sha256": "7974306bb3e893cef640d5f7ca5444fa5b98583700c048a7428e02ca2d2dba70",
+      "normalized_lf_sha256": "db1618f8c4559ad35ff68110784b58634fecfcc5066a8c51c36ef0fb39634c91"
+    },
+    {
+      "path": "core/gpu_lru_pool_hooks.h",
+      "new_file": true,
+      "bytes": 3781,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "7ca79e14899272fac90784b595f0af78bb968cbbd8c1724e70214fd0fb5f1ee3",
+      "sha256": "7ca79e14899272fac90784b595f0af78bb968cbbd8c1724e70214fd0fb5f1ee3",
+      "normalized_lf_sha256": "542af2885f8d5c04198afd107fc98575f5a8cc6820e41df85c448dce85c4ac45"
+    },
+    {
+      "path": "core/grouped_experts_api.h.inc",
+      "new_file": true,
+      "bytes": 1094,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "2cfbac0845677a32eb084c4475fb1f1207184939a3387f84ffe60a291ea56def",
+      "sha256": "808012dc405de10d475af20bb3b702fd3572bb6dbbba4b20263844a28255e88e",
+      "normalized_lf_sha256": "2cfbac0845677a32eb084c4475fb1f1207184939a3387f84ffe60a291ea56def"
+    },
+    {
+      "path": "core/grouped_experts_fields.h.inc",
+      "new_file": true,
+      "bytes": 284,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "d7ccc09a582b0c347ecd277f0af54d37699af9e234fe547fb0168915fb511aad",
+      "sha256": "bbe309b0f3342c257f9868ec87cbb9c562d42119496b8e6a3165ab2bdf31bb10",
+      "normalized_lf_sha256": "d7ccc09a582b0c347ecd277f0af54d37699af9e234fe547fb0168915fb511aad"
+    },
+    {
+      "path": "core/grouped_experts_methods.cpp.inc",
+      "new_file": true,
+      "bytes": 3100,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "5c37771884516cb94fa03a254750a9b97ae96a41d450e2b8ec8cce069093a53a",
+      "sha256": "bd4eafcc36c42e8c5d701e48010a0fe69534fe34122cb28a6bce46e47ce5593c",
+      "normalized_lf_sha256": "5c37771884516cb94fa03a254750a9b97ae96a41d450e2b8ec8cce069093a53a"
+    },
+    {
+      "path": "core/grouped_experts_partition.h.inc",
+      "new_file": true,
+      "bytes": 1650,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "655d531d74e1847a173fa8b43a6af4dd9e16484f6aa2d0cd0cd1aa01120be372",
+      "sha256": "969890dcbb2e210981486ff235a840c347e96f9e829b8c90695b79447306b07b",
+      "normalized_lf_sha256": "655d531d74e1847a173fa8b43a6af4dd9e16484f6aa2d0cd0cd1aa01120be372"
+    },
+    {
+      "path": "core/grouped_experts_submit.h.inc",
+      "new_file": true,
+      "bytes": 1804,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "8628fb68c0a0c5019fb4fad2b7e607de4986e481a3b3159e0640184e83576793",
+      "sha256": "7a147a5fbb78584482a8ef0de43b837dacf5f7311d45643ce1637280f4cefc23",
+      "normalized_lf_sha256": "8628fb68c0a0c5019fb4fad2b7e607de4986e481a3b3159e0640184e83576793"
+    },
+    {
+      "path": "core/host_expert_cache.h",
+      "new_file": true,
+      "bytes": 22157,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "b39c515af74c9d58f1fdfd5ed7d6760aac3ee8a9cac95ee6d519fee878b025bb",
+      "sha256": "b39c515af74c9d58f1fdfd5ed7d6760aac3ee8a9cac95ee6d519fee878b025bb",
+      "normalized_lf_sha256": "8298721d2a6a6623850e064fee88d3905aee8dbf708f1f460ff61340a65ea446"
+    },
+    {
+      "path": "core/hybrid_schedule.h",
+      "new_file": true,
+      "bytes": 3866,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "d132e53270856fd3de4d579b0ebaa070164aad11f2361919d9003c84a7c751f7",
+      "sha256": "e842a1c3a93f5b33be4274d9352dd3725bb167ff285f26c894d08e19a60e1cbe",
+      "normalized_lf_sha256": "d132e53270856fd3de4d579b0ebaa070164aad11f2361919d9003c84a7c751f7"
+    },
+    {
+      "path": "core/model.cpp",
+      "new_file": false,
+      "bytes": 46273,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "99e3f0a96157005cb43ecab2dbb3752b5b8c3debd12d773fd68352b36b763f20",
+      "sha256": "99e3f0a96157005cb43ecab2dbb3752b5b8c3debd12d773fd68352b36b763f20",
+      "normalized_lf_sha256": "5997ade13126f22e46d2c48a840545108d1236a32450216ddc8d5e2f7bac49e7"
+    },
+    {
+      "path": "core/model.h",
+      "new_file": false,
+      "bytes": 18786,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "169e0bf44456fe7f07635190e01522945dfcda534e7e18e4aa4b303f0c1f234c",
+      "sha256": "169e0bf44456fe7f07635190e01522945dfcda534e7e18e4aa4b303f0c1f234c",
+      "normalized_lf_sha256": "59ae75ef74b0ddf425b73d6da0d4ccac741e427b81e75348684303dc4dd42cde"
+    },
+    {
+      "path": "core/prefill_cache_policy.h",
+      "new_file": true,
+      "bytes": 711,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "91f317622e32783624cf65affe39494ffb888995df8c03876340a698e0a41bc2",
+      "sha256": "91f317622e32783624cf65affe39494ffb888995df8c03876340a698e0a41bc2",
+      "normalized_lf_sha256": "9175bab99e0e94a627b0eaff30254b2c57080faf6d7d37697684d23a950feaa6"
+    },
+    {
+      "path": "core/prompt_checkpoint_memory.h",
+      "new_file": true,
+      "bytes": 1714,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "a341838ba7cef42255ca6ffc5d398a56fb029dbad9452eada4baa77b1b1dbbd7",
+      "sha256": "a341838ba7cef42255ca6ffc5d398a56fb029dbad9452eada4baa77b1b1dbbd7",
+      "normalized_lf_sha256": "22624bc1bef1a6c69ddf06e613ffcbec87dd2792898922ff25c97cc4efc92c5f"
+    },
+    {
+      "path": "core/qsa_capture_api.h.inc",
+      "new_file": true,
+      "bytes": 625,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "b4c0f62bd6d0fd02b40c46453b655cdcf723f7b077c50069ec09f20f11aa8ffd",
+      "sha256": "b4c0f62bd6d0fd02b40c46453b655cdcf723f7b077c50069ec09f20f11aa8ffd",
+      "normalized_lf_sha256": "262574d2413a22dc3682c5159a802d6ee7126d5276e614d58a42157890c09fc8"
+    },
+    {
+      "path": "core/qsa_capture_runtime.inc",
+      "new_file": true,
+      "bytes": 2168,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "e23744e2e0b742495bce3dc36412450adebefdb8a307740d6a4a38aeda99ba4b",
+      "sha256": "e23744e2e0b742495bce3dc36412450adebefdb8a307740d6a4a38aeda99ba4b",
+      "normalized_lf_sha256": "2cb2c3db9e41567ff5c8c2aa80286e2c6b4d0d0dddb0a240eec5a6ccb7b8b153"
+    },
+    {
+      "path": "core/qsa_constant_inputs.h",
+      "new_file": true,
+      "bytes": 2321,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "c54d6985dfd80992dada64beb28e0a07a70717b22033e32a233cd70d50d7f315",
+      "sha256": "c54d6985dfd80992dada64beb28e0a07a70717b22033e32a233cd70d50d7f315",
+      "normalized_lf_sha256": "9a4b46376c9b75158a533f283b10ea7f625350af56d1b230649b00533209b170"
+    },
+    {
+      "path": "core/ram_s3fifo_LICENSE.txt",
+      "new_file": true,
+      "bytes": 11560,
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime.",
+      "original_worktree_sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+      "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+      "normalized_lf_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "core/ram_s3fifo_metadata.h",
+      "new_file": true,
+      "bytes": 10109,
+      "category": "experiment",
+      "reason": "Alternative cache policy; no production promotion assumed.",
+      "original_worktree_sha256": "1643f9b2751db81b4b4cb49cec45606160a22308b20510e19401b2f127edd76d",
+      "sha256": "1643f9b2751db81b4b4cb49cec45606160a22308b20510e19401b2f127edd76d",
+      "normalized_lf_sha256": "482d3ca9848294cd698cc7a165ce6da9aae8a5915bad3cafe9d95fda002589fc"
+    },
+    {
+      "path": "core/ram_ssd_admission.h",
+      "new_file": true,
+      "bytes": 1821,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "1408afb6b88d3e6dab769b47704bf19d111ad63033c35590d1f63c7df83938fe",
+      "sha256": "1408afb6b88d3e6dab769b47704bf19d111ad63033c35590d1f63c7df83938fe",
+      "normalized_lf_sha256": "e13f048bea3de4083ed8a27b5b0096f615a6b3813bab551340ab2c1a3413a207"
+    },
+    {
+      "path": "core/rpc_weights.h",
+      "new_file": true,
+      "bytes": 4256,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "0f9d6cf311b7ce0a303c216d84d8af599304e9b491ce1fd123addf769e8161fb",
+      "sha256": "8c2fcb410f27549158a27f2ee233aac91c00c798bcb595ad6d6a51626dece0d7",
+      "normalized_lf_sha256": "0f9d6cf311b7ce0a303c216d84d8af599304e9b491ce1fd123addf769e8161fb"
+    },
+    {
+      "path": "core/runtime.cpp",
+      "new_file": false,
+      "bytes": 394699,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "9fa63ecd87e4ab56a70c79330e58624359651c479017c5c31d50b17987556c82",
+      "sha256": "9fa63ecd87e4ab56a70c79330e58624359651c479017c5c31d50b17987556c82",
+      "normalized_lf_sha256": "3c5d8d4876ca7ef04e3110151e3bd1e57000ab8924a83932d54dd5ef969fe49d"
+    },
+    {
+      "path": "core/runtime.h",
+      "new_file": false,
+      "bytes": 15481,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "d00e625fb0a40bd897d817bcfa2ee1e10ea7142d60dc7d1117d37969e7e1c2c7",
+      "sha256": "79954c365c1cf33e7d56209974fe5fa9af4add341134c743000ce2162fa003ec",
+      "normalized_lf_sha256": "d00e625fb0a40bd897d817bcfa2ee1e10ea7142d60dc7d1117d37969e7e1c2c7"
+    },
+    {
+      "path": "core/scheduler_timing.h",
+      "new_file": true,
+      "bytes": 576,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "5fae3a352d83e975d2be9e1b3db1928cb1c733d36ac141e95000782cac374656",
+      "sha256": "1c7c0bc71fc0e6e28366695d895174a4afd927f2040fc5ec253f80748a545794",
+      "normalized_lf_sha256": "5fae3a352d83e975d2be9e1b3db1928cb1c733d36ac141e95000782cac374656"
+    },
+    {
+      "path": "core/speculation_api.h.inc",
+      "new_file": true,
+      "bytes": 1499,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "07305744ccd4f1dedf7fddafc4bdb07035fb8e8555d5d9030fcaa7431eecf644",
+      "sha256": "bfa6c26482413f18339e5da24420a2e8d73129af98bc6f459025b777884d5bc4",
+      "normalized_lf_sha256": "07305744ccd4f1dedf7fddafc4bdb07035fb8e8555d5d9030fcaa7431eecf644"
+    },
+    {
+      "path": "core/speculation_runtime.inc",
+      "new_file": true,
+      "bytes": 8102,
+      "category": "experiment",
+      "reason": "Complete-block, speculative or diagnostic experiment; preserve separately.",
+      "original_worktree_sha256": "b2120057f68545d34f0bc31ae393f355288274affb625e4b2bef323f30891679",
+      "sha256": "5f0df7ce57fa8cc378e09f68659073a65b49158a0a8593c7189d75e3438e0295",
+      "normalized_lf_sha256": "b2120057f68545d34f0bc31ae393f355288274affb625e4b2bef323f30891679"
+    },
+    {
+      "path": "core/tokenizer.cpp",
+      "new_file": false,
+      "bytes": 18878,
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper.",
+      "original_worktree_sha256": "448545d422e60018a1527d3be37b7f30fbc9968842aa3c6618a312d33d1773c6",
+      "sha256": "448545d422e60018a1527d3be37b7f30fbc9968842aa3c6618a312d33d1773c6",
+      "normalized_lf_sha256": "a8e0a232077cf1b2cbf2331d2950be887c86be838fa4a539a250aa94bc236e67"
+    },
+    {
+      "path": "core/tokenizer.h",
+      "new_file": false,
+      "bytes": 3567,
+      "category": "reuse-upstream",
+      "reason": "Delegate model formatting, tokenization and parsing to the pinned llama.cpp chat helper.",
+      "original_worktree_sha256": "4ec41db89a89f446fb04c8ab1740997b508bc6326a7ba4d5b14be08f08454267",
+      "sha256": "4ec41db89a89f446fb04c8ab1740997b508bc6326a7ba4d5b14be08f08454267",
+      "normalized_lf_sha256": "3440f685f0d01607dc8828d9a9ded2ce482e72caa979189ec1a1b6a32060b70d"
+    },
+    {
+      "path": "core/workspace_partition.h",
+      "new_file": true,
+      "bytes": 3618,
+      "category": "local-extension",
+      "reason": "Measured local memory/I/O integration or correctness support; replace with upstream equivalents when verified.",
+      "original_worktree_sha256": "802d34fd3e2782cadad5195494f86b6c2ddee1942cdb4c5744cfc4b682676ac1",
+      "sha256": "802d34fd3e2782cadad5195494f86b6c2ddee1942cdb4c5744cfc4b682676ac1",
+      "normalized_lf_sha256": "a0b6b29e6dc39e1e970b241eba6e437c8528684492bf3a257db1027c3e3e18d1"
+    },
+    {
+      "path": "server/main.cpp",
+      "new_file": false,
+      "bytes": 118200,
+      "category": "mixed",
+      "reason": "Contains multiple features. Use the feature ledger and isolated patches, not a whole-file upstream PR.",
+      "original_worktree_sha256": "b9923f5807f84491e78a33736d8fb7366c87ed68ab5b15b29380a8f64c8a6df7",
+      "sha256": "b9923f5807f84491e78a33736d8fb7366c87ed68ab5b15b29380a8f64c8a6df7",
+      "normalized_lf_sha256": "bce2d36c8fd02356128fb57aba29c910f626bc2d42b701bc457643d0a6904e90"
+    },
+    {
+      "path": "server/qwen_tool_calls.h",
+      "new_file": true,
+      "bytes": 6442,
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes.",
+      "original_worktree_sha256": "d4acb7c1889b917511905be5fd4951d4621ed2044238ec371b8d41f94e22e15b",
+      "sha256": "0f6d4f1f105ed944f52452096ff527ea5e9aa8e03b0a4b69626ec4a7c99a67e1",
+      "normalized_lf_sha256": "d4acb7c1889b917511905be5fd4951d4621ed2044238ec371b8d41f94e22e15b"
+    },
+    {
+      "path": "server/rpc_server.cpp",
+      "new_file": true,
+      "bytes": 3971,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "1fc735972ee81afed2cc253ca09f4fa3c1e2000e5643e2dd49b27dd2eefe6a1f",
+      "sha256": "1fc735972ee81afed2cc253ca09f4fa3c1e2000e5643e2dd49b27dd2eefe6a1f",
+      "normalized_lf_sha256": "dbfd4fc4d00f7a29fc507e69fe88b1d3816ac2285e564139a672da7c42443d62"
+    },
+    {
+      "path": "tests/block_transport_echo.cpp",
+      "new_file": true,
+      "bytes": 5680,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "0d031833e684f18513a2d5da0c577283667a47c46bbc657b42442e78e9644a2b",
+      "sha256": "0d031833e684f18513a2d5da0c577283667a47c46bbc657b42442e78e9644a2b",
+      "normalized_lf_sha256": "9de783e5ec2d9093486de760870d85352efb980e77125bdd66058f0960ce0830"
+    },
+    {
+      "path": "tests/block_worker.cpp",
+      "new_file": true,
+      "bytes": 22321,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "d9c9db4b5d43ab53302faddb2a789921538580189c83280149be961b3d2dad8e",
+      "sha256": "45c9d8f12639b2f8d7b3b9b2958f170fe85d418dc442a8c209a5df2ea8294620",
+      "normalized_lf_sha256": "f2a089a7eb2e8bafd5a282b1c5c1bae115413ff9805d108c700b8332495a7693"
+    },
+    {
+      "path": "tests/cache_memory_budget_test.cpp",
+      "new_file": true,
+      "bytes": 3324,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "d72075d1d280887631ae9c6ce4554dee99e586b3ba77ffda2e44d5b1f1725549",
+      "sha256": "864f6781e91e65c02eac19fc77857c052db0699b613930de2188643e8b92843e",
+      "normalized_lf_sha256": "d72075d1d280887631ae9c6ce4554dee99e586b3ba77ffda2e44d5b1f1725549"
+    },
+    {
+      "path": "tests/chat_template_probe.cpp",
+      "new_file": true,
+      "bytes": 2705,
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes.",
+      "original_worktree_sha256": "473ebec5e987f427d37f8b004ee943a23770ca06aedb7526a1924db6b3ae3e32",
+      "sha256": "502797add9460c4a0e41068ba280b6393489b5e1e7ffc5c53c0e80f5b2f80677",
+      "normalized_lf_sha256": "473ebec5e987f427d37f8b004ee943a23770ca06aedb7526a1924db6b3ae3e32"
+    },
+    {
+      "path": "tests/direct_pinned_covering_test.cpp",
+      "new_file": true,
+      "bytes": 5596,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "2f51c462f2a054ef547ea4470b35d9a8ffd157f18184dc9376391092244c9c3e",
+      "sha256": "2f51c462f2a054ef547ea4470b35d9a8ffd157f18184dc9376391092244c9c3e",
+      "normalized_lf_sha256": "a0fa2632280c0456e0f191403bfc394fc72a02a6e03d35fb34cbba9a0997f8b5"
+    },
+    {
+      "path": "tests/expert_calibrate.cpp",
+      "new_file": true,
+      "bytes": 10598,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "bfa3f79730c3aff5f71ef87cf5c21d69ae8d46d285f06b60ab38f4c5a97dde43",
+      "sha256": "421d401766793bbd3b8ce70c016f1cb3b3dad989ea6ae6ab1220d6aee90cbd36",
+      "normalized_lf_sha256": "bfa3f79730c3aff5f71ef87cf5c21d69ae8d46d285f06b60ab38f4c5a97dde43"
+    },
+    {
+      "path": "tests/expert_cost_graph.h",
+      "new_file": true,
+      "bytes": 8913,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "19f99baf35ab3a975d14ac677060898f53bc24e7eea4c9f75841f54eaa4da721",
+      "sha256": "c144304980b935532d06f2cb7046648d568f069229c340ec19062af9af7885ee",
+      "normalized_lf_sha256": "19f99baf35ab3a975d14ac677060898f53bc24e7eea4c9f75841f54eaa4da721"
+    },
+    {
+      "path": "tests/expert_cost_io.h",
+      "new_file": true,
+      "bytes": 5098,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "45d6bcca674ef6271d8ccd38d15744b92f43249c728c14aaa0b7bbd8669e53d6",
+      "sha256": "f59a23a3bfbd4a48b827261153a82856fc0e02c50ac81f388f8958103b620057",
+      "normalized_lf_sha256": "45d6bcca674ef6271d8ccd38d15744b92f43249c728c14aaa0b7bbd8669e53d6"
+    },
+    {
+      "path": "tests/expert_cost_stats.h",
+      "new_file": true,
+      "bytes": 1228,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "4e6545d2d2de2f8b2ee8f4a5e8bf1ad7409c4d08273851253f4c40cc8072e4f5",
+      "sha256": "0b4eb0ac90ea9770410886eabde3ded16b6d3bb7009b76eb1745e486211d19b1",
+      "normalized_lf_sha256": "4e6545d2d2de2f8b2ee8f4a5e8bf1ad7409c4d08273851253f4c40cc8072e4f5"
+    },
+    {
+      "path": "tests/expert_costs.cpp",
+      "new_file": true,
+      "bytes": 20449,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "756e7e02c5ef1ecf1775d779921f2fac3a4fe3fea2e9e1d43d6f4af615443f56",
+      "sha256": "13dec02334fd4bf8d1caac5358369fd1cec87064bf47b2363ee2e7c3fc311a26",
+      "normalized_lf_sha256": "756e7e02c5ef1ecf1775d779921f2fac3a4fe3fea2e9e1d43d6f4af615443f56"
+    },
+    {
+      "path": "tests/expert_demand_pipeline_test.cpp",
+      "new_file": true,
+      "bytes": 10395,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "543512226b8a969b6861768c37caf12396091c42a6e8e36b777cb01298de82db",
+      "sha256": "543512226b8a969b6861768c37caf12396091c42a6e8e36b777cb01298de82db",
+      "normalized_lf_sha256": "d6fd55ac02044de6b2ab128140d8d0ad675ea08be5b5da377370f13ea75c404f"
+    },
+    {
+      "path": "tests/expert_demand_trace_test.cpp",
+      "new_file": true,
+      "bytes": 7572,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "9e5a757aeb363a5d9c0ad61e29cd5e9abc2e4dad6eed893e0b3b83a4aac30da7",
+      "sha256": "9e5a757aeb363a5d9c0ad61e29cd5e9abc2e4dad6eed893e0b3b83a4aac30da7",
+      "normalized_lf_sha256": "92e0e8e92f80a1786b4f47e0a237d47387da4930b65e58dcbf0597b721d3911d"
+    },
+    {
+      "path": "tests/expert_install_check_test.cpp",
+      "new_file": true,
+      "bytes": 3806,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "75fa870bd4c998ebfa3dde3cf7fba05f156abd8ba07fb6f4a5cfb18f7f12e49a",
+      "sha256": "75fa870bd4c998ebfa3dde3cf7fba05f156abd8ba07fb6f4a5cfb18f7f12e49a",
+      "normalized_lf_sha256": "3c8d856bcd8a04a04c54bda38a2d1b7786633316a1d91456585095db3ab06382"
+    },
+    {
+      "path": "tests/expert_io_targeted_wake_test.cpp",
+      "new_file": true,
+      "bytes": 4984,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "1076e3a728d3fb9ed41492c143049041d9cb53fba4deec5bcb324421ff0739d2",
+      "sha256": "1076e3a728d3fb9ed41492c143049041d9cb53fba4deec5bcb324421ff0739d2",
+      "normalized_lf_sha256": "ee1d5a60a4a2b11eaba2843d7036c30ed8820b01e6005937ba0ba6db5dad3fd5"
+    },
+    {
+      "path": "tests/expert_io_workers_test.cpp",
+      "new_file": true,
+      "bytes": 9499,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "6d36fe6732af934633c12a8516633b142e222192ee8b80a8dba6be44df4cef00",
+      "sha256": "6d36fe6732af934633c12a8516633b142e222192ee8b80a8dba6be44df4cef00",
+      "normalized_lf_sha256": "2e9f0f248d95eef520954025db1f9f36973780fdf2337f2b10c8d3710b03af15"
+    },
+    {
+      "path": "tests/expert_ssd_read_phase_test.cpp",
+      "new_file": true,
+      "bytes": 11397,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "f709f496c5ed630ef196ded549a58c5e3f525685584472f996a1adfc88d00c3f",
+      "sha256": "f709f496c5ed630ef196ded549a58c5e3f525685584472f996a1adfc88d00c3f",
+      "normalized_lf_sha256": "009358195f26a988dc80c4b3e69a9265a3185e5ec9da915b2b8d705538fa71e3"
+    },
+    {
+      "path": "tests/expert_weight_audit_test.cpp",
+      "new_file": true,
+      "bytes": 2372,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "d4959a71118db59bd95ce5b132a9b6b1c80ce1ab49bd8850c6a5f1ae6b5394ed",
+      "sha256": "d4959a71118db59bd95ce5b132a9b6b1c80ce1ab49bd8850c6a5f1ae6b5394ed",
+      "normalized_lf_sha256": "ff4fb5cd4eba94f8e503b6eba916901612a9a59d3b0c0a50644f89c3e1014ce3"
+    },
+    {
+      "path": "tests/gpu_lru_index_test.cpp",
+      "new_file": true,
+      "bytes": 12714,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "1cbdd3e40da77885b0e2e69b13b303c9f2d798f9032b75633b15aef4e182f4ec",
+      "sha256": "1cbdd3e40da77885b0e2e69b13b303c9f2d798f9032b75633b15aef4e182f4ec",
+      "normalized_lf_sha256": "945a49e2a2abfde970ea231f8d799120a2ceef51ac1676ef1299a53ffef254f1"
+    },
+    {
+      "path": "tests/grouped_cost_graph.h",
+      "new_file": true,
+      "bytes": 9908,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "15a93929ca9384f8ec7486050bc7223d5132eaeaf1512bcba048021566c3f5d9",
+      "sha256": "c94fd2a882636bed85ef24214c6c2b8f8ad41e2f1e14365cd8afdb5949cdc18b",
+      "normalized_lf_sha256": "15a93929ca9384f8ec7486050bc7223d5132eaeaf1512bcba048021566c3f5d9"
+    },
+    {
+      "path": "tests/host_cache_s3fifo_test.cpp",
+      "new_file": true,
+      "bytes": 11629,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "72df65a357ec86d8d51523899678adda4fcf615805a8320546a94b7eb9c60723",
+      "sha256": "72df65a357ec86d8d51523899678adda4fcf615805a8320546a94b7eb9c60723",
+      "normalized_lf_sha256": "a9d2b39c232c3053d742cc36ac26ce8687980250d38da366d968b905a406bc65"
+    },
+    {
+      "path": "tests/host_cache_test.cpp",
+      "new_file": true,
+      "bytes": 9781,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "9ffad5bffb461dabfdae71d4e1cc608dd281f5b2f6fc16544174306f8b36deff",
+      "sha256": "12e8e20a3049e713c20e4eeabb626ab8d67f40df61c9c0a7f10ab07b6236d039",
+      "normalized_lf_sha256": "9ffad5bffb461dabfdae71d4e1cc608dd281f5b2f6fc16544174306f8b36deff"
+    },
+    {
+      "path": "tests/prefill_cache_policy_test.cpp",
+      "new_file": true,
+      "bytes": 3334,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "7f76900dc279462b3940d614288e26eb595045df15aad5a870e89e7815370caf",
+      "sha256": "2c1e64eaa3f26f005bb09b087226d9d1834e320dec98169f3eca5e25f3394748",
+      "normalized_lf_sha256": "7f76900dc279462b3940d614288e26eb595045df15aad5a870e89e7815370caf"
+    },
+    {
+      "path": "tests/prompt_checkpoint_memory_test.cpp",
+      "new_file": true,
+      "bytes": 2713,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "864cbcbc3d582a970e1b877b6ea09d3f3e50e8fd76afbcc681f7e052530fe6d4",
+      "sha256": "864cbcbc3d582a970e1b877b6ea09d3f3e50e8fd76afbcc681f7e052530fe6d4",
+      "normalized_lf_sha256": "2c8ae67be62c083cf37ff7fb05a9423c4a11ab72764025f4165b3048ff569b07"
+    },
+    {
+      "path": "tests/qsa_attention_reference.cpp",
+      "new_file": true,
+      "bytes": 9452,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "0360f8ea8c53ddae9497963c92e3ab4452665e740c5575859657979a3297d5f2",
+      "sha256": "0360f8ea8c53ddae9497963c92e3ab4452665e740c5575859657979a3297d5f2",
+      "normalized_lf_sha256": "1f926dc381a02e80de6cfa1cd415028dbd46aa0ff70fb3859d273fd2cf89724b"
+    },
+    {
+      "path": "tests/qsa_constant_inputs_test.cpp",
+      "new_file": true,
+      "bytes": 4300,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "34a466173346c17295de9b3d9666f1ad501dc64a111474b6458e709c44a4931a",
+      "sha256": "34a466173346c17295de9b3d9666f1ad501dc64a111474b6458e709c44a4931a",
+      "normalized_lf_sha256": "ab2bad6206856e0be5b063d85017d88a064bbda11cd50195d72c1ed2b395e5fe"
+    },
+    {
+      "path": "tests/qsa_constant_storage_test.cpp",
+      "new_file": true,
+      "bytes": 4495,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "9edcf96f64c342b0c589feab562f18019f8d27bc7ade8bf08b2e30c89dc4f4e6",
+      "sha256": "9edcf96f64c342b0c589feab562f18019f8d27bc7ade8bf08b2e30c89dc4f4e6",
+      "normalized_lf_sha256": "a0a368d5aeee431f2af8cb078dc5200a0eb9e96a4a06afacd88b15a308bb70b5"
+    },
+    {
+      "path": "tests/qsa_identity_view_test.cpp",
+      "new_file": true,
+      "bytes": 8836,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "e42ba2347f2edf2045770e5a9639445ba89f7a03339a18a1c57a07fc381157ac",
+      "sha256": "e42ba2347f2edf2045770e5a9639445ba89f7a03339a18a1c57a07fc381157ac",
+      "normalized_lf_sha256": "8baa1deea2d6f6f4e2b142fd37516dcb71250e1bd68d40dda9a9fbf231e0fb44"
+    },
+    {
+      "path": "tests/qsa_pool4_probe.cpp",
+      "new_file": true,
+      "bytes": 7621,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "bf0e9fdab44ee7e840dcceff72c2c484232d8ec535b1e1ac59f5aa4090406751",
+      "sha256": "bf0e9fdab44ee7e840dcceff72c2c484232d8ec535b1e1ac59f5aa4090406751",
+      "normalized_lf_sha256": "5c67443598bf719fe2e90beafdb98030589f4cd8d4892e95501778ac7537e279"
+    },
+    {
+      "path": "tests/ram_ssd_admission_test.cpp",
+      "new_file": true,
+      "bytes": 3185,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "77bdb8f281fceff36c3a9dd337e3b235f4abdac8c1c88f72464cc9f2f9dd601c",
+      "sha256": "77bdb8f281fceff36c3a9dd337e3b235f4abdac8c1c88f72464cc9f2f9dd601c",
+      "normalized_lf_sha256": "ab561f44e03be4e7f28101b6f06e5460f702784bb62887706580e374e5747eb1"
+    },
+    {
+      "path": "tests/real_grouped_client.h",
+      "new_file": true,
+      "bytes": 6589,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "a921b9593626c362279b420812b895761a2cab4b10320b68e246d9fe00c9ea9b",
+      "sha256": "dcb21262e2417960cc90fc75bf7ef1cf4d01c9d961d77e3481fb575502581cd4",
+      "normalized_lf_sha256": "a921b9593626c362279b420812b895761a2cab4b10320b68e246d9fe00c9ea9b"
+    },
+    {
+      "path": "tests/real_grouped_probe.cpp",
+      "new_file": true,
+      "bytes": 15143,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "c49657197ce2442bc26775d0c3a4d810b64a16e37fd3762a0dff93edc6dae2fe",
+      "sha256": "c49657197ce2442bc26775d0c3a4d810b64a16e37fd3762a0dff93edc6dae2fe",
+      "normalized_lf_sha256": "4e3947903c0e3ba764219fed80cb380c5f551bee1cef809b07f315c7c72c0066"
+    },
+    {
+      "path": "tests/real_grouped_reference.h",
+      "new_file": true,
+      "bytes": 3730,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "c3a617ff68a70ca629d4bb3afec208750a773560f51df1a5741c558b6aa729c9",
+      "sha256": "7e1ee38ec1d9d83ccce258de71757012441b8d9a66df3413f93ad3cc6de6f0ec",
+      "normalized_lf_sha256": "c3a617ff68a70ca629d4bb3afec208750a773560f51df1a5741c558b6aa729c9"
+    },
+    {
+      "path": "tests/rpc_probe.cpp",
+      "new_file": true,
+      "bytes": 6827,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "34f4472f0731e0f70ec986f9b48f5bdae70339b48877d0545183485596dcd082",
+      "sha256": "fcc1f8086d056b6dd5edb906815d0dc8627cd23e29b0a73f76776f1f6641282d",
+      "normalized_lf_sha256": "34f4472f0731e0f70ec986f9b48f5bdae70339b48877d0545183485596dcd082"
+    },
+    {
+      "path": "tests/scalar_get_rows_probe.cpp",
+      "new_file": true,
+      "bytes": 6082,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "4b04b00b74f2dbbb95cbac1881993917703709bbdfbab5f9b2661144d9036503",
+      "sha256": "4b04b00b74f2dbbb95cbac1881993917703709bbdfbab5f9b2661144d9036503",
+      "normalized_lf_sha256": "e10e27fcf57d2c2900ca5b382d4238b0516ad72e75ec833f66e4573ad0bae71e"
+    },
+    {
+      "path": "tests/speculation_probe.cpp",
+      "new_file": true,
+      "bytes": 33616,
+      "category": "experiment",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "4870d4b9dd971e7e6bc169dfe58972b7bccf918c397ce9c6595e396f41a22a28",
+      "sha256": "4870d4b9dd971e7e6bc169dfe58972b7bccf918c397ce9c6595e396f41a22a28",
+      "normalized_lf_sha256": "8d88d10c4889d67a5af9f429a0defab95128c53580f9b8ba5b19f8bbee0228f4"
+    },
+    {
+      "path": "tests/tiny_batch_workspace_test.cpp",
+      "new_file": true,
+      "bytes": 6404,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "dab4e274336fab0e76f162e0bc5deede85d334d55bbbd3e9d454b73e68365565",
+      "sha256": "dab4e274336fab0e76f162e0bc5deede85d334d55bbbd3e9d454b73e68365565",
+      "normalized_lf_sha256": "74b4441d38f4b97aa60f45743b35dfc793abec22bb5bc7d12ae72ffacef24d30"
+    },
+    {
+      "path": "tests/tool_call_probe.cpp",
+      "new_file": true,
+      "bytes": 1167,
+      "category": "local-temporary",
+      "reason": "Compatibility repair and migration checks; retire the custom parser after helper integration passes.",
+      "original_worktree_sha256": "a1b600cd44f99c45bd7b8b202d001a94458754c82dc8693998fb11b11d091241",
+      "sha256": "7d7156e75a17992e531c1de2754304af806b6e4f17121de2744b301c959d4eba",
+      "normalized_lf_sha256": "a1b600cd44f99c45bd7b8b202d001a94458754c82dc8693998fb11b11d091241"
+    },
+    {
+      "path": "tests/vector_get_rows_probe.cpp",
+      "new_file": true,
+      "bytes": 6652,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "6b567d54e732a4fc7a9237c32991e4e075e9623b5664252c2fe8bcadc5037a05",
+      "sha256": "6b567d54e732a4fc7a9237c32991e4e075e9623b5664252c2fe8bcadc5037a05",
+      "normalized_lf_sha256": "2813acbcea78b040134afe0fd4d80791b986e67a9109fe3843c600b10d6b8416"
+    },
+    {
+      "path": "tests/workspace_partition_test.cpp",
+      "new_file": true,
+      "bytes": 5490,
+      "category": "validation",
+      "reason": "Native regression/probe source; not a serving module.",
+      "original_worktree_sha256": "9c049b6ad4d96be64db18ca22a672154c1be6ca323070b27b30f87a898af6769",
+      "sha256": "46568eddc909026946a3f75371322ee1aa37970ee051e196419decb2e1c09e6b",
+      "normalized_lf_sha256": "9c049b6ad4d96be64db18ca22a672154c1be6ca323070b27b30f87a898af6769"
+    },
+    {
+      "path": "third_party/caffeine/LICENSE",
+      "new_file": true,
+      "bytes": 11358,
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime.",
+      "original_worktree_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+      "normalized_lf_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "path": "third_party/ggml/include/ggml-rpc.h",
+      "new_file": false,
+      "bytes": 1184,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "5a44c86009b236784404800113e88a726ba35decb0dfe4fad46521dd3bfc6aa2",
+      "sha256": "00093a88cb8a8c57f589226b68097f612b88e35feb52d69c10a52435e08d239f",
+      "normalized_lf_sha256": "5a44c86009b236784404800113e88a726ba35decb0dfe4fad46521dd3bfc6aa2"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/cp-async.cuh",
+      "new_file": false,
+      "bytes": 2725,
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission.",
+      "original_worktree_sha256": "901a6742b177adc13be79ef67d0475ae3e3e38afae70937dbe047aa46dbc3142",
+      "sha256": "901a6742b177adc13be79ef67d0475ae3e3e38afae70937dbe047aa46dbc3142",
+      "normalized_lf_sha256": "36a09a2184f7fce9422d573a693e04020d5a1e7a4d1a04c9c1d0dd1dc3cfdf64"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/fattn-mma-f16.cuh",
+      "new_file": false,
+      "bytes": 116695,
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission.",
+      "original_worktree_sha256": "5102e96cf50291f6ef2721327bc410d04a3c93c79ac4a6e49cfd0944d3f47be8",
+      "sha256": "5102e96cf50291f6ef2721327bc410d04a3c93c79ac4a6e49cfd0944d3f47be8",
+      "normalized_lf_sha256": "51d11fdc07415e6e7995106f68aa5f124c3e01478f8c5e5dbc213e004a23013a"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/getrows.cu",
+      "new_file": false,
+      "bytes": 28375,
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission.",
+      "original_worktree_sha256": "2c47d6723f21262bbfb1ead1f7ef8eea9791d3b35d240f81ce7c4512abbb770e",
+      "sha256": "2c47d6723f21262bbfb1ead1f7ef8eea9791d3b35d240f81ce7c4512abbb770e",
+      "normalized_lf_sha256": "ecca54e410afce7972d653993ce2e1f413f1d8ae755754f05f5c928f9560bebe"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-cuda/pool2d.cu",
+      "new_file": false,
+      "bytes": 8723,
+      "category": "local-kernel-candidate",
+      "reason": "Exact CUDA optimization candidate; requires independent backend/reference checks before an upstream submission.",
+      "original_worktree_sha256": "aaab83b124f6ea9fc7c5a05f4cfd74208ce091047b0ab4abe83394c30d0ccbc5",
+      "sha256": "aaab83b124f6ea9fc7c5a05f4cfd74208ce091047b0ab4abe83394c30d0ccbc5",
+      "normalized_lf_sha256": "38f7a0b7798b8f329b5d961aba0b010ccaf55d4eb42b4bdf7b6c39222936f4ff"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-rpc/ggml-rpc.cpp",
+      "new_file": false,
+      "bytes": 131474,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "da2e6f3187853c65e6bd3a3b3295f896235ffce146d9dab4e59a91fb4830bace",
+      "sha256": "a2a0da8f8162fbfac9a68599e9288cd65ec536a81dbe7527ad26645074b973df",
+      "normalized_lf_sha256": "da2e6f3187853c65e6bd3a3b3295f896235ffce146d9dab4e59a91fb4830bace"
+    },
+    {
+      "path": "third_party/ggml/src/ggml-rpc/indexed_weights.h",
+      "new_file": true,
+      "bytes": 4105,
+      "category": "experiment",
+      "reason": "Distributed layer-window or private-RPC work; not a demonstrated production speedup.",
+      "original_worktree_sha256": "424476aff67c90a71141ea5c07e319e88e2d623361143f7575e1e35c26eb5dea",
+      "sha256": "58460f3ec8ac03f61ab0ca4be4bf3cbc447d3332a872398470ce7654351068c2",
+      "normalized_lf_sha256": "424476aff67c90a71141ea5c07e319e88e2d623361143f7575e1e35c26eb5dea"
+    },
+    {
+      "path": "third_party/hybrimoe/LICENSE",
+      "new_file": true,
+      "bytes": 11357,
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime.",
+      "original_worktree_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "sha256": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+      "normalized_lf_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "third_party/moe-infinity/LICENSE",
+      "new_file": true,
+      "bytes": 11347,
+      "category": "local-attribution",
+      "reason": "Retain licenses for adapted algorithms, including code still compiled in the serving runtime.",
+      "original_worktree_sha256": "b54cda09d3828700460612b54c991dbe087966753ca414f0810d42ee9225fad7",
+      "sha256": "9097e708093ec9d767bc6b014748c5e142faeeed37a7d814c8c12a3f2f814df5",
+      "normalized_lf_sha256": "b54cda09d3828700460612b54c991dbe087966753ca414f0810d42ee9225fad7"
+    }
+  ],
+  "counts": {
+    "experiment": 24,
+    "local-attribution": 4,
+    "local-extension": 20,
+    "local-kernel-candidate": 4,
+    "local-temporary": 3,
+    "local-with-experimental-policy": 1,
+    "mixed": 8,
+    "reuse-upstream": 4,
+    "validation": 30
+  },
+  "unclassified": [],
+  "note": "File ownership is not a claim that mixed files or the current binary exclude experimental branches.",
+  "patches": {
+    "0001-user-defined-tokens.patch": "e5faa79e188b553ddef4058651ec21a498cb8cd08f31b5af999a0691c57cfc5e",
+    "0002-buffered-stream-heartbeats.patch": "af7893083b8a7d24c8dd9e2ced7bc4b9f7df3ee4abf2a966f3630c47478fc44a"
+  },
+  "full_source_patch_sha256": "a0c831afd4c0fd58fe50dbe1a17d2c83bd650eeb84a2c859b1fb107cc4a87847",
+  "line_ending_note": "Git may normalize line endings. Original-worktree, review-worktree and normalized-LF hashes are distinguished."
+}

@@ -8,6 +8,7 @@
 #include "runtime.h"
 #include "sampler.h"
 #include "chat.h"
+#include "qwen_tool_calls.h"
 #include "vision.h"
 #include "args.h"
 
@@ -29,6 +30,13 @@
 #include <set>
 #include <mutex>
 #include <string>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using json = nlohmann::json;
 using namespace questwend;
@@ -297,73 +305,15 @@ static std::string parse_tool_calls_lfm2(const std::string & text, std::vector<P
 }
 
 static std::string parse_tool_calls(const std::string & text, std::vector<ParsedToolCall> & calls,
-                                    const std::map<std::string, int> * param_kind = nullptr,
-                                    bool lfm2 = false) {
+                                    const QwenToolSchemas & schemas, bool lfm2 = false,
+                                    std::string * error = nullptr) {
     if (lfm2) return parse_tool_calls_lfm2(text, calls);
-    size_t scan = 0;
-    const size_t think_end = text.rfind("</think>");
-    if (think_end != std::string::npos) scan = think_end + 8;
-
-    std::string out = text.substr(0, scan);
-    size_t pos = scan;
-    while (true) {
-        const size_t tc = text.find("<tool_call>", pos);
-        if (tc == std::string::npos) { out += text.substr(pos); break; }
-        const size_t tce = text.find("</tool_call>", tc);
-        if (tce == std::string::npos) { out += text.substr(pos); break; }
-        out += text.substr(pos, tc - pos);
-        const std::string block = text.substr(tc, tce - tc);
-
-        ParsedToolCall call;
-        bool parsed = false;
-        const size_t fn = block.find("<function=");
-        if (fn != std::string::npos) {
-            const size_t fe = block.find('>', fn);
-            if (fe != std::string::npos) {
-                call.name = block.substr(fn + 10, fe - fn - 10);
-                json args = json::object();
-                size_t pp = fe;
-                while (true) {
-                    const size_t ps = block.find("<parameter=", pp);
-                    if (ps == std::string::npos) break;
-                    const size_t pe = block.find('>', ps);
-                    const size_t pc = block.find("</parameter>", ps);
-                    if (pe == std::string::npos || pc == std::string::npos) break;
-                    const std::string key = block.substr(ps + 11, pe - ps - 11);
-                    std::string val = block.substr(pe + 1, pc - pe - 1);
-                    // values are wrapped in newlines by the format
-                    if (!val.empty() && val.front() == '\n') val.erase(0, 1);
-                    if (!val.empty() && val.back() == '\n')  val.pop_back();
-                    // schema-declared strings stay raw; otherwise non-string
-                    // JSON values were serialized as JSON; try to recover
-                    int kind = -1;
-                    if (param_kind) {
-                        const auto it = param_kind->find(call.name + '\x1f' + key);
-                        if (it != param_kind->end()) kind = it->second;
-                    }
-                    json jv;
-                    if (kind == 1) {
-                        jv = val;
-                    } else {
-                        try {
-                            jv = json::parse(val);
-                            if (jv.is_string()) jv = val;   // quoted string stays raw
-                        } catch (...) { jv = val; }
-                    }
-                    args[key] = jv;
-                    pp = pc + 12;
-                }
-                call.arguments = args.dump();
-                calls.push_back(std::move(call));
-                parsed = true;
-            }
-        }
-        if (!parsed) out += text.substr(tc, tce + 12 - tc);   // malformed: keep as content
-        pos = tce + 12;
-    }
-    // trim trailing whitespace left by block removal
-    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
-    return out;
+    const auto parsed = parse_qwen_tool_calls(text, schemas);
+    if (error) *error = parsed.error;
+    for (const auto & call : parsed.calls) calls.push_back({call.name, call.arguments});
+    if (parsed.repaired_headers)
+        fprintf(stderr, "tool parser: repaired %d declared function header(s)\n", parsed.repaired_headers);
+    return parsed.content;
 }
 
 // Streaming holdback: bytes at the end of `s` that must not be emitted yet —
@@ -613,6 +563,7 @@ int main(int argc, char ** argv) {
     bool no_mmproj = false;
     int  cache_slots = 0;
     std::string cache_slots_dir;
+    bool complete_cache_slots = false; // experimental private state format
     int  time_slice = 64;   // generation tokens per turn when requests contend
                             // (needs --cache-slots to park state; 0 = back-to-back)
     bool want_help = false;
@@ -624,6 +575,7 @@ int main(int argc, char ** argv) {
         else if (a == "--no-mmproj")        no_mmproj = true;
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
+        else if (a == "--complete-cache-slots") complete_cache_slots = true;
         else if (a == "--time-slice" && i + 1 < argc) time_slice = std::stoi(argv[++i]);
         else if (a == "--heartbeat" && i + 1 < argc) set_knob("QWEN_HEARTBEAT", argv[++i]);
         else if (a == "--pf-chunk" && i + 1 < argc)  set_knob("QWEN_PF_CHUNK", argv[++i]);
@@ -642,6 +594,11 @@ int main(int argc, char ** argv) {
     }
     if (!want_help && !validate_common_options(opt)) return 1;
     if (!cache_slots_dir.empty() && cache_slots <= 0) cache_slots = 4;   // dir implies slots
+
+    if (!want_help && complete_cache_slots && (cache_slots <= 0 || opt.use_mtp)) {
+        fprintf(stderr, "error: --complete-cache-slots requires cache slots and --mtp off\n");
+        return 1;
+    }
 
     // Mirrors of the common options the request handlers below capture by value.
     const std::string & model_path = opt.model_path;
@@ -664,6 +621,7 @@ int main(int argc, char ** argv) {
             "  --no-mmproj         disable image input even if an mmproj file is present\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
+            "  --complete-cache-slots  experimental QSL2 slots including PLE/QSA/ngram/logits; no MTP\n"
             "  --time-slice <N>    interleave concurrent streaming requests every N generated tokens\n"
             "                      (default 64; takes effect with --cache-slots; 0 = run back-to-back)\n"
             "  --heartbeat <on|off>  SSE keepalive chunks while queued / between prefill chunks (default on)\n"
@@ -914,7 +872,69 @@ int main(int argc, char ** argv) {
     uint64_t slot_clock = 0;
     int live_origin = -1;              // slot the live state was loaded from / saved to
     const bool slots_ssd = !cache_slots_dir.empty();
-    static const uint32_t SLOT_MAGIC = 0x314C5351;   // "QSL1"
+    // QSL1 retains the existing default payload. QSL2 is deliberately
+    // private and incompatible: callers must pin source/model/runtime/context.
+    const uint32_t SLOT_MAGIC = complete_cache_slots ? 0x324C5351 : 0x314C5351;
+    auto save_slot_payload = [&](const std::function<void(const void *, size_t)> & sink) {
+        if (complete_cache_slots) rt->save_probe_state(sink);
+        else rt->save_state(sink);
+    };
+    auto load_slot_payload = [&](const std::function<void(void *, size_t)> & source) {
+        if (complete_cache_slots) rt->load_probe_state(source);
+        else rt->load_state(source);
+    };
+
+    // A trusted, single-server cache directory is required. Startup discovers
+    // only slot-N.bin, so an interrupted temporary write is never a slot.
+    auto save_complete_disk_slot = [&](const std::string & path,
+                                      const std::vector<int32_t> & toks,
+                                      const std::vector<ImgSpan> & imgs,
+                                      int slot_index) -> bool {
+        const std::string temporary = path + ".tmp";
+        FILE * f = fopen(temporary.c_str(), "wb");
+        if (!f) {
+            fprintf(stderr, "prefix cache: complete slot %d temporary open failed\n", slot_index);
+            return false;
+        }
+        bool ok = true;
+        try {
+            const uint32_t n_toks = (uint32_t) toks.size(), n_imgs = (uint32_t) imgs.size();
+            auto write_checked = [&](const void * p, size_t n) {
+                if (n && fwrite(p, 1, n, f) != n) throw std::runtime_error("short write");
+            };
+            write_checked(&SLOT_MAGIC, sizeof(SLOT_MAGIC));
+            write_checked(&n_toks, sizeof(n_toks));
+            write_checked(&n_imgs, sizeof(n_imgs));
+            write_checked(toks.data(), toks.size() * sizeof(int32_t));
+            write_checked(imgs.data(), imgs.size() * sizeof(ImgSpan));
+            save_slot_payload(write_checked);
+            if (fflush(f) != 0) throw std::runtime_error("flush failed");
+        } catch (const std::exception & error) {
+            fprintf(stderr, "prefix cache: complete slot %d save failed (%s)\n", slot_index, error.what());
+            ok = false;
+        }
+        if (fclose(f) != 0) {
+            fprintf(stderr, "prefix cache: complete slot %d close failed\n", slot_index);
+            ok = false;
+        }
+        if (ok) {
+#if defined(_WIN32)
+            // Unlike remove+rename this retains the prior slot when replacement
+            // fails. WRITE_THROUGH requests completion before success is returned.
+            const auto from = std::filesystem::path(temporary).wstring();
+            const auto to = std::filesystem::path(path).wstring();
+            ok = MoveFileExW(from.c_str(), to.c_str(),
+                            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+            std::error_code error;
+            std::filesystem::rename(temporary, path, error);
+            ok = !error;
+#endif
+            if (!ok) fprintf(stderr, "prefix cache: complete slot %d final rename failed\n", slot_index);
+        }
+        if (!ok) remove(temporary.c_str());
+        return ok;
+    };
 
     if (slots_ssd && !slots.empty()) {
         std::error_code ec;
@@ -966,6 +986,17 @@ int main(int argc, char ** argv) {
             return;
         }
         Slot & sl = slots[s];
+        if (slots_ssd && complete_cache_slots) {
+            // Prepare metadata before committing the new file. Failed
+            // writes retain the old complete slot and its match key.
+            auto next_toks = lt;
+            auto next_imgs = *kv_imgs;
+            if (!save_complete_disk_slot(sl.path, next_toks, next_imgs, s)) return;
+            sl.toks = std::move(next_toks);
+            sl.imgs = std::move(next_imgs);
+            sl.stamp = ++slot_clock;
+            return;
+        }
         sl.toks = lt;
         sl.imgs = *kv_imgs;
         sl.stamp = ++slot_clock;
@@ -979,7 +1010,7 @@ int main(int argc, char ** argv) {
                      (n_toks == 0 || fwrite(sl.toks.data(), sizeof(int32_t), n_toks, f) == n_toks) &&
                      (n_imgs == 0 || fwrite(sl.imgs.data(), sizeof(ImgSpan), n_imgs, f) == n_imgs);
                 if (ok) {
-                    try { rt->save_state([&](const void * p, size_t n) {
+                    try { save_slot_payload([&](const void * p, size_t n) {
                               if (fwrite(p, 1, n, f) != n) throw std::runtime_error("short write"); });
                     } catch (const std::exception & e) {
                         fprintf(stderr, "prefix cache: slot %d save failed (%s)\n", s, e.what());
@@ -992,7 +1023,7 @@ int main(int argc, char ** argv) {
         } else {
             sl.blob.clear();
             sl.blob.reserve(rt->state_bytes());
-            rt->save_state([&](const void * p, size_t n) {
+            save_slot_payload([&](const void * p, size_t n) {
                 const uint8_t * b = (const uint8_t *) p;
                 sl.blob.insert(sl.blob.end(), b, b + n);
             });
@@ -1010,18 +1041,35 @@ int main(int argc, char ** argv) {
                 const long skip = 12 + (long) (sl.toks.size() * sizeof(int32_t))
                                      + (long) (sl.imgs.size() * sizeof(ImgSpan));
                 if (fseek(f, skip, SEEK_SET) != 0) { fclose(f); throw std::runtime_error("seek failed"); }
-                try { rt->load_state([&](void * p, size_t n) {
-                          if (fread(p, 1, n, f) != n) throw std::runtime_error("short read"); });
+                try {
+                    // Recheck the header on every load: the file may have
+                    // changed since startup metadata was inspected.
+                    if (fseek(f, 0, SEEK_SET) != 0) throw std::runtime_error("seek failed");
+                    uint32_t magic = 0, n_toks = 0, n_imgs = 0;
+                    if (fread(&magic, 4, 1, f) != 1 || magic != SLOT_MAGIC ||
+                        fread(&n_toks, 4, 1, f) != 1 || n_toks != sl.toks.size() ||
+                        fread(&n_imgs, 4, 1, f) != 1 || n_imgs != sl.imgs.size())
+                        throw std::runtime_error("slot format or metadata mismatch");
+                    if (fseek(f, skip, SEEK_SET) != 0) throw std::runtime_error("seek failed");
+                    load_slot_payload([&](void * p, size_t n) {
+                        if (fread(p, 1, n, f) != n) throw std::runtime_error("short read");
+                    });
+                    if (complete_cache_slots && fgetc(f) != EOF)
+                        throw std::runtime_error("trailing complete slot payload");
                 } catch (...) { fclose(f); throw; }
                 fclose(f);
             } else {
                 size_t off = 0;
-                rt->load_state([&](void * p, size_t n) {
-                    if (off + n > sl.blob.size()) throw std::runtime_error("short blob");
+                load_slot_payload([&](void * p, size_t n) {
+                    if (n > sl.blob.size() - off) throw std::runtime_error("short blob");
                     memcpy(p, sl.blob.data() + off, n);
                     off += n;
                 });
+                if (complete_cache_slots && off != sl.blob.size())
+                    throw std::runtime_error("trailing complete slot payload");
             }
+            if (complete_cache_slots && rt->kv_tokens() != sl.toks)
+                throw std::runtime_error("complete slot token history mismatch");
         } catch (const std::exception & e) {
             fprintf(stderr, "prefix cache: slot %d load failed (%s), dropping it\n", s, e.what());
             if (slots_ssd) remove(sl.path.c_str());
@@ -1124,9 +1172,18 @@ int main(int argc, char ** argv) {
         return false;
     };
 
+    // Optional benchmark diagnostics. These export existing access counts;
+    // they never clear them, alter routing, or prefetch experts.
+    auto save_routing = [&rt](int prompt_tokens, const char * phase) {
+        const char * directory = getenv("QWEN_ROUTING_PROFILE_DIR");
+        if (!directory || !*directory || !rt->has_expert_cache()) return;
+        rt->save_expert_profile(std::string(directory) + "/prompt-" +
+            std::to_string(prompt_tokens) + "-" + phase);
+    };
+
     // completion log: prefill/decode tok/s, output tokens, expert hit-rate
     // delta since this request's prefill (c0 snapshot taken at prefill start).
-    auto log_done = [&rt](int n_prompt, int n_cached, int gen,
+    auto log_done = [&rt, &save_routing](int n_prompt, int n_cached, int gen,
                           double prefill_ms, double gen_ms, Runtime::CacheStats c0) {
         std::string hit;
         if (rt->has_expert_cache()) {
@@ -1138,6 +1195,7 @@ int main(int argc, char ** argv) {
                           (unsigned long long) h, (unsigned long long) tot);
             hit = b;
         }
+        save_routing(n_prompt, "decode");
         const int pf = n_prompt - n_cached;
         fprintf(stderr, "[%s] done: prefill %.0f tok/s (%d tok), gen %.1f tok/s (%d tok)%s\n",
                 clock_hms().c_str(),
@@ -1304,9 +1362,10 @@ int main(int argc, char ** argv) {
         // ---- parse messages (text / images / tool calls) and build the prompt ----
         std::vector<std::vector<uint8_t>> images;
         std::vector<ChatMessage> messages;
-        std::map<std::string, int> pkind;   // "tool\x1fparam" -> 1 if schema type "string"
+        QwenToolSchemas tool_schemas;   // declared functions and their parameter schemas
         ChatPromptOptions copts;
         copts.reasoning = reasoning;
+        copts.qwen38_template = model->hparams().arch == Arch::QWEN4EXP;
         // keep past <think> blocks so the re-rendered history tokenizes
         // identically to what was generated -> the prompt prefix cache hits
         copts.preserve_thinking = true;
@@ -1315,22 +1374,24 @@ int main(int argc, char ** argv) {
         std::vector<Runtime::EmbdOverride> ovr;
         try {
             messages = parse_messages(body, images);
+            const json template_kwargs = body.value("chat_template_kwargs", json::object());
+            if (!template_kwargs.is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
+            copts.preserve_thinking = template_kwargs.value("preserve_thinking", true);
+            copts.reasoning = template_kwargs.value("enable_thinking", reasoning);
+            reasoning = copts.reasoning;
+            copts.reasoning_effort = template_kwargs.value("reasoning_effort",
+                body.value("reasoning_effort", std::string("xhigh")));
+            // Open Agents' public high effort maps to this model's xhigh.
+            if (copts.reasoning_effort == "high") copts.reasoning_effort = "xhigh";
             const bool tools_off = body.contains("tool_choice") && body["tool_choice"].is_string()
                 && body["tool_choice"].get<std::string>() == "none";
             if (!tools_off && body.contains("tools") && body["tools"].is_array()) {
                 for (auto & t : body["tools"]) {
                     copts.tools_json.push_back(t.dump());
-                    // record schema-declared string parameters for the output parser
                     if (!t.contains("function") || !t["function"].is_object()) continue;
                     const auto & fn = t["function"];
-                    const std::string fname = fn.value("name", "");
-                    if (!fn.contains("parameters") || !fn["parameters"].is_object()) continue;
-                    const auto & params = fn["parameters"];
-                    if (!params.contains("properties") || !params["properties"].is_object()) continue;
-                    for (auto & kv : params["properties"].items()) {
-                        const std::string ty = kv.value().is_object() ? kv.value().value("type", "") : "";
-                        pkind[fname + '\x1f' + kv.key()] = ty == "string" ? 1 : 0;
-                    }
+                    const std::string name = fn.value("name", "");
+                    if (!name.empty()) tool_schemas[name] = fn.value("parameters", json::object());
                 }
             }
             if (!images.empty()) {
@@ -1410,7 +1471,8 @@ int main(int argc, char ** argv) {
                 bool role_sent = false;           // first delta carries role:"assistant"
                 std::string hold;                 // marker holdback buffer
                 std::string pend_r;               // UTF-8 holdback (reasoning channel)
-                std::map<std::string, int> pkind; // tool-arg schema types (see parse_tool_calls)
+                QwenToolSchemas tool_schemas;
+                bool initial_reasoning = false;
                 std::shared_ptr<Prog> prog = std::make_shared<Prog>();   // prefill progress
                 lclk::time_point t_recv;          // arrival (for the queued 0% marker)
                 std::string hb;                   // heartbeat: empty-delta chunk (see below)
@@ -1436,6 +1498,7 @@ int main(int argc, char ** argv) {
                 bool started = false, finished = false;
                 clk::time_point t0, t_prefill, t_first;
                 clk::time_point gen_log;          // last long-output progress line
+                clk::time_point last_output = clk::now(); // also bound silence while buffering tool arguments
                 State(const SamplerConfig & sc) : smp(sc) {}
                 ~State() { if (holding && tl) tl->unlock(); }   // client disconnect mid-slice
             };
@@ -1448,7 +1511,8 @@ int main(int argc, char ** argv) {
             st->vembs = vembs;
             st->ovr   = std::move(ovr);
             st->spans = std::move(spans);
-            st->pkind = std::move(pkind);
+            st->tool_schemas = std::move(tool_schemas);
+            st->initial_reasoning = reasoning;
             st->gen_begin = cp.gen_prompt_begin;
             st->t_recv = t_recv;
             // Heartbeat sent while queued / between prefill chunks so client
@@ -1492,7 +1556,20 @@ int main(int argc, char ** argv) {
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
-                        parse_tool_calls(st->text, calls, &st->pkind, cfmt.lfm2);
+                        std::string parse_error, ignored_reasoning;
+                        const std::string tool_text = st->initial_reasoning
+                            ? split_reasoning(st->text, ignored_reasoning) : st->text;
+                        parse_tool_calls(tool_text, calls, st->tool_schemas, cfmt.lfm2, &parse_error);
+                        if (!parse_error.empty()) {
+                            fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
+                            const json error = {{"error", {{"message", "Invalid model tool call: " + parse_error},
+                                {"type", "invalid_tool_call"}, {"code", "invalid_tool_call"}}}};
+                            const std::string event = "data: " + dumpj(error) + "\n\ndata: [DONE]\n\n";
+                            sink.write(event.data(), event.size());
+                            st->finished = true;
+                            sink.done();
+                            return false;
+                        }
                         if (getenv("QWEN_LOG_RESPONSE")) {
                             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                                     st->text.c_str(), calls.size());
@@ -1641,7 +1718,15 @@ int main(int argc, char ** argv) {
                         };
                         if (!rout.empty())  add_chunk("reasoning_content", rout);
                         if (!cout_.empty()) add_chunk("content", cout_);
-                        if (ev.empty()) return true;               // nothing complete to send yet
+                        if (ev.empty()) {
+                            // A long tool argument is withheld until its closing
+                            // tags are validated. Keep the connection alive while
+                            // generating it, just as during queueing/prefill.
+                            if (!hb_on || clk::now() - st->last_output < std::chrono::seconds(10))
+                                return true;
+                            ev = st->hb;
+                        }
+                        st->last_output = clk::now();
                         return sink.write(ev.data(), ev.size());
                     };
                     try {
@@ -1877,6 +1962,7 @@ int main(int argc, char ** argv) {
                         }
                         if (!st->pf_done) {
                             st->pf_done = true;
+                            save_routing(st->prompt_tokens, "prefill");
                             st->t_prefill = clk::now();
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
@@ -1989,9 +2075,17 @@ int main(int argc, char ** argv) {
         log_done(n_prompt_full, n_cached, generated, prefill_ms, gen_ms, cstat0);
         // split reasoning off, then parse tool calls out of the content
         std::string think;
-        const std::string rest = split_reasoning(text, think);
+        const std::string rest = reasoning ? split_reasoning(text, think) : text;
         std::vector<ParsedToolCall> calls;
-        const std::string content = parse_tool_calls(rest, calls, &pkind, cfmt.lfm2);
+        std::string parse_error;
+        const std::string content = parse_tool_calls(rest, calls, tool_schemas, cfmt.lfm2, &parse_error);
+        if (!parse_error.empty()) {
+            fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
+            res.status = 502;
+            res.set_content(dumpj(json{{"error", {{"message", "Invalid model tool call: " + parse_error},
+                {"type", "invalid_tool_call"}, {"code", "invalid_tool_call"}}}}), "application/json");
+            return;
+        }
         if (getenv("QWEN_LOG_RESPONSE")) {
             fprintf(stderr, "=== raw response ===\n%s\n=== parsed %zu tool call(s) ===\n",
                     text.c_str(), calls.size());

@@ -311,6 +311,10 @@ public:
     // Use Q8_0 instead of F16 for the get_rows embedding fallback (saves ~45% VRAM
     // vs F16, but introduces additional quantization error). Set before load_weights_*.
     void set_embd_q8(bool v) { embd_q8_ = v; }
+    // Experimental complete-block worker: preserve original tensor metadata
+    // and layer numbering, but allocate/read only this window in SSD mode.
+    void set_layer_window(int first, int last) { window_first_ = first; window_last_ = last; }
+    bool selected_weight(const std::string & name) const;
 
     std::string summary() const;
     std::string debug_dump() const;
@@ -318,6 +322,7 @@ public:
 private:
     Model() = default;
 
+    int window_first_ = -1, window_last_ = -1;
     HParams hp_;
     Vocab   vocab_;
     bool    keep_nextn_resident_ = false;  // keep MTP nextn experts in VRAM (set by Runtime)

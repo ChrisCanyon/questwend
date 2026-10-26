@@ -9,6 +9,9 @@
 #include "sampler.h"
 #include "chat.h"
 #include "qwen_tool_calls.h"
+#ifdef QW_UPSTREAM_CHAT
+#include "questwend_bridge.h"
+#endif
 #include "vision.h"
 #include "args.h"
 
@@ -759,8 +762,20 @@ int main(int argc, char ** argv) {
     }();
     const int32_t eos    = model->vocab().eos_id;
     const int32_t im_end = tok->token_to_id("<|im_end|>");
+#ifdef QW_UPSTREAM_CHAT
+    auto upstream_chat = std::make_shared<open_agents::ChatBridge>(model_path);
+    fprintf(stderr, "chat: pinned upstream adapter, strict completion enabled\n");
+#endif
     const ChatFormat cfmt = chat_format(*tok);   // Qwen XML or lfm2 call-list markup
-    auto is_stop = [&](int32_t t){ return t == eos || (im_end >= 0 && t == im_end); };
+    auto is_stop = [&](int32_t t){
+#ifdef QW_UPSTREAM_CHAT
+        for (const auto & token : upstream_chat->capabilities.at("eog_tokens"))
+            if (token.get<int32_t>()==t) return true;
+        return false;
+#else
+        return t == eos || (im_end >= 0 && t == im_end);
+#endif
+    };
 
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
     uint64_t live_owner = 0;   // request id owning the live state (0 = none); guarded by tlock
@@ -1322,7 +1337,14 @@ int main(int argc, char ** argv) {
         res.set_content(html, "text/html; charset=utf-8");
     });
 
-    srv.Get("/health", [](const httplib::Request &, httplib::Response & res) {
+    srv.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+#ifdef QW_UPSTREAM_CHAT
+        if (!upstream_chat->available()) {
+            res.status=503;
+            res.set_content(json{{"status","error"},{"error","Upstream chat helper unavailable; reload model runtime"}}.dump(),"application/json");
+            return;
+        }
+#endif
         res.set_content(json{{"status", "ok"}}.dump(), "application/json");
     });
 
@@ -1370,6 +1392,9 @@ int main(int argc, char ** argv) {
         // identically to what was generated -> the prompt prefix cache hits
         copts.preserve_thinking = true;
         ChatPrompt cp;
+#ifdef QW_UPSTREAM_CHAT
+        std::shared_ptr<open_agents::ChatTurn> chat_turn;
+#endif
         auto vembs = std::make_shared<std::vector<std::vector<float>>>();
         std::vector<Runtime::EmbdOverride> ovr;
         try {
@@ -1399,7 +1424,19 @@ int main(int argc, char ** argv) {
                 copts.n_image_tokens = venc->n_image_tokens();
                 copts.add_vision_id  = images.size() > 1;
             }
+#ifdef QW_UPSTREAM_CHAT
+            if (!images.empty()) throw std::runtime_error("Image input is not qualified for this upstream chat adapter build");
+            json chat_request = body;
+            chat_request["enable_thinking"] = reasoning;
+            chat_request["chat_template_kwargs"]["enable_thinking"] = reasoning;
+            chat_request["chat_template_kwargs"]["preserve_thinking"] = copts.preserve_thinking;
+            chat_request["chat_template_kwargs"]["reasoning_effort"] = copts.reasoning_effort;
+            chat_turn = std::make_shared<open_agents::ChatTurn>(*upstream_chat, chat_request);
+            cp.ids = chat_turn->prepared.at("tokens").get<std::vector<int32_t>>();
+            cp.gen_prompt_begin = chat_turn->prepared.at("gen_prompt_begin").get<int>();
+#else
             cp = build_qwen_prompt(*tok, messages, copts);
+#endif
             if (getenv("QWEN_LOG_RESPONSE"))
                 fprintf(stderr, "=== rendered prompt (%zu tok) ===\n%s\n",
                         cp.ids.size(), tok->decode(cp.ids).c_str());
@@ -1411,7 +1448,11 @@ int main(int argc, char ** argv) {
             for (const auto & sp : cp.image_spans)
                 ovr.push_back({ sp.first, sp.count, (*vembs)[sp.image_index].data() });
         } catch (const std::exception & e) {
+#ifdef QW_UPSTREAM_CHAT
+            res.status = upstream_chat->available() ? 400 : 503;
+#else
             res.status = 400;
+#endif
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
             return;
         }
@@ -1458,6 +1499,11 @@ int main(int argc, char ** argv) {
                 bool holding = false;             // we own the runtime lock
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
+#ifdef QW_UPSTREAM_CHAT
+                std::shared_ptr<open_agents::ChatTurn> chat_turn;
+                std::string upstream_pending;
+                std::string generation_error;
+#endif
                 std::string text;   // accumulated output (for tool-call parsing)
                 std::string utf8_pend;            // incomplete UTF-8 tail held between chunks
                 // output routing: reasoning -> reasoning_content deltas until
@@ -1513,6 +1559,9 @@ int main(int argc, char ** argv) {
             st->spans = std::move(spans);
             st->tool_schemas = std::move(tool_schemas);
             st->initial_reasoning = reasoning;
+#ifdef QW_UPSTREAM_CHAT
+            st->chat_turn = chat_turn;
+#endif
             st->gen_begin = cp.gen_prompt_begin;
             st->t_recv = t_recv;
             // Heartbeat sent while queued / between prefill chunks so client
@@ -1557,9 +1606,29 @@ int main(int argc, char ** argv) {
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
                         std::string parse_error, ignored_reasoning;
+#ifdef QW_UPSTREAM_CHAT
+                        json final_delta=json::object();
+#endif
                         const std::string tool_text = st->initial_reasoning
                             ? split_reasoning(st->text, ignored_reasoning) : st->text;
+#ifdef QW_UPSTREAM_CHAT
+                        try {
+                            if (!st->generation_error.empty()) throw std::runtime_error(st->generation_error);
+                            const bool length = st->generated >= st->max_tokens || st->prompt_tokens + st->generated + 1 >= n_ctx;
+                            const auto parsed = st->chat_turn->finish(st->upstream_pending, length ? "length" : "stop");
+                            for (const char * key : {"content","reasoning_content"}) {
+                                const auto before=st->chat_turn->previous.value(key,std::string());
+                                const auto after=parsed.value(key,std::string());
+                                if (after.compare(0,before.size(),before)!=0)
+                                    throw std::runtime_error("Final upstream parse rewrote streamed text");
+                                if (after.size()>before.size()) final_delta[key]=after.substr(before.size());
+                            }
+                            for (const auto & call : parsed.value("tool_calls", json::array()))
+                                calls.push_back({call.at("function").at("name"), call.at("function").at("arguments")});
+                        } catch (const std::exception & error) { parse_error=error.what(); }
+#else
                         parse_tool_calls(tool_text, calls, st->tool_schemas, cfmt.lfm2, &parse_error);
+#endif
                         if (!parse_error.empty()) {
                             fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
                             const json error = {{"error", {{"message", "Invalid model tool call: " + parse_error},
@@ -1577,6 +1646,14 @@ int main(int argc, char ** argv) {
                                 fprintf(stderr, "  %s args=%s\n", c.name.c_str(), c.arguments.c_str());
                         }
                         std::string ev;
+#ifdef QW_UPSTREAM_CHAT
+                        if (!final_delta.empty()) {
+                            if (!st->role_sent) { final_delta["role"]="assistant"; st->role_sent=true; }
+                            json chunk={{"id",id},{"object","chat.completion.chunk"},{"created",created},
+                                {"model",model_id},{"choices",json::array({{{"index",0},{"delta",final_delta},{"finish_reason",nullptr}}})}};
+                            ev+="data: "+dumpj(chunk)+"\n\n";
+                        }
+#endif
                         // flush withheld text: a partial marker that never completed,
                         // or withheld tool XML that turned out to be unparseable
                         // (parsed tool XML stays out of the content stream)
@@ -1603,7 +1680,7 @@ int main(int argc, char ** argv) {
                         // parsed) -> clients retry/extend instead of treating a
                         // partial reply as complete.
                         const bool truncated = calls.empty() &&
-                            (st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx);
+                            (st->generated >= st->max_tokens || st->prompt_tokens + st->generated + 1 >= n_ctx);
                         const char * fr = truncated ? "length" : "stop";
                         if (!calls.empty()) {
                             json tcs = json::array();
@@ -1646,6 +1723,23 @@ int main(int argc, char ** argv) {
                         }
                         const std::string piece = tok->decode(t);
                         st->text += piece;
+#ifdef QW_UPSTREAM_CHAT
+                        const auto complete = utf8_clip(st->upstream_pending, piece);
+                        const auto delta = complete.empty() ? json::object() : st->chat_turn->feed(complete);
+                        std::string ev;
+                        if (!delta.empty()) {
+                            json routed=delta;
+                            if (!st->role_sent) { routed["role"]="assistant"; st->role_sent=true; }
+                            json chunk={{"id",id},{"object","chat.completion.chunk"},{"created",created},
+                                {"model",model_id},{"choices",json::array({{{"index",0},{"delta",routed},{"finish_reason",nullptr}}})}};
+                            ev="data: "+dumpj(chunk)+"\n\n";
+                        } else {
+                            if (!hb_on || clk::now()-st->last_output<std::chrono::seconds(10)) return true;
+                            ev=st->hb;
+                        }
+                        st->last_output=clk::now();
+                        return sink.write(ev.data(),ev.size());
+#else
                         st->hold += piece;
                         // phase filter: reasoning goes out as reasoning_content
                         // deltas, </think> switches to content, and everything
@@ -1728,6 +1822,7 @@ int main(int argc, char ** argv) {
                         }
                         st->last_output = clk::now();
                         return sink.write(ev.data(), ev.size());
+#endif
                     };
                     try {
                         const bool was_holding = st->holding;
@@ -1985,6 +2080,9 @@ int main(int argc, char ** argv) {
                         return true;
                     } catch (const std::exception & e) {
                         fprintf(stderr, "stream error: %s\n", e.what());
+#ifdef QW_UPSTREAM_CHAT
+                        st->generation_error=e.what();
+#endif
                         if (st->holding) { rt->reset(); live_owner = 0; }   // state unknown
                         return finish();
                     }
@@ -2064,6 +2162,12 @@ int main(int argc, char ** argv) {
             t_end = clk::now();
         } catch (const std::exception & e) {
             fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
+#ifdef QW_UPSTREAM_CHAT
+            rt->reset();
+            res.status=502;
+            res.set_content(dumpj(json{{"error",{{"message",e.what()},{"type","model_generation_error"}}}}),"application/json");
+            return;
+#endif
             rt->reset();   // state unknown: invalidate the prefix cache
             if (t_end == clk::time_point{}) t_end = clk::now();
         }
@@ -2078,7 +2182,19 @@ int main(int argc, char ** argv) {
         const std::string rest = reasoning ? split_reasoning(text, think) : text;
         std::vector<ParsedToolCall> calls;
         std::string parse_error;
-        const std::string content = parse_tool_calls(rest, calls, tool_schemas, cfmt.lfm2, &parse_error);
+        std::string content;
+#ifdef QW_UPSTREAM_CHAT
+        try {
+            const bool length = generated >= max_tokens || n_prompt_full + generated + 1 >= n_ctx;
+            const auto parsed = chat_turn->finish(text, length ? "length" : "stop");
+            think=parsed.value("reasoning_content",std::string());
+            content=parsed.value("content",std::string());
+            for (const auto & call : parsed.value("tool_calls", json::array()))
+                calls.push_back({call.at("function").at("name"),call.at("function").at("arguments")});
+        } catch (const std::exception & error) { parse_error=error.what(); }
+#else
+        content = parse_tool_calls(rest, calls, tool_schemas, cfmt.lfm2, &parse_error);
+#endif
         if (!parse_error.empty()) {
             fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
             res.status = 502;
@@ -2104,7 +2220,7 @@ int main(int argc, char ** argv) {
             msg["tool_calls"] = tcs;
         }
         const bool truncated = calls.empty() &&
-            (generated >= max_tokens || rt->n_past() + 1 >= n_ctx);
+            (generated >= max_tokens || n_prompt_full + generated + 1 >= n_ctx);
         const char * fr = !calls.empty() ? "tool_calls" : (truncated ? "length" : "stop");
         json resp = {
             {"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", model_id},

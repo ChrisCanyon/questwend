@@ -96,6 +96,13 @@ target_include_directories(qw-server PRIVATE
     third_party/nlohmann
 )
 target_link_libraries(qw-server PRIVATE questwend_core)
+# The helper is a separate process: never link two ggml ABIs into the server.
+set(QW_CHAT_ADAPTER_DIR "" CACHE PATH "Optional external upstream chat adapter directory")
+if(QW_CHAT_ADAPTER_DIR)
+    target_include_directories(qw-server PRIVATE "${QW_CHAT_ADAPTER_DIR}")
+    target_compile_definitions(qw-server PRIVATE QW_UPSTREAM_CHAT=1)
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(qw-server PRIVATE Threads::Threads)
 if(WIN32)

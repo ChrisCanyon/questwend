@@ -51,11 +51,6 @@ struct GpuPlan {
 enum class ExpertTier { Ssd, Ram, Auto };
 
 struct RuntimeConfig {
-    // Experimental worker range. Both negative preserves ordinary inference.
-    // The complete residual (including hyperstreams) crosses this boundary.
-    bool   block_cpu_experts = false; // explicit worker CPU-miss choice; no automatic calibration
-    int    block_first    = -1;
-    int    block_last     = -1;     // exclusive, original model layer numbering
     std::string kv_cache_type = "f16"; // f16 or q8_0 attention K/V; QSA index remains F32
     int    n_ctx          = 4096;
     int    n_threads      = 0;       // 0 = auto
@@ -68,7 +63,6 @@ struct RuntimeConfig {
     // Multi-GPU plan. Empty = use the first GPU device only (single-GPU
     // behavior, with vram_budget_mb as its budget).
     std::vector<GpuPlan> gpus;
-    std::vector<std::string> rpc_endpoints; // experimental remote backend registration
     std::string cache_profile;       // file to persist/prefetch the hot-expert profile
     bool   cache_profile_save = true; // false: load/prefetch only, never overwrite the profile
     ExpertTier expert_tier = ExpertTier::Auto;  // tier used when the experts must leave VRAM
@@ -137,35 +131,10 @@ public:
     Runtime(Model & model, const RuntimeConfig & cfg);
     ~Runtime();
 
-    #include "speculation_api.h.inc"
-    #include "qsa_capture_api.h.inc"
-    #include "grouped_experts_api.h.inc"
 
     // Run a forward pass over `tokens` placed at the current position, advancing
     // the KV cache. Returns the logits (size n_vocab) for the LAST token.
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
-
-    struct BlockFrame {
-        int first = 0, last = 0, token = 0, position = 0, rope_position = 0;
-        std::vector<float> hidden, ple, output;
-        double elapsed_ms = 0;
-    };
-    // Capture uses the ordinary exact GPU path, breaking fusion only at its
-    // two boundaries. The observer runs after timing and must not mutate state.
-    void capture_block(int first, int last, std::function<void(const BlockFrame &)> observer);
-    // Worker-local KV/recurrent/PLE state advances once per call. Calls must be
-    // sequential from position zero. No embedding, head, or token sampling runs.
-    const std::vector<float> & block_step(const BlockFrame & frame);
-    // One setup snapshot after batched prefill; includes owned KV/GDN/QSA/PLE
-    // state and token/ngram lineage, unlike the older general state stream.
-    void save_block_state(int first, int last,
-        const std::function<void(const void *, size_t)> & sink) const;
-    void load_block_state(const std::function<void(void *, size_t)> & source);
-    // Experimental single-stream relay. Establish after ordinary prefill and
-    // matching worker-state import. Removing it requires a reset/refill because
-    // the primary's skipped layers no longer advance their own inference state.
-    void execute_remote_block(int first, int last,
-        std::function<std::vector<float>(const BlockFrame &)> executor);
 
     // Vision: override the token embeddings of a span of the NEXT batched
     // decode() call (e.g. the <|image_pad|> run) with precomputed embeddings.
@@ -248,19 +217,9 @@ public:
     // bookkeeping. Opaque format: feed load_state exactly the bytes produced
     // by save_state on the same model + n_ctx (validated by a header; throws
     // std::runtime_error on mismatch or truncation).
-    // Diagnostic only: bounded raw words from an initialized FP16 K/V prefix.
-    struct ProbeKvWindow {
-        int layer = -1, position = 0, saved_rows = 0;
-        std::string role, tensor_name;
-        uint64_t offset_bytes = 0, prefix_bytes = 0, tensor_bytes = 0;
-        std::vector<int64_t> shape;
-        std::vector<uint64_t> strides_bytes;
-        std::vector<uint16_t> words;
-        size_t backends_synchronized = 0;
-        bool all_owned_backends_synchronized = false;
-    };
-    ProbeKvWindow probe_kv_window(int layer, const std::string & role,
-                                 uint64_t offset_bytes, uint64_t bytes) const;
+    // Complete prompt slots also retain PLE, n-gram history, QSA keys and logits.
+    void save_complete_state(const std::function<void(const void *, size_t)> & sink) const;
+    void load_complete_state(const std::function<void(void *, size_t)> & source);
 
     size_t state_bytes() const;   // size save_state() will produce right now
     void save_state(const std::function<void(const void *, size_t)> & sink) const;

@@ -1,469 +1,88 @@
-# QuestWend
+# QuestWend production core for Open Agents
 
-*English | [日本語](README.ja.md)*
+This personal fork contains the measured single-machine cache/runtime extensions
+used by Open Agents. QuestWend supplies the inference engine and SSD expert
+streaming; llama.cpp supplies chat templates, prompt tokenization and response
+parsing. This branch is a focused production candidate, not an upstream release.
 
-A from-scratch inference engine for Qwen3 / Qwen3.5 / Qwen3.6, built on vendored ggml.
+## Source boundaries
 
-- **Architectures**: `qwen3` (dense), `qwen3moe` (MoE), `qwen35` / `qwen35moe` (Gated DeltaNet hybrid), `qwen3next`, `qwen4exp` (Qwen3.8-Flash-Next: hyper-connections + QSA + a PLE n-gram embedding), `lfm2` / `lfm2moe` (LiquidAI LFM2 / LFM2.5: short-convolution + GQA hybrid; the model always reasons, so `--reasoning off` has no effect on it)
-- **Backends**: CUDA (Windows/Linux), Metal (macOS), HIP/ROCm (AMD, untested), CPU fallback
-- **Features**:
-  - MoE expert offloading (**RAM tier** / **SSD tier**) with a dynamic VRAM expert cache
-    → runs models like 35B-A3B MoE on a 16GB GPU
-  - Persistent hot-expert residency profiles (`--cache-profile`) for fast warm starts
-  - CPU/GPU split decode on the RAM tier: experts missing from the VRAM cache are computed on the CPU instead of fetched over PCIe, tuned automatically on the first decode tokens per GPU/CPU/model and remembered (`QWEN_CPU_MISS=0/1` forces it, `QWEN_TUNE=redo` re-tunes)
-  - MTP (Multi-Token Prediction / nextn) self-speculative decoding (`--mtp`, `--draft N`)
-  - **Image input** (Qwen3-VL family + mmproj GGUF; the vision tower runs on ggml/GPU. CLI `--image`, server takes OpenAI-style `image_url`)
-  - **Tool calling** (OpenAI-compatible: `tools` / `tool_calls` / `role:"tool"`, with two-way conversion of Qwen3.6's `<function=...>` form)
-  - Sharded GGUF support (`-NNNNN-of-MMMMM.gguf`)
-  - K-quant embeddings on large-vocab models are converted to F16 in VRAM only when the backend's `get_rows` does not support the type (CUDA only; Metal/CPU support them natively so no copy is made. `--embd-q8` gives Q8_0 instead)
-  - OpenAI-compatible server (`qw-server`) with a browser chat UI
+| Directory | Responsibility |
+| --- | --- |
+| `core/` | Model execution, GPU/RAM/SSD caches, CPU overlap, MTP, KV and prompt state |
+| `server/` | HTTP/SSE transport and the upstream chat process bridge |
+| `tests/` | Independent correctness fixtures and explicit diagnostic tools |
+| `cmake/` | Optional tests, diagnostics and matching-backend SDK support |
+| `third_party/ggml/` | Backend plus the separately measured kernel changes |
 
----
+Private RPC, remote block execution, external draft experiments, QSA capture
+hooks and their obsolete probes are deleted from this branch. Git history and
+the previous personal review branch retain them; there is no second legacy tree.
+The private RPC backend changes were reverted to the original upstream files.
 
-## 1. Requirements
+The duplicated Jinja/chat renderer, prompt BPE implementation and hand-written
+tool parsers are deleted. The production server requires Open Agents' pinned
+`integrations/llama-chat` adapter. `TokenPieces` is only a small decoder from
+existing token IDs to their original bytes; it performs no prompt encoding or
+model-format parsing. UTF-8 stream buffering remains in the transport.
 
-| | Windows (CUDA) | macOS (Metal) | CPU only |
-|---|---|---|---|
-| Compiler | Visual Studio 2022 (C++) | Xcode Command Line Tools | any C++17 |
-| CMake | 3.20+ (the one bundled with VS works) | 3.20+ (`brew install cmake`) | 3.20+ |
-| Other | CUDA Toolkit 12.x | — | — |
+Prompt-state serialization is in `core/runtime_state.cpp.inc`, included after
+the private Runtime implementation. Complete snapshots retain PLE convolution,
+n-gram history, QSA keys and logits. Their existing payload format is preserved.
+Trained MTP is retained; removing unrelated external drafts does not disable it.
 
-The repository vendors ggml and is self-contained (`third_party/ggml`); no submodule checkout is needed.
-The upstream commit it was vendored from is recorded in `third_party/ggml/GGML_VERSION`, and the
-qwencpp-specific patches applied on top live in [`patches/`](patches/README.md), together with the
-re-vendoring procedure and its pitfalls.
+## Build
 
----
-
-## 2. Build
-
-`CMAKE_BUILD_TYPE` does not need to be passed: the project forces `Release` when it is
-unset. (Visual Studio is multi-config, so there you pick the config at build time with
-`--config Release`.)
-
-### Windows (CUDA)
+The native process bridge is currently qualified on Windows. Build the pinned
+helper in Open Agents first, then configure this source with its adapter path:
 
 ```powershell
-# configure (enable the CUDA backend)
-cmake -B build -DQW_CUDA=ON
-
-# build (Release)
-cmake --build build --config Release --target qw-cli qw-server
+python C:/workspace/open-agents/integrations/llama-chat/build.py --source path/to/llama.cpp
+cmake -S . -B build -DQW_CUDA=ON -DQW_CHAT_ADAPTER_DIR=C:/workspace/open-agents/integrations/llama-chat
+cmake --build build --config Release --target qw-server
 ```
 
-- Outputs: `build\Release\qw-cli.exe`, `build\Release\qw-server.exe`. The ggml DLLs are built into
-  `build\bin\Release\` and copied next to the executables after linking, so run the exe in place.
-- The CUDA architecture is detected natively (e.g. RTX 4060 Ti = sm_89, RTX 3050 = sm_86).
-- CMake configures `CUDA graphs ON`, `Flash Attention ON`.
-- Using the cmake bundled with VS:
-  `"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"`
+Package `open-agents-llama-chat.exe` beside `qw-server.exe`, with the required
+matching ggml/CUDA DLLs and dependency licenses. Open Agents records the source
+commit, build options and binary hashes. Do not package RPC or diagnostic binaries.
 
-### macOS (Metal)
+`BUILD_TESTING` and `QW_BUILD_DIAGNOSTICS` default to OFF. Production builds contain
+only the server and required libraries. To build and run regression fixtures:
 
-```bash
-cmake -B build -DQW_METAL=ON
-cmake --build build -j --target qw-cli qw-server
+```powershell
+cmake -S . -B build-tests -DBUILD_TESTING=ON -DQW_CHAT_ADAPTER_DIR=C:/workspace/open-agents/integrations/llama-chat
+cmake --build build-tests --config Release
+ctest --test-dir build-tests -C Release --output-on-failure
 ```
 
-- Outputs: `build/qw-cli`, `build/qw-server`.
-- Metal is active if startup prints `backend: GPU [MTL0] ...`.
-
-### AMD (HIP / ROCm)
-
-```bash
-cmake -B build -DQW_HIP=ON
-cmake --build build -j --target qw-cli qw-server
-```
-
-- The GPU architecture is normally detected for you. Pass `-DGPU_TARGETS=gfx1100` only when the
-  detection misses, when building for a machine with a different GPU, or when you want several
-  architectures in one binary (`rocminfo | grep gfx` prints yours; RX 7900 series = `gfx1100`,
-  MI300 = `gfx942`). The older `AMDGPU_TARGETS` spelling also works.
-- HIP graphs are on by default in ggml (`GGML_HIP_GRAPHS`), so unlike CUDA there is nothing to pass.
-- To avoid installing ROCm, use the Vulkan backend below instead.
-- **Untested**: backend selection is generic (it takes the first GPU device ggml reports, discrete
-  before integrated), so it should work with no code changes, but the expert-offload paths have only
-  been exercised on CUDA and Metal.
-  Reports welcome.
-
-### Vulkan (AMD / Intel / integrated GPUs)
-
-```bash
-cmake -B build -DQW_VULKAN=ON
-cmake --build build -j --target qw-cli qw-server
-```
-
-- Vendor-neutral: AMD, Intel and NVIDIA all work through the same backend. This is the practical
-  way to use a Ryzen APU or an Intel integrated GPU, since it needs neither ROCm nor oneAPI.
-- Requires the [Vulkan SDK](https://vulkan.lunarg.com/) -- ggml compiles its compute shaders with
-  the `glslc` that ships with it, so a runtime-only driver install is not enough.
-- An integrated GPU is reported as an IGPU device and picked up automatically; a discrete GPU in the
-  same machine wins over it. Startup prints `backend: GPU [Vulkan0] ...` when it is active.
-- **Untested**, same caveat as HIP above.
-
-### CPU only (any platform)
-
-```bash
-cmake -B build
-cmake --build build -j --target qw-cli
-# pass --cpu at runtime, or build without a GPU backend and it runs on CPU automatically
-```
-
----
-
-## 3. Usage (CLI: `qw-cli`)
-
-```bash
-# one-shot generation
-qw-cli -m model.gguf -p "The capital of France is" -n 128
-
-# chat (wrapped in ChatML)
-qw-cli -m model.gguf --chat -p "Explain photosynthesis." -n 256
-qw-cli -m model.gguf -i                      # interactive mode
-qw-cli -m model.gguf --info                  # print model info and exit
-```
-
-### Main options
-
-| Option | Description |
-|---|---|
-| `-m <path>` | model GGUF (for sharded models, pass the first shard) |
-| `-p <text>` | prompt |
-| `-n <N>` | tokens to generate (default 128) |
-| `-i` | interactive chat |
-| `--chat` | wrap `-p` in ChatML |
-| `--reasoning <on\|off>` | thinking mode (default on; `off` terminates with `<think>\n\n</think>`) |
-| `--n-ctx <N>` | context length (default: the model's trained length; the KV cache is sized from it, so lower it if the allocation does not fit. Going past the trained length warns: there is no RoPE scaling, so positions beyond it are extrapolated and the output degrades) |
-| `--temp <f>` / `--top-p <f>` / `--top-k <N>` / `--seed <N>` | sampling (default greedy: temp=0) |
-| `--embd-q8` | use Q8_0 instead of F16 for the embedding `get_rows` fallback (saves VRAM; slight quantization error) |
-| `--image <path>` | attach an image to the prompt (repeatable; needs a VL model + mmproj) |
-| `--mmproj <gguf>` | vision tower GGUF (defaults to `mmproj-*.gguf` next to the model) |
-| `--vision-test` | encode the image with the vision tower only and print statistics (numerical checks; no LLM) |
-| `--log-tokens-per-sec` | print prefill / generation tok/s |
-| `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
-| `--cpu` | force the CPU backend |
-
-### Expert offloading (large MoE on limited VRAM)
-
-**Automatic by default.** With no options at all the runtime measures what the device has
-free and streams whatever does not fit -- the routed experts -- straight from the GGUF on
-disk. The typical case, a model larger than the machine's memory, needs no flags.
-
-```bash
-# automatic: resident if the weights fit the free VRAM; otherwise the experts go to
-# host RAM when they fit there (CPU/GPU split decode), else they stream from the SSD
-qw-cli -m moe.gguf -p "..." -n 128
-
-# an explicit budget (leave VRAM for other processes, divide it across GPUs, ...)
-qw-cli -m moe.gguf -p "..." -n 128 --vram-budget 12
-
-# force a tier: ram (pinned host RAM) or ssd (stream from the GGUF)
-qw-cli -m moe.gguf -p "..." -n 128 --experts ram
-
-# residency profile: saved on the first run, then hot experts are preloaded at startup
-qw-cli -m moe.gguf -p "..." -n 128 --cache-profile hot.prof
-```
-
-- `--vram-budget <GB>`: VRAM the model may use. **Omit it and the device's free memory is
-  measured instead.** Weights + KV cache + compute headroom that fit inside the budget stay
-  fully resident; only what does not fit moves to the expert tier (the decision is logged
-  at startup).
-  The unit is **GB** and fractions work (`13.5`); an explicit `M`/`G` suffix always wins
-  (`13500M`, `14G`). A bare number of 512 or more is read as MB, so command lines written
-  before the unit changed keep working (with a note pointing at the GB spelling).
-- When the part that cannot be offloaded (resident weights + KV cache) does not fit, the run
-  stops before loading a single weight, naming what it needs, what is available and how much of
-  it is KV at the current `--n-ctx`. If only the budget is exceeded and the device itself has
-  room, it warns instead and says that nothing is left for the expert pool.
-- `--experts <ram|ssd|auto>`: where the routed experts go once they do not fit in VRAM.
-  **`auto` is the default** and rarely needs overriding.
-  - `ram`: a pinned copy in host RAM. Decode then computes the experts missing from the
-    VRAM cache on the CPU instead of fetching them over PCIe (the CPU/GPU split decode,
-    tuned on the first decode tokens per GPU / CPU / model and remembered in
-    `%LOCALAPPDATA%\questwend\tune.tsv` or `~/.cache/questwend/tune.tsv`).
-  - `ssd`: stream the experts from the GGUF on disk. Needs no RAM, so it is the tier that
-    lets a model larger than the machine's memory run at all.
-  - `auto`: `ram` when the offloaded experts fit in the memory the OS reports as available
-    with room to spare (the larger of 4 GB or 10% of physical memory), `ssd` otherwise.
-    If the RAM tier's pinned allocation still fails, it falls back to `ssd`. The choice is
-    logged at startup (`expert tier: auto -> RAM ...`).
-  - Giving more than one value (`--experts ram --experts ssd`, or `ram` together with
-    `auto`) means `auto`, with a warning.
-- `--experts-ram` / `--experts-ssd`: **deprecated** spellings of `--experts ram` /
-  `--experts ssd`. Still accepted, with a warning pointing at the new form.
-- `--ngram <off|disk|ram>`: where qwen4exp keeps its n-gram embedding table (default `disk`).
-  It is 26.8 GB in Qwen3.8-Flash-Next and **never goes on the GPU in any mode**.
-  `off` skips the module entirely -- it is a gated additive branch onto the residual,
-  so the stack still runs. `--ngram-cache <MB>` sizes the host cache for `disk` (default 256).
-- `--cache-profile <file>`: persist the hot-expert frequency profile. **On the same or a similar
-  workload the hit rate reaches ~100%, streaming essentially disappears and throughput jumps.**
-
-Prefill runs **layer-major** by default (each layer fetches its experts once and processes every
-token), which is ~4x faster than the old scheme on the RAM tier and ~8x on the SSD tier. Further
-knobs, all either lossy or behavior-changing (measurements in
-[`prefill_layer_major.md`](prefill_layer_major.md)):
-
-- `--resident-decode`: **run decode as one fused graph with routing restricted to resident experts**.
-  After a short warmup the router is masked to the resident set and never misses again (residency
-  verification, state backup and the fallback path all disappear). Experts the unmasked router
-  actually wanted are refilled in the background every token and join the mask, so the set follows
-  topic drift with a few tokens of lag. Measured: RAM tier 20.8 → 36-45 tok/s, SSD tier 3.1 → 25 tok/s
-  (with true SSD reads). Lossy. See [`docs/resident_decode.md`](docs/resident_decode.md) for the
-  mechanism, how experts get loaded, and the quality characteristics (degradation on domain switches)
-  with mitigations.
-- `--resident-refill <N>`: experts refilled per token (summed over all layers; default 8, `0` freezes
-  the set completely — not recommended).
-- `--resident-warmup <N>`: decode tokens before the mask locks in (default 32).
-- `--prefill-prune <eps>`: during prefill, skip fetching non-resident experts whose summed router
-  weight is below `eps` of the layer total (e.g. `0.05`; especially effective on the SSD tier). Lossy.
-- `--ssd-direct`: bypass the OS page cache for SSD reads (Windows, unbuffered I/O). Use it to measure
-  real performance when the model does not fit in RAM, or to avoid double caching.
-
-### Multiple GPUs
-
-Naming more than one device is what asks for more than one GPU — either with `--gpus`, or by
-giving `--vram-budget` one value per device. Layers are assigned in contiguous ranges, and a
-layer's weights, KV cache and expert pool all live on the same device, so the only traffic
-crossing the bus is the hidden state at a device boundary (a few KB per token).
-
-```bash
-# run a model that does not fit one card: both GPUs, all their free VRAM
-qw-cli -m big.gguf -p "..." --gpus 0,1
-
-# expert offloading with a budget per GPU
-qw-cli -m moe.gguf -p "..." --vram-budget 13.5,5
-
-# GPU1 holds no layers: its whole budget becomes expert pool for GPU0
-qw-cli -m moe.gguf -p "..." --gpus 0,1 --vram-budget 8,5 --gpu-split 1,0
-```
-
-- `--gpus <list>`: device indices, primary first (`1`, or `1,0`). **The order is ggml's, which is
-  CUDA's default "fastest first" — the reverse of `nvidia-smi`'s PCI order**, so `--gpus 0` is
-  usually the faster card. The startup log prints each device's name; check it there.
-- `--vram-budget <list>`: one value per GPU. `auto` gives that device all its free VRAM (what
-  omitting the flag already does); `0` removes the device from the plan entirely, so `--gpus 1,0 --vram-budget 5g,0` is the
-  same as `--gpus 1 --vram-budget 5g`. Omitting the flag is the same as `auto`.
-- `--gpu-split <list>`: each GPU's share of the layers; defaults to the `--vram-budget` ratio, or to
-  free VRAM when no budget is given. Shares are relative, so `0.9,0.1`, `9,1` and `18,2` all mean the
-  same thing, and on a 40-layer model `36,4` gives exactly 36 and 4. A GPU given `0` holds no layers
-  but keeps its budget as **expert pool** for the others, and runs those layers' expert matmuls.
-  `auto` uses every GPU present.
-
-`--gpus` and `--vram-budget` must name the same number of devices, and a device switched off with
-`--vram-budget 0` cannot be given a non-zero `--gpu-split` share; both are errors rather than
-guesses. The same flags work on `qw-server`.
-
-A second GPU is a trade, not a free win. It adds VRAM — which is what matters when residency is the
-bottleneck — but at batch 1 only one device computes at a time, so a slower second card holds the
-faster one up. Measured on an RTX 4060 Ti + RTX 3050 with a 35B-A3B MoE: with a tight budget where
-the expert pool is genuinely binding, two GPUs are **+15%** on decode (16.6 → 19.1 tok/s, misses
-−64%); with a budget where the pool already fits the working set they are **−6%**, and prefill is
-slower in both cases because it is compute-bound. Numbers and analysis in
-[issue #4](https://github.com/kishida/questwend/issues/4).
-
-### MTP self-speculative decoding (models with a nextn block)
-
-```bash
-qw-cli -m model-MTP.gguf -p "..." -n 128 --mtp            # look ahead 1 token
-qw-cli -m model-MTP.gguf -p "..." -n 128 --mtp --draft 2  # look ahead 2 tokens (recommended)
-```
-
-- Output matches plain decoding exactly (greedy lossless).
-- When compute-bound (whole model resident in VRAM), `--draft 2`-`3` gives roughly **+30%** over plain
-  (27B Q2, ctx=2000: 18.2 → 24.2 tok/s). It is a loss when offloading (fetch-bound).
-  Details in [`docs/mtp.md`](docs/mtp.md).
-
----
-
-## 4. Usage (server: `qw-server`)
-
-Provides an OpenAI-compatible `/v1/chat/completions` (with SSE streaming) plus a browser chat UI.
-
-```bash
-qw-server -m model.gguf --host 0.0.0.0 --port 8080 --vram-budget 15
-```
-
-Open `http://<host>:<port>/` for the chat UI (shows TTFT / tok/s / prefill tok/s / output tokens).
-
-| Option | Description |
-|---|---|
-| `-m <path>` | model GGUF |
-| `--host <addr>` | bind address (default `127.0.0.1`; use `0.0.0.0` to expose on the LAN) |
-| `--port <N>` | port (default 8080) |
-| `--n-ctx <N>` | context length |
-| `--vram-budget <GB>` | VRAM the model may use (default: whatever the device has free; GB, fractions ok, `M`/`G` suffix to be explicit) |
-| `--experts <ram\|ssd\|auto>` | where offloaded experts live (default `auto`; `--experts-ram` / `--experts-ssd` are deprecated aliases) |
-| `--gpus <list>` / `--gpu-split <list>` | use several GPUs (see [Multiple GPUs](#multiple-gpus)) |
-| `--cache-profile <file>` | residency profile (**the server only reads it**, never overwrites) |
-| `--reasoning <on\|off>` | default thinking mode (also reflected in the UI checkbox) |
-| `--mtp` | MTP self-speculative decoding (models with a nextn block; enabled at startup) |
-| `--draft <N>` | MTP draft length (default 1) |
-| `--embd-q8` | use Q8_0 for the embedding `get_rows` fallback (saves VRAM) |
-| `--mmproj <gguf>` | vision tower for image input (defaults to `mmproj-*.gguf` next to the model) |
-| `--no-mmproj` | disable image input even if an mmproj file is present |
-| `--cache-slots <N>` | extra prefix-cache slots (default 0; for interleaved conversations) |
-| `--cache-slots-dir <dir>` | store slots on disk instead of RAM (survives a server restart) |
-| `--time-slice <N>` | interleave concurrent streams every N generated tokens (default 64; effective with `--cache-slots`. `0` serializes completely = throughput first) |
-| `--cpu` | force the CPU backend |
-| `--resident-decode` and friends | offload tuning knobs (`--resident-refill/-warmup`, `--prefill-prune`, `--batch-chunk`, `--ssd-direct`; shared with the CLI, see the offloading section above) |
-| `--pf-chunk <N>` | server prefill slice length (disconnect-detection granularity; default 4096) |
-
-> `max_tokens` is optional: when it is omitted (or <= 0) generation runs until the context is
-> exhausted, matching llama.cpp's server — set a budget only when you want one. `finish_reason` is
-> `"length"` when generation was cut by either the budget or the context. OpenAI's newer
-> `max_completion_tokens` spelling is accepted as an alias.
-
-> Images are accepted in OpenAI form (a base64 data URI in `image_url` inside the `content` array).
-> The browser UI has a 📎 button. Image input also works with MTP enabled.
-> Loading an mmproj subtracts the vision tower's GPU usage (weights + compute buffers, logged at
-> startup) from `--vram-budget` automatically, so a budget set to Metal's working-set limit will not
-> OOM. For text-only use, `--no-mmproj` returns that memory to the expert cache.
-> For tool calling, pass `tools` and `<tool_call>` output is converted to OpenAI `tool_calls`
-> (`finish_reason: "tool_calls"`). `role:"tool"` response messages are supported.
-
-> MTP keeps the nextn block resident in VRAM from model load, so it is a **server startup flag**, not a
-> per-request option. Both streaming and non-streaming work. **MTP is greedy-only**: a request's
-> `temperature` / `top_p` / `top_k` are ignored and output is always as if temp=0 (also stated in the
-> startup log). Start without `--mtp` if you need sampling.
-
-> Plain decoding (without `--mtp`) honors a request's `repetition_penalty` (or `repeat_penalty`) /
-> `presence_penalty` / `frequency_penalty` / `repeat_last_n` (window, default 64). Penalties are
-> applied at the logits stage, so **repetition control works even under greedy (temp=0)**. They are
-> ignored under MTP.
-
-> **Prompt prefix cache**: the server keeps the previous request's KV cache / GDN state, and when a new
-> prompt continues the previous "prompt + generation" (an ordinary chat continuation) only the delta
-> tokens are prefilled. However long the conversation grows, each turn's prefill costs only the new
-> input. `timings.cached_tokens` (`N cached` in the UI) shows how much was reused. If retokenization
-> shifts token boundaries, matching falls back to the text level. Images are identified by a byte
-> hash (a different image forces a full prefill). `<think>` blocks in the history are preserved and
-> reconstructed so the cache still matches (`preserve_thinking`). Editing an earlier turn or switching
-> to a different conversation resets fully and automatically.
-
-> **Interleaved conversations** (agents etc.): by default there is only one live state, so alternating
-> between conversations A and B falls back to a full prefill each time. `--cache-slots N` adds
-> eviction slots: on a switch the live state is parked in a slot and restored when that conversation
-> comes back, continuing with only a delta prefill. Slots live in RAM by default (per slot: the GDN
-> state plus KV for the conversation length). `--cache-slots-dir <dir>` moves them to disk, consuming
-> no RAM and **surviving a server restart** (slots whose model / n-ctx changed are discarded by a
-> header check). Passing only `--cache-slots-dir` implies 4 slots.
-
-> **Request logging** (stderr): each request prints a start and a completion line. Start:
-> `[time] req: N tok (+img), KV reuse M (live/slot/none), prefill K (resident)` — tokens accepted,
-> how much the prefix cache reused and from where, and how many tokens will actually be prefilled.
-> Completion: `[time] done: prefill X tok/s, gen Y tok/s (Z tok), expert hit P%` — prefill/decode
-> speed, output tokens, and (when offloading) that request's expert cache hit rate. During long
-> offloaded prefills a `prefill done/total (%)` progress line appears every 10 seconds (resident
-> models finish in one shot, so no progress line).
-
-> **Time slicing**: by default requests are fully serialized (a later request waits for the previous
-> generation to finish). With `--time-slice N`, when concurrent streams compete the runtime is handed
-> over every N tokens so both streams progress (output is unaffected; state is parked and restored
-> exactly through slots). **Prefill is preemptible too**: a long prompt's prefill advances in chunks of
-> `max(N, 256)` tokens and yields at chunk boundaries if someone is waiting (coarser than generation to
-> keep batch efficiency). There is zero overhead when nothing is competing. Switching costs tens of
-> milliseconds depending on state size, so N=10-50 is a reasonable range. Use it together with
-> `--cache-slots` (RAM slots recommended for slicing). It works without slots, but the interrupted side
-> re-prefills its whole context on every resume.
-
----
-
-## 5. Sharded GGUF
-
-For models split as `model-00001-of-00003.gguf`, pass the **first shard** to `-m` and the remaining
-shards are discovered and merged automatically (5-digit zero-padded naming, starting at 00001).
-
-```bash
-qw-cli -m Qwen3.5-122B-A10B-00001-of-00005.gguf -p "..." --vram-budget 40
-```
-
----
-
-## 6. Environment variables (debugging / tuning)
-
-Not normally needed — for profiling, A/B checks and troubleshooting.
-
-### Profiling
-
-| Variable | Effect |
-|---|---|
-| `QWEN_PROF=1` | print the time breakdown of single-token decode (decode_reuse) |
-| `QWEN_PROF_DC=1` | print offloaded decode's wall / GPU compute / host time at exit |
-| `QWEN_PROF_MTP=1` | print MTP's per-cycle phase breakdown (draft / verify / settle / resync) |
-| `QWEN_PROF_MTP2=1` | print compute / readback time per MTP draft (averaged over 100) |
-
-### Behavior switches (A/B, fallbacks)
-
-| Variable | Effect |
-|---|---|
-| `QWEN_NO_FLASH=1` | disable fused flash attention |
-| `QWEN_NO_REUSE=1` | disable persistent graph reuse (CUDA graphs) for single-token decode |
-| `QWEN_NO_DIRECT_FETCH=1` | disable zero-copy SSD reads into unified memory (use the staging path) |
-| `QWEN_SYNC_FETCH=1` | make RAM-tier H2D copies synchronous (to A/B the async DMA) |
-| `QWEN_PREFETCH_THREADS=N` | worker count for parallel SSD reads (default 8, 1-64) |
-| `QWEN_MAX_BUFFER_MB=N` | cap one weight buffer at N MB, forcing the split path on a backend that reports no limit (test aid) |
-| `QWEN_GGML_DEBUG=1` | show all raw ggml logs (by default DEBUG/INFO are dropped and repeated WARNs collapsed) |
-| `QWEN_CACHE_DEBUG=1` | on a server prefix-cache miss, print where it diverged and the tokens |
-
-### Experimental / test
-
-| Variable | Effect |
-|---|---|
-| `QWEN_NO_BATCH_PREFILL=1` | revert SSD-tier prefill to the old token-by-token path (default is batched chunks) |
-| `QWEN_BATCH_CHUNK=N` | offloaded prefill chunk length (default 4096; layer-major makes expert traffic scale with the chunk count) |
-| `QWEN_SEGA_CHUNK=N` | attention sub-chunk length in layer-major prefill (default 256; a smaller T uses the old fused path) |
-| `QWEN_SEGB_SLICE=N` | max tokens per FFN slice in layer-major prefill (default 1024; caps MoE activation memory) |
-| `QWEN_PREFILL_STATS=1` | print per (chunk, layer) expert union / fetch bytes / slice count to stderr |
-| `QWEN_PREFILL_PRUNE=eps` | = `--prefill-prune` (mass-based expert pruning in prefill; lossy) |
-| `QWEN_RESIDENT_DECODE=1` | = `--resident-decode` (resident-only routing decode; lossy) |
-| `QWEN_RESIDENT_MIN=N` | residents per layer required before masking (default 32; layers below it keep warming up) |
-| `QWEN_RESIDENT_WARMUP=N` | = `--resident-warmup` (after this many decode tokens the mask locks in regardless; default 32) |
-| `QWEN_RESIDENT_REFILL=N` | = `--resident-refill` (experts refilled per token while masked, all layers combined; default 8, 0 = frozen) |
-| `QWEN_SSD_DIRECT=1` | = `--ssd-direct` (Windows: unbuffered reads bypassing the page cache) |
-| `QWEN_COALESCE=1` | merge a layer's expert union into large sequential range reads (for drives where sequential beats random QD8) |
-| `QWEN_COAL_DEBUG=1` | print per-run read/upload times for coalesced reads |
-| `QWEN_PF_CHUNK=N` | = `--pf-chunk` (server prefill slice length; default 4096) |
-| `QWEN_PREFILL_CHUNK=N` | chunk length for resident / RAM-tier build_graph prefill (default 512) |
-| `QWEN_CPU_PREFILL=1` | revert RAM-tier prefill to running experts on CPU (scheduler). The old behavior: the GPU idles but H2D transfers are avoided |
-| `QWEN_MTP_NO_BATCH_PREFILL=1` | revert MTP prefill to token-by-token (default is batched; forced batched with image input) |
-| `QWEN_FASTCACHE=1` | optimistic single-graph decode (assumes all experts resident, falls back on a miss; `--resident-decode` without the mask) |
-| `QWEN_GDN_TEST=1` | run the GDN multi-token / token-by-token equivalence check and exit |
-| `QWEN_MTP_TEST=1` | MTP draft acceptance-rate measurement mode (keeps nextn resident even without `--mtp`) |
-| `QWEN_MTP_NOACCEPT=1` | force-reject every MTP draft (output should then match plain; for lossless verification) |
-
----
-
-## 7. Documentation
-
-- [`docs/mtp.md`](docs/mtp.md) — MTP (self-speculative decoding): implementation, evaluation, benchmarks
-- [`docs/resident_decode.md`](docs/resident_decode.md) — resident-only routing decode: mechanism, expert load paths, quality characteristics
-- [`docs/metal_unified_memory.md`](docs/metal_unified_memory.md) — tuning log for running 122B-A10B on a 48GB Mac (Metal / unified memory / zero-copy SSD reads)
-- [`offload_optimize.md`](offload_optimize.md) — measurement log for expert-offload speedups (pinned / async / graph fusion)
-- [`prefill_layer_major.md`](prefill_layer_major.md) — layer-major prefill / expert pruning / resident-only decode: design, measurements, pitfalls (2026-07)
-- [`docs/gpu_performance_guide.md`](docs/gpu_performance_guide.md) — GPU performance notes
-- [`patches/README.md`](patches/README.md) — patches applied to the vendored ggml and how to re-vendor
-
----
-
-## 8. Notes / limitations
-
-- Sampling is off by default (greedy, `temp=0`) for reproducibility.
-- For large vocabularies (e.g. 248k), K-quant embeddings are kept as an F16 conversion in VRAM only
-  when the backend's `get_rows` does not support that type (effectively lossless). CUDA does not
-  support K-quant/IQ there, so the conversion runs; Metal and CPU support them natively so no copy is
-  made at all (saving memory). When VRAM is tight, `--embd-q8` uses Q8_0 instead (about half of F16,
-  with slight quantization error).
-- The offload RAM tier uses pinned host memory. A single `cudaHostAlloc` has an upper limit
-  (environment-dependent, e.g. ~15.5GB), so experts are pinned in several chunks.
-- CUDA graphs and Flash Attention are enabled by default in CUDA builds.
-- `--cache-profile` is overwritten on every CLI run (the server only reads it). Mixing runs with
-  different access patterns (MTP vs plain) pollutes the profile, so copying the best profile to a
-  fixed file is recommended.
-- On unified memory (Apple Silicon), SSD-tier misses are `pread` directly into slot memory
-  (zero copy).
-- The chat template implements logic equivalent to the official Qwen3.6 template directly (no jinja
-  engine). It covers tools, `<think>` splitting, image placeholders and reasoning on/off. Video input
-  is not supported.
-- Prefill is batched (for plain decoding, MTP and SSD offloading alike). MTP prefill captures every
-  token's hidden state in one main forward pass and builds the nextn KV in a batch too, so image +
-  MTP works together.
+`QW_BACKEND_BUILD` is an optional matching-backend SDK for host-only refactor
+comparisons. It is not a substitute for checking a source build. Open Agents
+validates both paths; GPU measurements retain the recorded numerical DLL family.
+Diagnostics require `-DQW_BUILD_DIAGNOSTICS=ON`; they never run during a build.
+The obsolete multi-platform release workflow was removed rather than publishing
+an unqualified bridge on unsupported platforms.
+
+## Serving scope
+
+This candidate serves text and structured tools through the upstream adapter.
+Its unused native CLI, vision encoder and image-only libraries were removed.
+The existing `--no-mmproj` launch argument remains a no-op for profile compatibility;
+image requests and `--mmproj` fail explicitly. Open Agents' consumer CLI and the
+other aliases' llama.cpp vision support are separate and unchanged.
+
+This is a refactor, not a new speed or model-quality claim. Keep the preceding
+runtime available until native, inference, cache and maintained-client checks
+pass. Existing background design documents describe upstream context; this README
+and the actual build options define the production branch's supported surface.
+
+## Attribution
+
+Original engine: [kishida/questwend](https://github.com/kishida/questwend).
+Chat components: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+Local policy ports retain the Caffeine, HybriMoE and MoE-Infinity references and
+licenses in `third_party/`. SSD offload and activation-aware caching are established
+techniques; this project claims measured implementation work, not their invention.
+
+The SDK validation build recompiles upstream ggml registration/loader sources
+without RPC, while retaining the measured CPU/CUDA numerical libraries. The old
+dispatcher cannot be copied because it imports the retired RPC DLL at startup.

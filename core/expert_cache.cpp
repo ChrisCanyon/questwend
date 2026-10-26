@@ -7,7 +7,6 @@
 #include "expert_readiness.h"
 #include "expert_weight_audit.h"
 #include "model.h"
-#include "rpc_weights.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -122,7 +121,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     if (const char * value = getenv("QWEN_EXPERT_RAM_CACHE_MB")) {
         const size_t mib = std::stoull(value);
         if (mib) {
-            if (!ssd_ || std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0)
+            if (!ssd_)
                 throw std::runtime_error("Bounded RAM victim caching currently requires a local SSD-tier GPU");
             cache_min_free_bytes_ = parse_cache_min_free_mb(getenv("QWEN_CACHE_MIN_FREE_MB"));
             host_cache_ = std::make_unique<HostExpertCache>(mib * 1024ull * 1024ull);
@@ -135,7 +134,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     }
 
     weight_audit_ = ExpertWeightAudit::from_environment(n_layer_);
-    if (weight_audit_ && (!ssd_ || std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0))
+    if (weight_audit_ && (!ssd_))
         throw std::runtime_error("Expert byte audit requires local SSD-tier execution");
 
     const char * preserve_decode = getenv("QWEN_PRESERVE_DECODE_CACHE");
@@ -216,8 +215,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             }
         }
         const char * persistent_io = getenv("QWEN_PERSISTENT_EXPERT_IO");
-        if (persistent_io && std::string(persistent_io) != "0" &&
-            std::string(ggml_backend_name(backend_)).rfind("RPC", 0) != 0) {
+        if (persistent_io && std::string(persistent_io) != "0") {
             io_workers_ = std::make_unique<PersistentExpertIO>(prefetch_threads_, expert_io_closers());
             fprintf(stderr, "expert I/O: %d persistent workers, worker-local file handles\n", prefetch_threads_);
         }
@@ -647,12 +645,7 @@ void ExpertCache::fetch_slab(Role role, int layer, int expert, ggml_tensor * dst
     const void * hsrc;
     if (ssd_) {
         const size_t off = foff_[role][layer] + (size_t) expert * nb2;
-        if (fill_remote_expert(backend_, dst, fpath_[role][layer], off, nb2, (size_t) slot * nb2)) {
-            stats_.fetch_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t0).count();
-            stats_.fetch_bytes += nb2;
-            return;
-        }
+
 #ifdef __APPLE__
         // unified memory: pread straight into the slot (no staging, no memcpy)
         if (uint8_t * hp = host_of(dst)) {
@@ -1200,26 +1193,7 @@ void ExpertCache::fetch_parallel(int layer, std::vector<FetchJob> & jobs) {
     flush_victims();
     // The remote node owns its own disk/RAM reads. Do not read or coalesce its
     // expert payloads on the coordinator before issuing the identifier request.
-    if (std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0) {
-        const auto started = std::chrono::steady_clock::now();
-        std::vector<ggml_tensor *> destinations;
-        std::vector<uint64_t> hashes;
-        std::vector<size_t> offsets, sizes;
-        uint64_t bytes = 0;
-        for (const auto & job : jobs) {
-            const size_t size = job.pool->t->nb[2];
-            destinations.push_back(job.pool->t);
-            hashes.push_back(remote_expert_hash(fpath_[job.role][layer],
-                foff_[job.role][layer] + (uint64_t) job.expert * size, size));
-            offsets.push_back((size_t) job.slot * size);
-            sizes.push_back(size);
-            bytes += size;
-        }
-        fill_remote_experts(destinations, hashes, offsets, sizes);
-        stats_.fetch_bytes += bytes;
-        stats_.fetch_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-        return;
-    }
+
     const int n = (int) jobs.size();
     if (n == 0) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1718,28 +1692,7 @@ size_t ExpertCache::load_prefetch(const std::string & path) {
               [](const Ent & a, const Ent & b) { return a.count > b.count; });
 
     size_t n_pref = 0;
-    if (ssd_ && std::string(ggml_backend_name(backend_)).rfind("RPC", 0) == 0) {
-        // Reserve the same highest-ranked slots as the serial loader, then
-        // issue one identifier batch per layer. The worker reads its own GGUF
-        // and fills GPU or CPU buffers; no weight payload crosses the network.
-        std::vector<std::vector<FetchJob>> by_layer(n_layer_);
-        for (const auto & en : ents) {
-            Pool & pool = pools_[layer_pool_[en.role][en.layer]];
-            if ((int) pool.key2slot.size() >= pool.n_slots) continue;
-            const int key = en.layer * n_expert_ + en.expert;
-            if (pool.key2slot.count(key)) continue;
-            const int slot = reserve_victim(pool, key);
-            by_layer[en.layer].push_back({ &pool, en.role, en.expert, slot });
-            n_pref++;
-        }
-        for (int layer = 0; layer < n_layer_; ++layer) {
-            if (by_layer[layer].empty()) continue;
-            fetch_parallel(layer, by_layer[layer]);
-            fprintf(stderr, "RPC startup prefetch: layer %d, %zu slabs loaded locally\n",
-                    layer, by_layer[layer].size());
-        }
-        return n_pref;
-    }
+
     for (const auto & en : ents) {
         Pool & pool = pools_[layer_pool_[en.role][en.layer]];
         if ((int) pool.key2slot.size() >= pool.n_slots) continue;   // pool full

@@ -22,7 +22,6 @@ struct CommonOptions {
     std::string kv_cache_type = "f16"; // --kv-cache-type f16|q8_0
     bool        force_cpu = false;          // --cpu
     std::string cache_profile;              // --cache-profile
-    std::string mmproj_path;                // --mmproj
     std::string ngram_mode = "disk";        // --ngram off|disk|ram
     size_t      ngram_cache_mb = 256;       // --ngram-cache <MB>
     bool        reasoning = true;           // --reasoning on|off
@@ -32,7 +31,6 @@ struct CommonOptions {
     float       repeat_penalty = 1.0f;      // --repeat-penalty <f>
 
     // Multi-GPU plan, as typed. build_gpu_plan() combines them (see apply()).
-    std::vector<std::string> rpc_endpoints; // loopback SSH forwarding endpoints
     std::vector<int>    gpu_ids;            // --gpus
     std::vector<float>  gpu_split;          // --gpu-split ("auto" leaves this empty)
     bool                gpu_split_given = false;
@@ -70,7 +68,6 @@ bool validate_common_options(const CommonOptions & o);
 // before the runtime, on the primary device, so its bytes are not available to
 // the expert cache. Only explicit budgets need this -- an "auto" budget is
 // measured after the tower is allocated and already excludes it.
-void reserve_vision_tower_vram(CommonOptions & o, size_t tower_bytes);
 
 // Fill the RuntimeConfig fields these options own. Returns false (after
 // printing) when the GPU plan does not add up.

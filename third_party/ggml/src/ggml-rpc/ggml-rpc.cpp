@@ -4,7 +4,6 @@
 #include "ggml-cpp.h"
 #include "transport.h"
 #include "log.h"
-#include "indexed_weights.h"
 
 #include <array>
 #include <chrono>
@@ -80,7 +79,6 @@ enum rpc_cmd {
     RPC_CMD_COMM_ALLREDUCE,
     RPC_CMD_COMM_FREE,
     RPC_CMD_NONE,
-    RPC_CMD_SET_TENSOR_HASH_BATCH,
     RPC_CMD_COUNT,
 };
 
@@ -107,16 +105,12 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
         case RPC_CMD_GRAPH_RECOMPUTE:   return "GRAPH_RECOMPUTE";
         case RPC_CMD_MEMSET_TENSOR:     return "MEMSET_TENSOR";
         case RPC_CMD_NONE:              return "NONE";
-        case RPC_CMD_SET_TENSOR_HASH_BATCH: return "SET_TENSOR_HASH_BATCH";
         default:                        return "UNKNOWN";
     }
 }
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
-const size_t HASH_THRESHOLD = [] {
-    const char * value = std::getenv("GGML_RPC_WEIGHT_HASH_MIN_BYTES");
-    return value ? static_cast<size_t>(std::strtoull(value, nullptr, 10)) : size_t(10 * 1024 * 1024);
-}();
+const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
 // Maximum number of graphs cached per device; client and server must use the same value
 // so that both sides clear their caches at the same point in the message stream
@@ -206,12 +200,6 @@ struct rpc_msg_set_tensor_hash_req {
     rpc_tensor tensor;
     uint64_t offset;
     uint64_t hash;
-};
-
-// Private prototype protocol 9: only identifiers and destination bounds travel.
-struct rpc_msg_set_tensor_hash_entry {
-    rpc_msg_set_tensor_hash_req request;
-    uint64_t expected_size;
 };
 
 struct rpc_msg_set_tensor_hash_rsp {
@@ -850,52 +838,6 @@ static bool rpc_use_hash_cache(const ggml_tensor * tensor, size_t size) {
     return size > HASH_THRESHOLD && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
 }
 
-
-// Identifier-only upload from the worker's verified GGUF index. No source
-// payload is read or transmitted by the coordinator for this operation.
-static bool ggml_backend_rpc_tensor_set_hash(ggml_tensor * tensor, uint64_t hash,
-                                             size_t offset, size_t size) {
-    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_rpc(tensor->buffer) ||
-        tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-        offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset) return false;
-    auto * ctx = static_cast<ggml_backend_rpc_buffer_context *>(tensor->buffer->context);
-    auto request = std::make_shared<rpc_msg_set_tensor_hash_req>();
-    request->tensor = serialize_tensor(tensor);
-    request->offset = offset;
-    request->hash = hash;
-    rpc_msg_set_tensor_hash_rsp response;
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_HASH, request, sizeof(*request), &response, sizeof(response));
-    return response.result != 0;
-}
-
-static bool ggml_backend_rpc_tensors_set_hash(ggml_tensor ** tensors, const uint64_t * hashes,
-                                               const size_t * offsets, const size_t * sizes, size_t count) {
-    if (!count || count > 4096 || !tensors || !hashes || !offsets || !sizes) return false;
-    const size_t bytes = sizeof(uint32_t) + count * sizeof(rpc_msg_set_tensor_hash_entry);
-    auto input = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
-    const uint32_t length = static_cast<uint32_t>(count);
-    memcpy(input.get(), &length, sizeof(length));
-    ggml_backend_rpc_buffer_context * first = nullptr;
-    for (size_t i = 0; i < count; ++i) {
-        auto * tensor = tensors[i];
-        if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_rpc(tensor->buffer) ||
-            tensor->buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !sizes[i] ||
-            offsets[i] > ggml_nbytes(tensor) || sizes[i] > ggml_nbytes(tensor) - offsets[i]) return false;
-        auto * context = static_cast<ggml_backend_rpc_buffer_context *>(tensor->buffer->context);
-        if (!first) first = context;
-        if (context->dispatcher != first->dispatcher) return false;
-        rpc_msg_set_tensor_hash_entry entry{};
-        entry.request.tensor = serialize_tensor(tensor);
-        entry.request.offset = offsets[i];
-        entry.request.hash = hashes[i];
-        entry.expected_size = sizes[i];
-        memcpy(input.get() + sizeof(length) + i * sizeof(entry), &entry, sizeof(entry));
-    }
-    uint32_t completed = 0;
-    first->dispatcher->send(RPC_CMD_SET_TENSOR_HASH_BATCH, input, bytes, &completed, sizeof(completed));
-    return completed == count;
-}
-
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -1439,7 +1381,7 @@ public:
     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_2d(const std::vector<uint8_t> & input);
-    bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response, uint64_t expected_size = 0);
+    bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool get_tensor_2d(const rpc_msg_get_tensor_2d_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -1853,7 +1795,7 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     fs::path cache_file = fs::path(cache_dir) / hash_str;
     std::error_code ec;
     if (!fs::exists(cache_file, ec)) {
-        return indexed_weights::read(hash, data);
+        return false;
     }
     std::ifstream ifs(cache_file, std::ios::binary);
     ifs.seekg(0, std::ios::end);
@@ -1864,21 +1806,16 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
     return true;
 }
 
-bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response, uint64_t expected_size)
+bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     sync_all_backends();
     std::vector<uint8_t> cached_file;
     if (!get_cached_file(request.hash, cached_file)) {
         LOG_DBG2("[%s] hash: 0x%" PRIx64 ", cache miss\n", __func__, request.hash);
-        if (std::getenv("GGML_RPC_REQUIRE_LOCAL_WEIGHTS")) {
-            LOG_ERROR("Required local weight hash is missing; refusing bulk network fallback\n");
-            return false;
-        }
         response.result = 0;
         return true;
     }
     size_t size = cached_file.size();
-    if (expected_size && expected_size != size) return false;
     LOG_DBG2("[%s] hash: 0x%" PRIx64 ", cache hit (%zu bytes)\n", __func__, request.hash, size);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -2659,22 +2596,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
-            case RPC_CMD_SET_TENSOR_HASH_BATCH: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sock, input) || input.size() < sizeof(uint32_t)) return;
-                uint32_t count = 0;
-                memcpy(&count, input.data(), sizeof(count));
-                if (!count || count > 4096 || input.size() != sizeof(count) + count * sizeof(rpc_msg_set_tensor_hash_entry)) return;
-                uint32_t completed = 0;
-                for (; completed < count; ++completed) {
-                    rpc_msg_set_tensor_hash_entry entry;
-                    memcpy(&entry, input.data() + sizeof(count) + completed * sizeof(entry), sizeof(entry));
-                    rpc_msg_set_tensor_hash_rsp response{};
-                    if (!entry.expected_size || !server.set_tensor_hash(entry.request, response, entry.expected_size) || !response.result) break;
-                }
-                if (!send_msg(sock, &completed, sizeof(completed))) return;
-                break;
-            }
             case RPC_CMD_SET_TENSOR_HASH: {
                 rpc_msg_set_tensor_hash_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -3140,12 +3061,6 @@ static bool ggml_backend_rpc_comm_allreduce_tensor(void * comm_ctx_v, ggml_tenso
 }
 
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    if (std::strcmp(name, "ggml_backend_rpc_tensors_set_hash") == 0) {
-        return (void *)ggml_backend_rpc_tensors_set_hash;
-    }
-    if (std::strcmp(name, "ggml_backend_rpc_tensor_set_hash") == 0) {
-        return (void *)ggml_backend_rpc_tensor_set_hash;
-    }
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }

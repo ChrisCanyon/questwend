@@ -82,3 +82,7 @@ Chat components: [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
 Local policy ports retain the Caffeine, HybriMoE and MoE-Infinity references and
 licenses in `third_party/`. SSD offload and activation-aware caching are established
 techniques; this project claims measured implementation work, not their invention.
+
+The SDK validation build recompiles upstream ggml registration/loader sources
+without RPC, while retaining the measured CPU/CUDA numerical libraries. The old
+dispatcher cannot be copied because it imports the retired RPC DLL at startup.

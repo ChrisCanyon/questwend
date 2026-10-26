@@ -4,15 +4,10 @@
 //   GET  /health
 
 #include "model.h"
-#include "tokenizer.h"
+#include "token_pieces.h"
 #include "runtime.h"
 #include "sampler.h"
-#include "chat.h"
-#include "qwen_tool_calls.h"
-#ifdef QW_UPSTREAM_CHAT
 #include "questwend_bridge.h"
-#endif
-#include "vision.h"
 #include "args.h"
 
 #include "ggml-backend.h"
@@ -115,223 +110,7 @@ static std::string clock_hms() {
     return buf;
 }
 
-static std::vector<uint8_t> base64_decode(const std::string & in) {
-    static int8_t tbl[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; ++i) tbl[i] = -1;
-        const char * cs = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; ++i) tbl[(uint8_t) cs[i]] = (int8_t) i;
-        init = true;
-    }
-    std::vector<uint8_t> out;
-    out.reserve(in.size() * 3 / 4);
-    int acc = 0, bits = 0;
-    for (char c : in) {
-        if (c == '=' || c == '\n' || c == '\r') continue;
-        const int8_t v = tbl[(uint8_t) c];
-        if (v < 0) continue;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back((uint8_t) ((acc >> bits) & 0xFF));
-        }
-    }
-    return out;
-}
-
-// Split generated text at the first </think>: `reasoning` gets the text before
-// it (the generation prompt pre-opens <think>, so output starts mid-block),
-// the returned string is what follows. No </think> -> everything is content.
-static std::string split_reasoning(const std::string & text, std::string & reasoning) {
-    const size_t p = text.find("</think>");
-    if (p == std::string::npos) return text;
-    reasoning = text.substr(0, p);
-    // lfm2 opens the block itself instead of the prompt pre-opening it
-    const size_t lead = reasoning.find_first_not_of(" \n");
-    if (lead != std::string::npos && reasoning.compare(lead, 7, "<think>") == 0)
-        reasoning.erase(0, lead + 7);
-    while (!reasoning.empty() && reasoning.front() == '\n') reasoning.erase(0, 1);
-    while (!reasoning.empty() && (reasoning.back() == '\n' || reasoning.back() == ' ')) reasoning.pop_back();
-    std::string rest = text.substr(p + 8);
-    while (!rest.empty() && rest.front() == '\n') rest.erase(0, 1);
-    return rest;
-}
-
-// Parse Qwen3.6-format tool calls out of generated text:
-//   <tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>...\n</function>\n</tool_call>
-// Returns the text with the tool-call blocks removed; parsed calls go to `calls`
-// as (name, arguments-json-string). Reasoning (<think>...</think>) is skipped.
-//
-// `param_kind` maps "tool\x1fparam" -> 1 if the tool schema declares the
-// parameter as type "string". The XML format carries values untyped, so
-// without the schema a string value that happens to parse as JSON (a file's
-// JSON content, "123", "true") would be coerced to a non-string type and
-// re-serialized — corrupting tool arguments. Schema-declared strings stay raw
-// (same as llama.cpp's schema-aware parser).
 struct ParsedToolCall { std::string name; std::string arguments; };
-
-// ---- lfm2 tool calls: a Python call list, "[f(a='x', b=1), g()]" ----
-// A small recursive-descent reader for the literals the model writes: quoted
-// strings (either quote, backslash escapes), numbers, True/False/None, lists
-// and dicts. Returns false on anything else; the caller keeps such a block as
-// plain content rather than inventing arguments.
-struct PyReader {
-    const std::string & s;
-    size_t i = 0;
-    explicit PyReader(const std::string & src) : s(src) {}
-    void ws() { while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r')) ++i; }
-    bool eat(char c) { ws(); if (i < s.size() && s[i] == c) { ++i; return true; } return false; }
-    bool ident(std::string & out) {
-        ws();
-        const size_t b = i;
-        while (i < s.size() && (isalnum((unsigned char) s[i]) || s[i] == '_' || s[i] == '.' || s[i] == '-')) ++i;
-        out = s.substr(b, i - b);
-        return !out.empty();
-    }
-    bool str(std::string & out) {
-        ws();
-        if (i >= s.size() || (s[i] != '\'' && s[i] != '"')) return false;
-        const char q = s[i++];
-        out.clear();
-        while (i < s.size() && s[i] != q) {
-            if (s[i] == '\\' && i + 1 < s.size()) {
-                const char e = s[++i];
-                out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e;
-                ++i;
-            } else {
-                out += s[i++];
-            }
-        }
-        return eat(q);
-    }
-    bool value(json & v) {
-        ws();
-        if (i >= s.size()) return false;
-        std::string t;
-        if (s[i] == '\'' || s[i] == '"') { if (!str(t)) return false; v = t; return true; }
-        if (s[i] == '[') {
-            ++i; v = json::array();
-            if (eat(']')) return true;
-            do { json e; if (!value(e)) return false; v.push_back(e); } while (eat(','));
-            return eat(']');
-        }
-        if (s[i] == '{') {
-            ++i; v = json::object();
-            if (eat('}')) return true;
-            do {
-                json k, e;
-                if (!value(k) || !k.is_string() || !eat(':') || !value(e)) return false;
-                v[k.get<std::string>()] = e;
-            } while (eat(','));
-            return eat('}');
-        }
-        if (!ident(t)) return false;
-        if (t == "True")  { v = true;  return true; }
-        if (t == "False") { v = false; return true; }
-        if (t == "None")  { v = nullptr; return true; }
-        try { v = json::parse(t); return v.is_number(); } catch (...) { return false; }
-    }
-    // [name(k=v, ...), ...]
-    bool calls(std::vector<ParsedToolCall> & out) {
-        if (!eat('[')) return false;
-        if (eat(']')) return true;
-        do {
-            ParsedToolCall c;
-            json args = json::object();
-            if (!ident(c.name) || !eat('(')) return false;
-            if (!eat(')')) {
-                do {
-                    std::string k; json v;
-                    if (!ident(k) || !eat('=') || !value(v)) return false;
-                    args[k] = v;
-                } while (eat(','));
-                if (!eat(')')) return false;
-            }
-            c.arguments = args.dump();
-            out.push_back(std::move(c));
-        } while (eat(','));
-        return eat(']');
-    }
-};
-
-// A JSON argument as the lfm2 template's format_arg_value writes it: strings
-// in single quotes (unescaped, as the template does), objects as JSON, and the
-// rest through Jinja's |string, i.e. Python's str().
-static std::string py_literal(const json & v, bool top = true) {
-    if (v.is_string())  return "'" + v.get<std::string>() + "'";
-    if (v.is_boolean()) return v.get<bool>() ? "True" : "False";
-    if (v.is_null())    return "None";
-    if (v.is_object() && top) return v.dump(-1, ' ', false);
-    if (v.is_array() || v.is_object()) {
-        const bool arr = v.is_array();
-        std::string s = arr ? "[" : "{";
-        bool first = true;
-        for (auto it = v.begin(); it != v.end(); ++it) {
-            if (!first) s += ", ";
-            first = false;
-            if (!arr) s += "'" + it.key() + "': ";
-            s += py_literal(*it, false);
-        }
-        return s + (arr ? "]" : "}");
-    }
-    return v.dump();
-}
-
-static std::string parse_tool_calls_lfm2(const std::string & text, std::vector<ParsedToolCall> & calls) {
-    size_t scan = 0;
-    const size_t think_end = text.rfind("</think>");
-    if (think_end != std::string::npos) scan = think_end + 8;
-    std::string out = text.substr(0, scan);
-    size_t pos = scan;
-    static const std::string open = "<|tool_call_start|>", close = "<|tool_call_end|>";
-    while (true) {
-        const size_t a = text.find(open, pos);
-        if (a == std::string::npos) { out += text.substr(pos); break; }
-        const size_t b = text.find(close, a);
-        if (b == std::string::npos) { out += text.substr(pos); break; }
-        out += text.substr(pos, a - pos);
-        const std::string block = text.substr(a + open.size(), b - a - open.size());
-        std::vector<ParsedToolCall> got;
-        PyReader r(block);
-        if (r.calls(got)) { r.ws(); }
-        if (!got.empty() && r.i == block.size()) {
-            for (auto & c : got) calls.push_back(std::move(c));
-        } else {
-            out += text.substr(a, b + close.size() - a);   // malformed: keep as content
-        }
-        pos = b + close.size();
-    }
-    while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back();
-    return out;
-}
-
-static std::string parse_tool_calls(const std::string & text, std::vector<ParsedToolCall> & calls,
-                                    const QwenToolSchemas & schemas, bool lfm2 = false,
-                                    std::string * error = nullptr) {
-    if (lfm2) return parse_tool_calls_lfm2(text, calls);
-    const auto parsed = parse_qwen_tool_calls(text, schemas);
-    if (error) *error = parsed.error;
-    for (const auto & call : parsed.calls) calls.push_back({call.name, call.arguments});
-    if (parsed.repaired_headers)
-        fprintf(stderr, "tool parser: repaired %d declared function header(s)\n", parsed.repaired_headers);
-    return parsed.content;
-}
-
-// Streaming holdback: bytes at the end of `s` that must not be emitted yet —
-// the longest suffix that is a proper prefix of `marker`, plus any whitespace
-// run immediately before it (so content doesn't end in the blank lines that
-// precede a <tool_call> block).
-static size_t marker_holdback(const std::string & s, const char * marker, size_t mlen) {
-    size_t k = 0;
-    const size_t maxk = std::min(s.size(), mlen - 1);
-    for (size_t n = maxk; n > 0; --n)
-        if (s.compare(s.size() - n, n, marker, n) == 0) { k = n; break; }
-    size_t i = s.size() - k;
-    while (i > 0 && (s[i-1] == '\n' || s[i-1] == ' ' || s[i-1] == '\t' || s[i-1] == '\r')) --i;
-    return s.size() - i;
-}
 
 // Hold back a trailing incomplete UTF-8 sequence in `pend`: with byte-level
 // BPE a multi-byte character can span tokens, and each SSE chunk must be
@@ -563,7 +342,6 @@ int main(int argc, char ** argv) {
     CommonOptions opt;      // -m, --n-ctx, GPU/offload, ... (core/args.h)
     int  port  = 8080;
     std::string host = "127.0.0.1";
-    bool no_mmproj = false;
     int  cache_slots = 0;
     std::string cache_slots_dir;
     bool complete_cache_slots = false; // experimental private state format
@@ -575,7 +353,7 @@ int main(int argc, char ** argv) {
         std::string a = argv[i];
         if      (a == "--port" && i + 1 < argc) port = std::stoi(argv[++i]);
         else if (a == "--host" && i + 1 < argc) host = argv[++i];
-        else if (a == "--no-mmproj")        no_mmproj = true;
+        else if (a == "--no-mmproj")        {} // retained launch compatibility; text-only server
         else if (a == "--cache-slots" && i + 1 < argc) cache_slots = std::stoi(argv[++i]);
         else if (a == "--cache-slots-dir" && i + 1 < argc) cache_slots_dir = argv[++i];
         else if (a == "--complete-cache-slots") complete_cache_slots = true;
@@ -610,7 +388,6 @@ int main(int argc, char ** argv) {
     const int   n_draft                = opt.n_draft;
     const bool  reasoning_default      = opt.reasoning;
     const float repeat_penalty_default = opt.repeat_penalty;   // when the request sends none
-    std::string mmproj_path            = opt.mmproj_path;      // may be auto-discovered below
     int         n_ctx                  = opt.n_ctx;            // 0 = the model's trained length
 
     if (want_help || model_path.empty()) {
@@ -621,7 +398,7 @@ int main(int argc, char ** argv) {
             "server:\n"
             "  --port <N>          listen port (default 8080)\n"
             "  --host <addr>       bind address (default 127.0.0.1)\n"
-            "  --no-mmproj         disable image input even if an mmproj file is present\n"
+            "  --no-mmproj         accepted for launch compatibility; text input only\n"
             "  --cache-slots <N>   extra prompt-cache slots for interleaved conversations (default 0)\n"
             "  --cache-slots-dir <dir>  store the slots on disk instead of RAM (persists across restarts)\n"
             "  --complete-cache-slots  experimental QSL2 slots including PLE/QSA/ngram/logits; no MTP\n"
@@ -637,14 +414,11 @@ int main(int argc, char ** argv) {
     }
 
     std::unique_ptr<Model> model;
-    std::unique_ptr<Tokenizer> tok;
+    std::unique_ptr<TokenPieces> tok;
     std::unique_ptr<Runtime> rt;
-    ggml_backend_t vis_backend = nullptr;
-    std::unique_ptr<VisionEncoder> venc;
-    std::mutex vis_mtx;   // the encoder graph is single-threaded
     try {
         model = Model::load(model_path);
-        tok   = std::make_unique<Tokenizer>(model->vocab());
+        tok   = std::make_unique<TokenPieces>(model->vocab());
 
         // Context length defaults to what the model was trained for. The KV
         // cache is sized from it, so a very long context costs memory that the
@@ -653,48 +427,6 @@ int main(int argc, char ** argv) {
         if (n_ctx <= 0) {
             n_ctx = (int) model->hparams().n_ctx_train;
             fprintf(stderr, "context: %d tokens (model's trained length; --n-ctx to change)\n", n_ctx);
-        }
-
-        // ---- vision tower (image input): explicit --mmproj or auto-discovery ----
-        // Loaded BEFORE the runtime so its GPU footprint can be subtracted from
-        // the expert-cache budget: a maxed-out --vram-budget sized for text-only
-        // would otherwise exceed the backend memory limit once the tower is
-        // added on top (Metal: kIOGPUCommandBufferCallbackErrorOutOfMemory).
-        if (!no_mmproj) {
-            if (mmproj_path.empty()) {
-                std::string dir = model_path;
-                const size_t sl = dir.find_last_of("/\\");
-                dir = sl == std::string::npos ? "." : dir.substr(0, sl);
-                try {
-                    for (const auto & e : std::filesystem::directory_iterator(dir)) {
-                        const std::string fn = e.path().filename().string();
-                        if (fn.rfind("mmproj", 0) == 0 && fn.size() > 5 &&
-                            fn.substr(fn.size() - 5) == ".gguf") {
-                            mmproj_path = e.path().string();
-                            break;
-                        }
-                    }
-                } catch (...) {}
-            }
-            if (!mmproj_path.empty()) {
-                try {
-                    if (!force_cpu)
-                        for (ggml_backend_dev_t d : gpu_devices())
-                            if ((vis_backend = ggml_backend_dev_init(d, nullptr))) break;
-                    if (!vis_backend) vis_backend = ggml_backend_cpu_init();
-                    venc = VisionEncoder::load(mmproj_path, vis_backend);
-                    if (venc->n_embd() != (int) model->hparams().n_embd) {
-                        fprintf(stderr, "mmproj: projection dim mismatch, disabling image input\n");
-                        venc.reset();
-                    } else {
-                        fprintf(stderr, "image input: ON (%s)\n", mmproj_path.c_str());
-                    }
-                } catch (const std::exception & e) {
-                    fprintf(stderr, "mmproj load failed (%s), image input disabled\n", e.what());
-                    venc.reset();
-                }
-            }
-            if (venc) reserve_vision_tower_vram(opt, venc->gpu_bytes());
         }
 
         opt.n_ctx = n_ctx;   // resolved above from the model's trained length
@@ -760,21 +492,12 @@ int main(int argc, char ** argv) {
         d += '('; d += arch_name(hp.arch); d += ')';
         return d;
     }();
-    const int32_t eos    = model->vocab().eos_id;
-    const int32_t im_end = tok->token_to_id("<|im_end|>");
-#ifdef QW_UPSTREAM_CHAT
     auto upstream_chat = std::make_shared<open_agents::ChatBridge>(model_path);
     fprintf(stderr, "chat: pinned upstream adapter, strict completion enabled\n");
-#endif
-    const ChatFormat cfmt = chat_format(*tok);   // Qwen XML or lfm2 call-list markup
     auto is_stop = [&](int32_t t){
-#ifdef QW_UPSTREAM_CHAT
         for (const auto & token : upstream_chat->capabilities.at("eog_tokens"))
             if (token.get<int32_t>()==t) return true;
         return false;
-#else
-        return t == eos || (im_end >= 0 && t == im_end);
-#endif
     };
 
     TicketLock tlock;          // runtime is single-threaded + stateful (FIFO queue)
@@ -891,11 +614,11 @@ int main(int argc, char ** argv) {
     // private and incompatible: callers must pin source/model/runtime/context.
     const uint32_t SLOT_MAGIC = complete_cache_slots ? 0x324C5351 : 0x314C5351;
     auto save_slot_payload = [&](const std::function<void(const void *, size_t)> & sink) {
-        if (complete_cache_slots) rt->save_probe_state(sink);
+        if (complete_cache_slots) rt->save_complete_state(sink);
         else rt->save_state(sink);
     };
     auto load_slot_payload = [&](const std::function<void(void *, size_t)> & source) {
-        if (complete_cache_slots) rt->load_probe_state(source);
+        if (complete_cache_slots) rt->load_complete_state(source);
         else rt->load_state(source);
     };
 
@@ -1249,66 +972,6 @@ int main(int argc, char ** argv) {
         return true;
     };
 
-    // Parse OpenAI-style messages: plain string content, multimodal content
-    // arrays (text / image_url with base64 data URIs), assistant tool_calls,
-    // reasoning_content, and tool-role messages. Image bytes go to `images`.
-    auto parse_messages = [](const json & body, std::vector<std::vector<uint8_t>> & images) {
-        std::vector<ChatMessage> msgs;
-        if (!body.contains("messages")) return msgs;
-        for (auto & m : body["messages"]) {
-            ChatMessage cm;
-            cm.role = m.value("role", "user");
-            const auto & c = m.contains("content") ? m["content"] : json();
-            if (c.is_string()) {
-                cm.content = c.get<std::string>();
-            } else if (c.is_array()) {
-                for (auto & item : c) {
-                    const std::string type = item.value("type", "");
-                    if (type == "text" || item.contains("text")) {
-                        cm.parts.push_back(ContentPart::make_text(item.value("text", "")));
-                    } else if (type == "image_url" || item.contains("image_url")) {
-                        std::string url = item.contains("image_url") && item["image_url"].is_object()
-                            ? item["image_url"].value("url", "")
-                            : item.value("image_url", "");
-                        const size_t comma = url.find(',');
-                        if (url.rfind("data:", 0) != 0 || comma == std::string::npos)
-                            throw std::runtime_error("image_url must be a base64 data URI");
-                        images.push_back(base64_decode(url.substr(comma + 1)));
-                        cm.parts.push_back(ContentPart::make_image((int) images.size() - 1));
-                    } else {
-                        throw std::runtime_error("unsupported content part type: " + type);
-                    }
-                }
-            }
-            if (m.contains("reasoning_content") && m["reasoning_content"].is_string()) {
-                cm.reasoning_content = m["reasoning_content"].get<std::string>();
-                cm.has_reasoning = true;
-            }
-            if (m.contains("tool_calls") && m["tool_calls"].is_array()) {
-                for (auto & tc : m["tool_calls"]) {
-                    const auto & fn = tc.contains("function") ? tc["function"] : tc;
-                    ToolCall call;
-                    call.name = fn.value("name", "");
-                    json args = json::object();
-                    if (fn.contains("arguments")) {
-                        if (fn["arguments"].is_string()) {
-                            try { args = json::parse(fn["arguments"].get<std::string>()); } catch (...) {}
-                        } else if (fn["arguments"].is_object()) {
-                            args = fn["arguments"];
-                        }
-                    }
-                    for (auto & kv : args.items()) {
-                        call.arguments.push_back({ kv.key(),
-                            kv.value().is_string() ? kv.value().get<std::string>() : kv.value().dump() });
-                        call.arg_literals.push_back(py_literal(kv.value()));
-                    }
-                    cm.tool_calls.push_back(std::move(call));
-                }
-            }
-            msgs.push_back(std::move(cm));
-        }
-        return msgs;
-    };
     auto make_sampler = [repeat_penalty_default](const json & body) {
         SamplerConfig sc;
         sc.temperature = body.value("temperature", 0.7f);
@@ -1338,13 +1001,11 @@ int main(int argc, char ** argv) {
     });
 
     srv.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-#ifdef QW_UPSTREAM_CHAT
         if (!upstream_chat->available()) {
             res.status=503;
             res.set_content(json{{"status","error"},{"error","Upstream chat helper unavailable; reload model runtime"}}.dump(),"application/json");
             return;
         }
-#endif
         res.set_content(json{{"status", "ok"}}.dump(), "application/json");
     });
 
@@ -1381,92 +1042,39 @@ int main(int argc, char ** argv) {
         if (body.contains("reasoning")) reasoning = body["reasoning"].get<bool>();
         else if (body.contains("enable_thinking")) reasoning = body["enable_thinking"].get<bool>();
 
-        // ---- parse messages (text / images / tool calls) and build the prompt ----
-        std::vector<std::vector<uint8_t>> images;
-        std::vector<ChatMessage> messages;
-        QwenToolSchemas tool_schemas;   // declared functions and their parameter schemas
-        ChatPromptOptions copts;
-        copts.reasoning = reasoning;
-        copts.qwen38_template = model->hparams().arch == Arch::QWEN4EXP;
-        // keep past <think> blocks so the re-rendered history tokenizes
-        // identically to what was generated -> the prompt prefix cache hits
-        copts.preserve_thinking = true;
-        ChatPrompt cp;
-#ifdef QW_UPSTREAM_CHAT
+        struct PreparedPrompt { std::vector<int32_t> ids; int gen_prompt_begin = 0; } cp;
         std::shared_ptr<open_agents::ChatTurn> chat_turn;
-#endif
-        auto vembs = std::make_shared<std::vector<std::vector<float>>>();
         std::vector<Runtime::EmbdOverride> ovr;
+        std::vector<ImgSpan> spans;
         try {
-            messages = parse_messages(body, images);
-            const json template_kwargs = body.value("chat_template_kwargs", json::object());
-            if (!template_kwargs.is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
-            copts.preserve_thinking = template_kwargs.value("preserve_thinking", true);
-            copts.reasoning = template_kwargs.value("enable_thinking", reasoning);
-            reasoning = copts.reasoning;
-            copts.reasoning_effort = template_kwargs.value("reasoning_effort",
-                body.value("reasoning_effort", std::string("xhigh")));
-            // Open Agents' public high effort maps to this model's xhigh.
-            if (copts.reasoning_effort == "high") copts.reasoning_effort = "xhigh";
-            const bool tools_off = body.contains("tool_choice") && body["tool_choice"].is_string()
-                && body["tool_choice"].get<std::string>() == "none";
-            if (!tools_off && body.contains("tools") && body["tools"].is_array()) {
-                for (auto & t : body["tools"]) {
-                    copts.tools_json.push_back(t.dump());
-                    if (!t.contains("function") || !t["function"].is_object()) continue;
-                    const auto & fn = t["function"];
-                    const std::string name = fn.value("name", "");
-                    if (!name.empty()) tool_schemas[name] = fn.value("parameters", json::object());
+            for (const auto & message : body.at("messages")) {
+                const auto content = message.value("content", json());
+                if (!content.is_array()) continue;
+                for (const auto & part : content) {
+                    if (part.value("type", std::string()) != "text")
+                        throw std::runtime_error("This runtime supports text input only");
                 }
             }
-            if (!images.empty()) {
-                if (!venc) throw std::runtime_error("image input not available (no mmproj loaded)");
-                copts.n_image_tokens = venc->n_image_tokens();
-                copts.add_vision_id  = images.size() > 1;
-            }
-#ifdef QW_UPSTREAM_CHAT
-            if (!images.empty()) throw std::runtime_error("Image input is not qualified for this upstream chat adapter build");
             json chat_request = body;
+            json kwargs = body.value("chat_template_kwargs", json::object());
+            if (!kwargs.is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
+            reasoning = kwargs.value("enable_thinking", reasoning);
+            std::string effort = kwargs.value("reasoning_effort", body.value("reasoning_effort", std::string("xhigh")));
+            if (effort == "high") effort = "xhigh";
+            kwargs["enable_thinking"] = reasoning;
+            kwargs["preserve_thinking"] = kwargs.value("preserve_thinking", true);
+            kwargs["reasoning_effort"] = effort;
             chat_request["enable_thinking"] = reasoning;
-            chat_request["chat_template_kwargs"]["enable_thinking"] = reasoning;
-            chat_request["chat_template_kwargs"]["preserve_thinking"] = copts.preserve_thinking;
-            chat_request["chat_template_kwargs"]["reasoning_effort"] = copts.reasoning_effort;
+            chat_request["chat_template_kwargs"] = std::move(kwargs);
             chat_turn = std::make_shared<open_agents::ChatTurn>(*upstream_chat, chat_request);
             cp.ids = chat_turn->prepared.at("tokens").get<std::vector<int32_t>>();
             cp.gen_prompt_begin = chat_turn->prepared.at("gen_prompt_begin").get<int>();
-#else
-            cp = build_qwen_prompt(*tok, messages, copts);
-#endif
             if (getenv("QWEN_LOG_RESPONSE"))
-                fprintf(stderr, "=== rendered prompt (%zu tok) ===\n%s\n",
-                        cp.ids.size(), tok->decode(cp.ids).c_str());
-            if (!images.empty()) {
-                std::lock_guard<std::mutex> vl(vis_mtx);
-                for (const auto & ib : images)
-                    vembs->push_back(venc->encode_bytes(ib.data(), ib.size()));
-            }
-            for (const auto & sp : cp.image_spans)
-                ovr.push_back({ sp.first, sp.count, (*vembs)[sp.image_index].data() });
-        } catch (const std::exception & e) {
-#ifdef QW_UPSTREAM_CHAT
+                fprintf(stderr, "=== rendered prompt (%zu tok) ===\n%s\n", cp.ids.size(), tok->decode(cp.ids).c_str());
+        } catch (const std::exception & error) {
             res.status = upstream_chat->available() ? 400 : 503;
-#else
-            res.status = 400;
-#endif
-            res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+            res.set_content(json{{"error", error.what()}}.dump(), "application/json");
             return;
-        }
-        // image spans + content hashes for the prefix cache
-        std::vector<ImgSpan> spans;
-        {
-            std::vector<uint64_t> ih;
-            for (const auto & ib : images) {
-                uint64_t h = 1469598103934665603ull;            // FNV-1a
-                for (uint8_t b : ib) { h ^= b; h *= 1099511628211ull; }
-                ih.push_back(h);
-            }
-            for (const auto & sp : cp.image_spans)
-                spans.push_back({ sp.first, sp.count, ih[sp.image_index] });
         }
 
         std::vector<int32_t> prompt = cp.ids;
@@ -1477,7 +1085,7 @@ int main(int argc, char ** argv) {
         // acquired, which can be minutes later behind a running request
         const auto t_recv = lclk::now();
         fprintf(stderr, "[%s] recv: %d tok%s%s\n", clock_hms().c_str(), n_prompt_full,
-                images.empty() ? "" : " +img", tlock.busy() ? " (queued)" : "");
+                "", tlock.busy() ? " (queued)" : "");
 
         // the prompt must fit the context window with room to generate
         if (n_prompt_full >= n_ctx) {
@@ -1499,30 +1107,14 @@ int main(int argc, char ** argv) {
                 bool holding = false;             // we own the runtime lock
                 std::vector<int32_t> prompt;
                 std::vector<float> logits;
-#ifdef QW_UPSTREAM_CHAT
                 std::shared_ptr<open_agents::ChatTurn> chat_turn;
                 std::string upstream_pending;
                 std::string generation_error;
-#endif
                 std::string text;   // accumulated output (for tool-call parsing)
-                std::string utf8_pend;            // incomplete UTF-8 tail held between chunks
-                // output routing: reasoning -> reasoning_content deltas until
-                // </think>, then content until <tool_call>, then withheld
-                // (tool-call XML is parsed at finish, not streamed as content)
-                enum class Phase { Reason, Content, Tool };
-                Phase phase = Phase::Content;
-                bool skip_lead = false;           // drop newlines right after </think>
-                bool await_think = false;         // lfm2: the reply may open <think> itself
-                bool skip_lead_r = false;         // drop newlines right after that <think>
-                bool role_sent = false;           // first delta carries role:"assistant"
-                std::string hold;                 // marker holdback buffer
-                std::string pend_r;               // UTF-8 holdback (reasoning channel)
-                QwenToolSchemas tool_schemas;
-                bool initial_reasoning = false;
+                bool role_sent = false;
                 std::shared_ptr<Prog> prog = std::make_shared<Prog>();   // prefill progress
                 lclk::time_point t_recv;          // arrival (for the queued 0% marker)
                 std::string hb;                   // heartbeat: empty-delta chunk (see below)
-                std::shared_ptr<std::vector<std::vector<float>>> vembs;   // keep image embds alive
                 std::vector<Runtime::EmbdOverride> ovr;
                 std::vector<ImgSpan> spans;       // image spans for the prefix cache
                 uint64_t sid = 0;                 // request id (live-state ownership)
@@ -1554,14 +1146,9 @@ int main(int argc, char ** argv) {
             st->prompt = prompt;
             st->max_tokens = max_tokens;
             st->prompt_tokens = (int) prompt.size();
-            st->vembs = vembs;
             st->ovr   = std::move(ovr);
             st->spans = std::move(spans);
-            st->tool_schemas = std::move(tool_schemas);
-            st->initial_reasoning = reasoning;
-#ifdef QW_UPSTREAM_CHAT
             st->chat_turn = chat_turn;
-#endif
             st->gen_begin = cp.gen_prompt_begin;
             st->t_recv = t_recv;
             // Heartbeat sent while queued / between prefill chunks so client
@@ -1573,11 +1160,7 @@ int main(int argc, char ** argv) {
                     {{"index", 0}, {"delta", json::object()}, {"finish_reason", nullptr}}})}}) + "\n\n";
             // the generation prompt pre-opens <think> when reasoning is on, so
             // the stream starts inside the reasoning block
-            st->phase = (reasoning && !cfmt.lfm2 && tok->token_to_id("<think>") >= 0)
-                ? State::Phase::Reason : State::Phase::Content;
-            // lfm2 has no pre-opened block (and reasons whether asked to or
-            // not): watch the start of the reply instead
-            st->await_think = cfmt.lfm2;
+
             st->smp.prime(prompt);   // repetition-penalty window (prompt tail)
 
             res.set_chunked_content_provider("text/event-stream",
@@ -1605,13 +1188,8 @@ int main(int argc, char ** argv) {
                         // tool calls: parse the accumulated text; if any, emit them as a
                         // final delta and finish with "tool_calls"
                         std::vector<ParsedToolCall> calls;
-                        std::string parse_error, ignored_reasoning;
-#ifdef QW_UPSTREAM_CHAT
+                        std::string parse_error;
                         json final_delta=json::object();
-#endif
-                        const std::string tool_text = st->initial_reasoning
-                            ? split_reasoning(st->text, ignored_reasoning) : st->text;
-#ifdef QW_UPSTREAM_CHAT
                         try {
                             if (!st->generation_error.empty()) throw std::runtime_error(st->generation_error);
                             const bool length = st->generated >= st->max_tokens || st->prompt_tokens + st->generated + 1 >= n_ctx;
@@ -1626,9 +1204,6 @@ int main(int argc, char ** argv) {
                             for (const auto & call : parsed.value("tool_calls", json::array()))
                                 calls.push_back({call.at("function").at("name"), call.at("function").at("arguments")});
                         } catch (const std::exception & error) { parse_error=error.what(); }
-#else
-                        parse_tool_calls(tool_text, calls, st->tool_schemas, cfmt.lfm2, &parse_error);
-#endif
                         if (!parse_error.empty()) {
                             fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
                             const json error = {{"error", {{"message", "Invalid model tool call: " + parse_error},
@@ -1646,34 +1221,16 @@ int main(int argc, char ** argv) {
                                 fprintf(stderr, "  %s args=%s\n", c.name.c_str(), c.arguments.c_str());
                         }
                         std::string ev;
-#ifdef QW_UPSTREAM_CHAT
                         if (!final_delta.empty()) {
                             if (!st->role_sent) { final_delta["role"]="assistant"; st->role_sent=true; }
                             json chunk={{"id",id},{"object","chat.completion.chunk"},{"created",created},
                                 {"model",model_id},{"choices",json::array({{{"index",0},{"delta",final_delta},{"finish_reason",nullptr}}})}};
                             ev+="data: "+dumpj(chunk)+"\n\n";
                         }
-#endif
                         // flush withheld text: a partial marker that never completed,
                         // or withheld tool XML that turned out to be unparseable
                         // (parsed tool XML stays out of the content stream)
-                        if (calls.empty() && !st->hold.empty()) {
-                            const bool rphase = st->phase == State::Phase::Reason;
-                            std::string tail = rphase ? st->pend_r : st->utf8_pend;
-                            if (st->phase == State::Phase::Tool) tail += cfmt.tool_open;
-                            tail += st->hold;
-                            while (!tail.empty() && (tail.back() == '\n' || tail.back() == ' ')) tail.pop_back();
-                            if (!tail.empty()) {
-                                json delta;
-                                if (!st->role_sent) { delta["role"] = "assistant"; st->role_sent = true; }
-                                delta[rphase ? "reasoning_content" : "content"] = tail;
-                                json fchunk = {{"id", id}, {"object", "chat.completion.chunk"},
-                                    {"created", created}, {"model", model_id}, {"choices", json::array({
-                                        {{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}})}};
-                                ev += "data: " + dumpj(fchunk) + "\n\n";
-                            }
-                            st->hold.clear();
-                        }
+
                         // "length" when generation was cut by the token budget or
                         // the context limit (e.g. a tool call's big content arg got
                         // truncated before its closing tags, so it could not be
@@ -1723,7 +1280,6 @@ int main(int argc, char ** argv) {
                         }
                         const std::string piece = tok->decode(t);
                         st->text += piece;
-#ifdef QW_UPSTREAM_CHAT
                         const auto complete = utf8_clip(st->upstream_pending, piece);
                         const auto delta = complete.empty() ? json::object() : st->chat_turn->feed(complete);
                         std::string ev;
@@ -1739,90 +1295,6 @@ int main(int argc, char ** argv) {
                         }
                         st->last_output=clk::now();
                         return sink.write(ev.data(),ev.size());
-#else
-                        st->hold += piece;
-                        // phase filter: reasoning goes out as reasoning_content
-                        // deltas, </think> switches to content, and everything
-                        // from <tool_call> on is withheld (parsed at finish);
-                        // partial markers at the buffer tail are held back
-                        std::string rout, cout_;
-                        if (st->await_think) {
-                            const size_t lead = st->hold.find_first_not_of(" \n");
-                            if (lead == std::string::npos) return true;          // only whitespace so far
-                            const std::string head = st->hold.substr(lead);
-                            if (head.size() < 7 && std::string("<think>").compare(0, head.size(), head) == 0)
-                                return true;                                      // could still be <think>
-                            st->await_think = false;
-                            if (head.compare(0, 7, "<think>") == 0) {
-                                st->hold = head.substr(7);
-                                st->phase = State::Phase::Reason;
-                                st->skip_lead_r = true;
-                            }
-                        }
-                        for (bool again = true; again; ) {
-                            again = false;
-                            // Tool phase: keep accumulating in hold — flushed as
-                            // content at finish if it turns out to be unparseable
-                            if (st->phase == State::Phase::Tool) break;
-                            const bool rphase = st->phase == State::Phase::Reason;
-                            const char * marker = rphase ? "</think>" : cfmt.tool_open.c_str();
-                            const size_t mlen   = rphase ? 8 : cfmt.tool_open.size();
-                            const size_t p = st->hold.find(marker);
-                            if (p == std::string::npos) {
-                                const size_t hb = marker_holdback(st->hold, marker, mlen);
-                                if (st->hold.size() > hb) {
-                                    (rphase ? rout : cout_) += st->hold.substr(0, st->hold.size() - hb);
-                                    st->hold.erase(0, st->hold.size() - hb);
-                                }
-                            } else {
-                                std::string before = st->hold.substr(0, p);
-                                while (!before.empty() && (before.back() == '\n' || before.back() == ' ' ||
-                                                           before.back() == '\t' || before.back() == '\r'))
-                                    before.pop_back();
-                                (rphase ? rout : cout_) += before;
-                                st->hold.erase(0, p + mlen);
-                                st->phase = rphase ? State::Phase::Content : State::Phase::Tool;
-                                st->skip_lead = rphase;
-                                again = true;
-                            }
-                        }
-                        if (st->skip_lead_r && !rout.empty()) {  // newlines after an opened <think>
-                            size_t i = 0;
-                            while (i < rout.size() && rout[i] == '\n') ++i;
-                            rout.erase(0, i);
-                            if (!rout.empty()) st->skip_lead_r = false;
-                        }
-                        if (st->skip_lead && !cout_.empty()) {   // newlines after </think>
-                            size_t i = 0;
-                            while (i < cout_.size() && cout_[i] == '\n') ++i;
-                            cout_.erase(0, i);
-                            if (!cout_.empty()) st->skip_lead = false;
-                        }
-                        rout  = utf8_clip(st->pend_r,    rout);
-                        cout_ = utf8_clip(st->utf8_pend, cout_);
-                        std::string ev;
-                        auto add_chunk = [&](const char * field, const std::string & s) {
-                            json delta;
-                            if (!st->role_sent) { delta["role"] = "assistant"; st->role_sent = true; }
-                            delta[field] = s;
-                            json chunk = {{"id", id}, {"object", "chat.completion.chunk"},
-                                {"created", created}, {"model", model_id}, {"choices", json::array({
-                                    {{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}})}};
-                            ev += "data: " + dumpj(chunk) + "\n\n";
-                        };
-                        if (!rout.empty())  add_chunk("reasoning_content", rout);
-                        if (!cout_.empty()) add_chunk("content", cout_);
-                        if (ev.empty()) {
-                            // A long tool argument is withheld until its closing
-                            // tags are validated. Keep the connection alive while
-                            // generating it, just as during queueing/prefill.
-                            if (!hb_on || clk::now() - st->last_output < std::chrono::seconds(10))
-                                return true;
-                            ev = st->hb;
-                        }
-                        st->last_output = clk::now();
-                        return sink.write(ev.data(), ev.size());
-#endif
                     };
                     try {
                         const bool was_holding = st->holding;
@@ -2080,9 +1552,7 @@ int main(int argc, char ** argv) {
                         return true;
                     } catch (const std::exception & e) {
                         fprintf(stderr, "stream error: %s\n", e.what());
-#ifdef QW_UPSTREAM_CHAT
                         st->generation_error=e.what();
-#endif
                         if (st->holding) { rt->reset(); live_owner = 0; }   // state unknown
                         return finish();
                     }
@@ -2162,12 +1632,10 @@ int main(int argc, char ** argv) {
             t_end = clk::now();
         } catch (const std::exception & e) {
             fprintf(stderr, "generation error: %s\n", e.what());  // return what we have
-#ifdef QW_UPSTREAM_CHAT
             rt->reset();
             res.status=502;
             res.set_content(dumpj(json{{"error",{{"message",e.what()},{"type","model_generation_error"}}}}),"application/json");
             return;
-#endif
             rt->reset();   // state unknown: invalidate the prefix cache
             if (t_end == clk::time_point{}) t_end = clk::now();
         }
@@ -2179,11 +1647,9 @@ int main(int argc, char ** argv) {
         log_done(n_prompt_full, n_cached, generated, prefill_ms, gen_ms, cstat0);
         // split reasoning off, then parse tool calls out of the content
         std::string think;
-        const std::string rest = reasoning ? split_reasoning(text, think) : text;
         std::vector<ParsedToolCall> calls;
         std::string parse_error;
         std::string content;
-#ifdef QW_UPSTREAM_CHAT
         try {
             const bool length = generated >= max_tokens || n_prompt_full + generated + 1 >= n_ctx;
             const auto parsed = chat_turn->finish(text, length ? "length" : "stop");
@@ -2192,9 +1658,6 @@ int main(int argc, char ** argv) {
             for (const auto & call : parsed.value("tool_calls", json::array()))
                 calls.push_back({call.at("function").at("name"),call.at("function").at("arguments")});
         } catch (const std::exception & error) { parse_error=error.what(); }
-#else
-        content = parse_tool_calls(rest, calls, tool_schemas, cfmt.lfm2, &parse_error);
-#endif
         if (!parse_error.empty()) {
             fprintf(stderr, "invalid tool call: %s\n", parse_error.c_str());
             res.status = 502;
@@ -2249,7 +1712,5 @@ int main(int argc, char ** argv) {
             host.c_str(), port, model_id.c_str());
     const bool ok = srv.listen(host.c_str(), port);
     if (!ok) fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
-    venc.reset();
-    if (vis_backend) ggml_backend_free(vis_backend);
     return ok ? 0 : 1;
 }

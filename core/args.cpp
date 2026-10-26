@@ -41,7 +41,10 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
         }
         set_knob("QWEN_EXPERT_RAM_CACHE_MB", std::to_string(mib).c_str());
     }
-    else if (a == "--mmproj"  && has_val) o.mmproj_path = next();
+    else if (a == "--mmproj") {
+        fprintf(stderr, "error: this production runtime supports text input only\n");
+        return ArgResult::Error;
+    }
     else if (a == "--cache-profile" && has_val) o.cache_profile = next();
     else if (a == "--ngram"   && has_val) o.ngram_mode = next();
     else if (a == "--ngram-cache" && has_val) o.ngram_cache_mb = (size_t) std::stoul(next());
@@ -65,21 +68,7 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
             return ArgResult::Error;
         }
     }
-    else if (a == "--rpc" && has_val) {
-        const std::string endpoints = next();
-        size_t start = 0;
-        do {
-            const size_t end = endpoints.find(',', start);
-            const std::string endpoint = endpoints.substr(start, end == std::string::npos ? end : end - start);
-            if (endpoint.rfind("127.0.0.1:", 0) != 0 || endpoint.size() <= 10) {
-                fprintf(stderr, "error: --rpc requires loopback SSH forwarding endpoints\n");
-                return ArgResult::Error;
-            }
-            o.rpc_endpoints.push_back(endpoint);
-            if (end == std::string::npos) break;
-            start = end + 1;
-        } while (start < endpoints.size());
-    }
+
     else if (a == "--gpus" && has_val) {
         const std::string v = next();
         if (!parse_gpu_list(v, o.gpu_ids)) {
@@ -162,16 +151,7 @@ bool validate_common_options(const CommonOptions & o) {
     return true;
 }
 
-void reserve_vision_tower_vram(CommonOptions & o, size_t tower_bytes) {
-    if (o.vram_list.empty()) return;              // auto budget: measured after the tower
-    size_t & primary = o.vram_list[0];
-    if (primary == VRAM_BUDGET_AUTO) return;      // same, for the primary device
-    const size_t vmb = (tower_bytes + 1024 * 1024 - 1) / (1024 * 1024);
-    const size_t cut = std::min(primary, vmb);
-    fprintf(stderr, "vision tower: %zu MB GPU; primary VRAM budget %zu -> %zu MB\n",
-            vmb, primary, primary - cut);
-    primary -= cut;
-}
+
 
 bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
     cfg.kv_cache_type = o.kv_cache_type;
@@ -184,7 +164,6 @@ bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
     cfg.vram_budget_mb = 0;
     if (cfg.gpus.size() <= 1 && !o.vram_list.empty() && o.vram_list[0] != VRAM_BUDGET_AUTO)
         cfg.vram_budget_mb = o.vram_list[0];
-    cfg.rpc_endpoints = o.rpc_endpoints;
     cfg.cache_profile  = o.cache_profile;
     cfg.expert_tier    = o.tier();
     cfg.ngram_mode     = o.ngram_mode;
@@ -202,7 +181,6 @@ void print_common_help(FILE * out) {
         "  --kv-cache-type <f16|q8_0>  attention K/V storage (default f16); Q8 requires CUDA flash attention\n"
         "  --reasoning <on|off>  thinking mode (default on)\n"
         "  --repeat-penalty <f>  repetition penalty over the recent tokens (default 1 = off)\n"
-        "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
         "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
         "  --draft <N>         MTP draft length (default 1)\n"
         "  --embd-q8           use Q8_0 (not F16) for the embedding fallback (saves ~45%% VRAM)\n"
@@ -215,7 +193,6 @@ void print_common_help(FILE * out) {
         "                      auto = that GPU's free VRAM (same as omitting it);\n"
         "                      0 = that GPU is not used at all (13.5,auto and 5g,0\n"
         "                      are both valid)\n"
-        "  --rpc <endpoints>   experimental loopback RPC workers; requires matching ggml RPC backend\n"
         "  --gpus <list>       GPU device indices, primary first (e.g. 1, or 1,0).\n"
         "                      Naming two devices -- here or via --vram-budget --\n"
         "                      is what asks for two GPUs; without a --vram-budget\n"

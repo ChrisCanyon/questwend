@@ -1,5 +1,5 @@
 #include "expert_cache.h"
-#include "expert_debug.h"
+#include "expert_debug_hooks.h"
 #include "cache_memory_budget.h"
 #include "workspace_partition.h"
 #include "gpu_lru_pool_hooks.h"
@@ -339,7 +339,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             "(of %.1f MB experts, %d layers x %d experts)\n",
             sigs.size(), frac * 100.0, resident / 1024.0 / 1024.0,
             total_bytes / 1024.0 / 1024.0, n_layer, n_expert);
-    ExpertDebug::instance().initialize(n_layer_, n_expert_);
+    expert_debug_hooks::initialize(n_layer_, n_expert_);
 }
 
 ExpertCache::~ExpertCache() {
@@ -1016,8 +1016,8 @@ void ExpertCache::activation_lookahead(int current_layer) {
 }
 
 void ExpertCache::note_demands(int layer, const int32_t * ids, int count) {
-    ExpertDebug::instance().observe(layer, ids, count);
-    ExpertDebug::instance().maybe_capture(*this);
+    expert_debug_hooks::observe(layer, ids, count);
+    expert_debug_hooks::maybe_capture(*this);
     if (activation_) { SchedulerTimer timing(activation_observe_ms_); activation_->observe(layer, ids, count); }
     if (activation_scores_)
         for (int role = 0; role < N_ROLE; ++role)
@@ -1652,8 +1652,10 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
             for (int r = 0; r < N_ROLE; ++r)
                 outs[r][i] = slot_for(*pools3[r], layer, e, (Role) r);
         }
+#if QW_EXPERT_VISUALIZATION
         refresh_telemetry();
-        ExpertDebug::instance().maybe_capture(*this);
+#endif
+        expert_debug_hooks::maybe_capture(*this);
         return;
     }
 
@@ -1708,7 +1710,7 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
     // Snapshot the origin before fetch_parallel can change the host cache.
     // These slots are transient GPU workspaces, not retained GPU residency.
     std::vector<int> debug_scratch;
-    if (ExpertDebug::instance().mode() == ExpertDebug::Detailed) {
+    if (expert_debug_hooks::mode() == ExpertDebug::Detailed) {
         std::unordered_map<int, size_t> position;
         for (const auto & job : jobs) {
             if (!transient_slot(*job.pool, job.slot)) continue;
@@ -1721,7 +1723,7 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
         }
     }
     fetch_parallel(layer, jobs);
-    ExpertDebug::instance().scratch(layer, debug_scratch);
+    expert_debug_hooks::scratch(layer, debug_scratch);
     if (audit_group) {
         if (weight_audit_->wants_gpu()) {
             // Diagnostic barrier, never a performance configuration. Include
@@ -1743,8 +1745,10 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
         }
         weight_audit_->end();
     }
+#if QW_EXPERT_VISUALIZATION
     refresh_telemetry();
-    ExpertDebug::instance().maybe_capture(*this);
+#endif
+    expert_debug_hooks::maybe_capture(*this);
 }
 
 } // namespace questwend

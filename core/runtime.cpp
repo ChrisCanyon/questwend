@@ -3,7 +3,7 @@
 #include "model.h"
 #include "ngram_table.h"
 #include "expert_cache.h"
-#include "expert_debug.h"
+#include "expert_debug_hooks.h"
 #include "prompt_checkpoint_memory.h"
 #include "hybrid_schedule.h"
 #include "qsa_constant_inputs.h"
@@ -3641,7 +3641,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     // prefix (n_past > 0); prefill bridges the nextn KV across the boundary.
     const int P = (int) prompt.size();
     if (P > 0) prefill(prompt, /*mtp_kv=*/true);
-    ExpertDebug::instance().set_phase(ExpertDebug::Decode);
+    expert_debug_hooks::set_phase(ExpertDebug::Decode);
     std::vector<float> mlog = logits;    // logits of the last prefilled token
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     // prompt fully in KV, nothing generated yet: the state the next request
@@ -4876,7 +4876,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // is fetched once per chunk regardless of chunk length, so expert traffic
         // is amortized over all T tokens instead of per pool-sized mini-chunk.
         for (int il = 0; il < N; ++il) {
-            ExpertDebug::instance().layer_stage(il, "batch_layer", T);
+            expert_debug_hooks::layer_stage(il, "batch_layer", T);
             for (int tc0 = 0; tc0 < T; tc0 += sega_chunk) {
                 const int tlen = std::min(sega_chunk, T - tc0);
                 ggml_context * ctx = new_ctx();
@@ -4919,11 +4919,11 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
                 build_segB(ctx, gf, il, st0, slen);
                 run(ctx, gf);
-                ExpertDebug::instance().execution(il, "gpu", true,
+                expert_debug_hooks::execution(il, "gpu", true,
                     sel.data() + (size_t) st0 * n_used, n_used * slen);
                 if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg B compute failed");
-                ExpertDebug::instance().execution(il, "gpu", false,
+                expert_debug_hooks::execution(il, "gpu", false,
                     sel.data() + (size_t) st0 * n_used, n_used * slen);
                 dump_flush("segB");
                 ggml_free(ctx);
@@ -4949,7 +4949,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
-        ExpertDebug::instance().layer_stage(il, T > 1 ? "batch_layer" : "decode_layer", T);
+        expert_debug_hooks::layer_stage(il, T > 1 ? "batch_layer" : "decode_layer", T);
         if (!hp.is_moe_layer(il)) {
             // Dense block: seg A already finished it, so there is no seg B to
             // fuse the next layer's seg A onto -- run that one on its own.
@@ -4981,11 +4981,11 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * nsel = (k == nsl - 1 && il + 1 < N) ? build_segA(ctx, gf, il + 1, 0, T) : nullptr;
             run(ctx, gf);
             set_attn_inputs(gf, 0, T);
-            ExpertDebug::instance().execution(il, "gpu", true,
+            expert_debug_hooks::execution(il, "gpu", true,
                 sel.data() + (size_t) st0 * n_used, n_used * slen);
             if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
-            ExpertDebug::instance().execution(il, "gpu", false,
+            expert_debug_hooks::execution(il, "gpu", false,
                 sel.data() + (size_t) st0 * n_used, n_used * slen);
             dump_flush("segBA");
             if (nsel)
@@ -5508,7 +5508,7 @@ if (p_ple) {
         };
 
         for (int il = first; il < N; ++il) {
-            ExpertDebug::instance().layer_stage(il, "decode_layer", 1);
+            expert_debug_hooks::layer_stage(il, "decode_layer", 1);
             auto t0 = hclk::now();
 
             // ---- seg A ----
@@ -5673,9 +5673,9 @@ if (p_ple) {
                      ids = cids, weights = cw, held = held_cpu_weights]() {
                         const auto started = hclk::now();
                         std::vector<float> output;
-                        ExpertDebug::instance().execution(il, "cpu", true, ids.data(), (int) ids.size());
+                        expert_debug_hooks::execution(il, "cpu", true, ids.data(), (int) ids.size());
                         cpu_experts(il, input.data(), ids, weights, output, &held);
-                        ExpertDebug::instance().execution(il, "cpu", false, ids.data(), (int) ids.size());
+                        expert_debug_hooks::execution(il, "cpu", false, ids.data(), (int) ids.size());
                         const double duration = std::chrono::duration<double, std::milli>(hclk::now() - started).count();
                         return std::make_pair(std::move(output), duration);
                     });
@@ -5683,9 +5683,9 @@ if (p_ple) {
             }
             auto cpu_started = hclk::now();
             if (bounded_cpu_miss && !overlap_bounded_cpu && !cids.empty() && !cpu_future.valid()) {
-                ExpertDebug::instance().execution(il, "cpu", true, cids.data(), (int) cids.size());
+                expert_debug_hooks::execution(il, "cpu", true, cids.data(), (int) cids.size());
                 cpu_experts(il, pin_x, cids, cw, corr);
-                ExpertDebug::instance().execution(il, "cpu", false, cids.data(), (int) cids.size());
+                expert_debug_hooks::execution(il, "cpu", false, cids.data(), (int) cids.size());
             }
             cm_cpu_ms += ms_since(cpu_started);
             if (bounded_cpu_miss) {
@@ -5756,7 +5756,7 @@ if (p_ple) {
                 ggml_backend_tensor_set_async(be, gb->w,      pin_gw,               0, (size_t) nr * sizeof(float));
             }
             if (nr > 0)
-                ExpertDebug::instance().execution(il, "gpu", true, gpu_ids.data(), (int) gpu_ids.size());
+                expert_debug_hooks::execution(il, "gpu", true, gpu_ids.data(), (int) gpu_ids.size());
             if (do_B && ggml_backend_graph_compute_async(be, gb->gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached: cpu-miss seg B failed");
             cm_b_ms += ms_since(t0);
@@ -5774,14 +5774,14 @@ if (p_ple) {
                     hss_cpu_ms = 0.95 * hss_cpu_ms + 0.05 * per_expert;
                 }
             } else if ((!bounded_cpu_miss || overlap_bounded_cpu) && !cids.empty()) {
-                ExpertDebug::instance().execution(il, "cpu", true, cids.data(), (int) cids.size());
+                expert_debug_hooks::execution(il, "cpu", true, cids.data(), (int) cids.size());
                 cpu_experts(il, pin_x, cids, cw, corr, overlap_bounded_cpu ? &held_cpu_weights : nullptr);
-                ExpertDebug::instance().execution(il, "cpu", false, cids.data(), (int) cids.size());
+                expert_debug_hooks::execution(il, "cpu", false, cids.data(), (int) cids.size());
             }
             auto tw = hclk::now();
             ggml_backend_synchronize(be);
             if (nr > 0)
-                ExpertDebug::instance().execution(il, "gpu", false, gpu_ids.data(), (int) gpu_ids.size());
+                expert_debug_hooks::execution(il, "gpu", false, gpu_ids.data(), (int) gpu_ids.size());
             if (!asynchronous_cpu) cm_cpu_ms += std::chrono::duration<double, std::milli>(tw - tc).count();
             cm_wait_ms += ms_since(tw);
             if (tctx) { ggml_free(tctx); tctx = nullptr; }
@@ -5853,9 +5853,9 @@ if (p_ple) {
         ggml_tensor * nsel = fuse ? build_segA(ctx, gf, il + 1) : nullptr;
         run(ctx, gf, p);
         set_attn_inputs(gf);
-        ExpertDebug::instance().execution(il, "gpu", true, sel.data(), n_used);
+        expert_debug_hooks::execution(il, "gpu", true, sel.data(), n_used);
         compute(gf, p, "fused segB/segA compute failed");
-        ExpertDebug::instance().execution(il, "gpu", false, sel.data(), n_used);
+        expert_debug_hooks::execution(il, "gpu", false, sel.data(), n_used);
         dump_flush("segBA");
         if (fuse && nsel) {
             const int p1 = pdev_of(il + 1);
@@ -6667,7 +6667,7 @@ ExpertTelemetry Runtime::expert_telemetry_snapshot(int layer) const {
 }
 void Runtime::refresh_expert_debug() {
     for (const auto & cache : impl_->ecaches)
-        if (cache) ExpertDebug::instance().maybe_capture(*cache, true);
+        if (cache) expert_debug_hooks::maybe_capture(*cache, true);
 }
 Runtime::CacheStats Runtime::cache_stats() const {
     CacheStats c;

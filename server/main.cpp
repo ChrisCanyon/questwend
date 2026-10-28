@@ -6,8 +6,10 @@
 #include "model.h"
 #include "token_pieces.h"
 #include "runtime.h"
-#include "expert_debug.h"
+#include "expert_debug_hooks.h"
+#if QW_EXPERT_VISUALIZATION
 #include "expert_debug_routes.h"
+#endif
 #include "sampler.h"
 #include "questwend_bridge.h"
 #include "args.h"
@@ -1030,7 +1032,9 @@ int main(int argc, char ** argv) {
         res.set_content(j.dump(), "application/json");
     });
 
+#if QW_EXPERT_VISUALIZATION
     register_expert_debug_routes(srv, rt, tlock, model);
+#endif
 
     srv.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
         json body;
@@ -1183,7 +1187,7 @@ int main(int argc, char ** argv) {
                     if (st->finished) return false;
                     auto release_runtime = [&]() {
                         if (!st->holding) return;
-                        ExpertDebug::instance().set_phase(ExpertDebug::Idle);
+                        expert_debug_hooks::set_phase(ExpertDebug::Idle);
                         tlock.unlock();
                         st->holding = false;
                     };
@@ -1345,7 +1349,7 @@ int main(int argc, char ** argv) {
                             st->slice_used = 0;   // fresh slice on (re)acquisition
                             *cur_prog = st->prog; // progress lines report this request
                         }
-                        ExpertDebug::instance().set_phase(
+                        expert_debug_hooks::set_phase(
                             st->pf_done || st->generated > 0 ? ExpertDebug::Decode : ExpertDebug::Prefill);
 
                         // clip the image-embedding overrides to a prompt chunk
@@ -1396,7 +1400,7 @@ int main(int argc, char ** argv) {
                                     return finish();
                                 }
                                 if (reprefill) {
-                                    ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                                    expert_debug_hooks::set_phase(ExpertDebug::Prefill);
                                     rt->prefill(st->my_toks, true);   // exact rebuild incl nextn KV
                                 }
                             }
@@ -1520,7 +1524,7 @@ int main(int argc, char ** argv) {
                                 return finish();
                             }
                             if (reprefill) {
-                                ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                                expert_debug_hooks::set_phase(ExpertDebug::Prefill);
                                 st->logits = rt->decode(st->my_toks);
                             }
                         }
@@ -1562,7 +1566,7 @@ int main(int argc, char ** argv) {
                             st->t_prefill = clk::now();
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
-                        ExpertDebug::instance().set_phase(ExpertDebug::Decode);
+                        expert_debug_hooks::set_phase(ExpertDebug::Decode);
                         int next = st->smp.sample(st->logits);
                         st->smp.accept(next);   // repetition-penalty window
                         // stop on EOS, token budget, or context limit (avoids overflow crash)
@@ -1601,10 +1605,10 @@ int main(int argc, char ** argv) {
                 TicketLock & t;
                 Guard(TicketLock & t_) : t(t_) {
                     t.lock();
-                    ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                    expert_debug_hooks::set_phase(ExpertDebug::Prefill);
                 }
                 ~Guard() {
-                    ExpertDebug::instance().set_phase(ExpertDebug::Idle);
+                    expert_debug_hooks::set_phase(ExpertDebug::Idle);
                     t.unlock();
                 }
             } lk(tlock);
@@ -1648,7 +1652,7 @@ int main(int argc, char ** argv) {
                 auto logits = rt->decode(prompt);
                 rt->snapshot_ckpt();   // rewind point at prompt end
                 t_prefill = clk::now();
-                ExpertDebug::instance().set_phase(ExpertDebug::Decode);
+                expert_debug_hooks::set_phase(ExpertDebug::Decode);
                 smp.prime(cp.ids);     // repetition-penalty window (prompt tail)
                 clk::time_point glog = clk::now();
                 for (int t = 0; t < max_tokens; ++t) {

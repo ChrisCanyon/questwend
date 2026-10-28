@@ -1,4 +1,5 @@
 #include "expert_cache.h"
+#include "expert_debug.h"
 #include "cache_memory_budget.h"
 #include "workspace_partition.h"
 #include "gpu_lru_pool_hooks.h"
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
 #include <utility>
 #include <stdexcept>
 #include <string>
@@ -139,8 +141,16 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 
     const char * preserve_decode = getenv("QWEN_PRESERVE_DECODE_CACHE");
     prefill_cache_policy_.set_enabled(preserve_decode && std::string(preserve_decode) != "0");
+    const char * static_prefill = getenv("QWEN_STATIC_PREFILL_CACHE");
+    const bool static_prefill_cache = static_prefill && std::string(static_prefill) == "1";
+    prefill_cache_policy_.set_static_placement(static_prefill_cache);
     transient_admission_ = getenv("QWEN_TINYLFU_ADMISSION") != nullptr;
-    phase_workspace_ = transient_admission_ && getenv("QWEN_PHASE_WORKSPACE") != nullptr;
+    // The opt-in cold workspace preserves the learned placement until the first
+    // decode token. Thereafter the normal small decode workspace is available.
+    cold_prefill_workspace_ = static_prefill_cache && getenv("QWEN_COLD_PREFILL_WORKSPACE") != nullptr;
+    // The older static mode retains its fixed partition for rollback.
+    phase_workspace_ = transient_admission_ && getenv("QWEN_PHASE_WORKSPACE") != nullptr &&
+        (!static_prefill_cache || cold_prefill_workspace_);
     if (transient_admission_ && (!host_cache_ || readthrough_ram_ || getenv("QWEN_FASTCACHE")))
         throw std::runtime_error("Transient admission requires the exclusive RAM tier and exact segmented execution");
     infinity_policy_ = getenv("QWEN_MOE_INFINITY") != nullptr;
@@ -337,6 +347,7 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
             "(of %.1f MB experts, %d layers x %d experts)\n",
             sigs.size(), frac * 100.0, resident / 1024.0 / 1024.0,
             total_bytes / 1024.0 / 1024.0, n_layer, n_expert);
+    ExpertDebug::instance().initialize(n_layer_, n_expert_);
 }
 
 ExpertCache::~ExpertCache() {
@@ -422,8 +433,10 @@ void ExpertCache::set_phase_workspace(bool batched, int token_count, bool source
     ssd_read_phase_.enter_phase(source_prefill);
     // Record both phases even when physical workspace resizing is disabled.
     prefill_cache_policy_.enter_phase(source_prefill);
+    if (!batched && !source_prefill) cold_prefill_pending_ = false;
     if (!phase_workspace_) return;
-    const int scratch = bounded_workspace_scratch(n_expert_, n_used_, batched ? token_count : 1);
+    const int scratch = cold_prefill_workspace_ && cold_prefill_pending_ && source_prefill
+        ? n_expert_ : bounded_workspace_scratch(n_expert_, n_used_, batched ? token_count : 1);
     const auto plan = plan_workspace_partition(pools_, scratch, n_used_);
     if (!plan.changed) return;
     require_workspace_boundary(active_demands_);
@@ -732,6 +745,91 @@ bool ExpertCache::host_resident(int layer, int expert, bool touch) {
     return true;
 }
 
+void ExpertCache::request_telemetry_layer(int layer) {
+    telemetry_requested_layer_.store(layer, std::memory_order_relaxed);
+}
+
+ExpertTelemetry ExpertCache::telemetry_snapshot() const {
+    std::lock_guard<std::mutex> guard(telemetry_mutex_);
+    return telemetry_;
+}
+
+void ExpertCache::debug_placement(std::vector<uint8_t> & gpu,
+                                  std::vector<uint8_t> & ram) const {
+    const size_t size = static_cast<size_t>(n_layer_) * n_expert_;
+    if (gpu.size() != size || ram.size() != size) return;
+    for (int layer = 0; layer < n_layer_; ++layer) {
+        if (!serves(layer)) continue;
+        const size_t start = static_cast<size_t>(layer) * n_expert_;
+        std::fill_n(gpu.begin() + start, n_expert_, 0);
+        std::fill_n(ram.begin() + start, n_expert_, 0);
+        for (int role = 0; role < N_ROLE; ++role) {
+            const auto present = host_cache_
+                ? host_cache_->presence_range(ram_key(role, layer, 0), n_expert_)
+                : std::vector<uint8_t>{};
+            for (int expert = 0; expert < n_expert_; ++expert) {
+                const size_t key = start + expert;
+                if (resident(static_cast<Role>(role), layer, expert))
+                    gpu[key] |= static_cast<uint8_t>(1 << role);
+                else if (!present.empty() && present[expert])
+                    ram[key] |= static_cast<uint8_t>(1 << role);
+            }
+        }
+    }
+}
+
+void ExpertCache::refresh_telemetry(bool force) {
+    const int selected = telemetry_requested_layer_.load(std::memory_order_relaxed);
+    if (!serves(selected)) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && telemetry_last_ != std::chrono::steady_clock::time_point{} &&
+        now - telemetry_last_ < std::chrono::milliseconds(500)) return;
+    telemetry_last_ = now;
+
+    ExpertTelemetry next;
+    next.layer = selected;
+    next.layers = n_layer_;
+    next.experts = n_expert_;
+    next.sampled_at_unix_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    next.observations_available = activation_ != nullptr;
+    next.gpu_mask.assign(n_expert_, 0);
+    next.ram_mask.assign(n_expert_, 0);
+    next.observations.assign(n_expert_, 0);
+
+    for (int role = 0; role < N_ROLE; ++role) {
+        const auto present = host_cache_
+            ? host_cache_->presence_range(ram_key(role, selected, 0), n_expert_)
+            : std::vector<uint8_t>{};
+        for (int expert = 0; expert < n_expert_; ++expert) {
+            if (resident(static_cast<Role>(role), selected, expert))
+                next.gpu_mask[expert] |= static_cast<uint8_t>(1 << role);
+            if (!present.empty() && present[expert])
+                next.ram_mask[expert] |= static_cast<uint8_t>(1 << role);
+        }
+    }
+    if (activation_)
+        for (int expert = 0; expert < n_expert_; ++expert)
+            next.observations[expert] = activation_->observed_count(selected, expert);
+    if (host_cache_) {
+        const auto usage = host_cache_->stats();
+        next.ram_capacity_bytes = usage.capacity_bytes;
+        next.ram_resident_bytes = usage.resident_bytes;
+    }
+
+    next.capture_microseconds = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - now).count());
+    telemetry_total_microseconds_ += next.capture_microseconds;
+    next.capture_total_microseconds = telemetry_total_microseconds_;
+    next.capture_samples = ++telemetry_samples_;
+
+    std::lock_guard<std::mutex> guard(telemetry_mutex_);
+    next.sequence = telemetry_.sequence + 1;
+    telemetry_ = std::move(next);
+}
+
 void ExpertCache::copy_host_slab(Role role, int layer, int expert, void * destination, size_t bytes) {
     if (!host_cache_ || !host_cache_->copy(ram_key(role, layer, expert), destination, bytes))
         throw std::runtime_error("CPU expert lost a required RAM slab before execution");
@@ -1013,6 +1111,8 @@ void ExpertCache::activation_lookahead(int current_layer) {
 }
 
 void ExpertCache::note_demands(int layer, const int32_t * ids, int count) {
+    ExpertDebug::instance().observe(layer, ids, count);
+    ExpertDebug::instance().maybe_capture(*this);
     if (activation_) { SchedulerTimer timing(activation_observe_ms_); activation_->observe(layer, ids, count); }
     if (activation_scores_)
         for (int role = 0; role < N_ROLE; ++role)
@@ -1031,6 +1131,7 @@ void ExpertCache::note_demands(int layer, const int32_t * ids, int count) {
 }
 
 bool ExpertCache::can_retain(int layer, int expert) {
+    if (!prefill_cache_policy_.retain_new_gpu_copy()) return false;
     if (!admission_) return true;
     const size_t candidate = (size_t) layer * n_expert_ + expert;
     for (int role = 0; role < N_ROLE; ++role) {
@@ -1818,6 +1919,8 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
             for (int r = 0; r < N_ROLE; ++r)
                 outs[r][i] = slot_for(*pools3[r], layer, e, (Role) r);
         }
+        refresh_telemetry();
+        ExpertDebug::instance().maybe_capture(*this);
         return;
     }
 
@@ -1869,7 +1972,23 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
             }
         }
     }
+    // Snapshot the origin before fetch_parallel can change the host cache.
+    // These slots are transient GPU workspaces, not retained GPU residency.
+    std::vector<int> debug_scratch;
+    if (ExpertDebug::instance().mode() == ExpertDebug::Detailed) {
+        std::unordered_map<int, size_t> position;
+        for (const auto & job : jobs) {
+            if (!transient_slot(*job.pool, job.slot)) continue;
+            auto [it, inserted] = position.emplace(job.expert, debug_scratch.size());
+            if (inserted) debug_scratch.insert(debug_scratch.end(), {job.expert, 0, 0});
+            const int bit = 1 << job.role;
+            debug_scratch[it->second + 1] |= bit;
+            if (host_cache_ && host_cache_->contains(ram_key(job.role, layer, job.expert)))
+                debug_scratch[it->second + 2] |= bit;
+        }
+    }
     fetch_parallel(layer, jobs);
+    ExpertDebug::instance().scratch(layer, debug_scratch);
     if (audit_group) {
         if (weight_audit_->wants_gpu()) {
             // Diagnostic barrier, never a performance configuration. Include
@@ -1891,6 +2010,8 @@ void ExpertCache::ensure(int layer, const int32_t * expert_ids, int n,
         }
         weight_audit_->end();
     }
+    refresh_telemetry();
+    ExpertDebug::instance().maybe_capture(*this);
 }
 
 } // namespace questwend

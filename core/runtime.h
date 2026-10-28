@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "expert_telemetry.h"
 
 typedef struct ggml_backend_device * ggml_backend_dev_t;
 
@@ -183,6 +184,10 @@ public:
     CacheStats cache_stats() const;
     void save_expert_profile(const std::string & prefix) const;
     bool has_expert_cache() const;
+    bool request_expert_telemetry_layer(int layer);
+    void refresh_expert_telemetry(int layer);
+    ExpertTelemetry expert_telemetry_snapshot(int layer) const;
+    void refresh_expert_debug();
 
     // Progress callback invoked once per prefill chunk (offload path only;
     // resident prefill is a single fast pass): (tokens_done, tokens_total).

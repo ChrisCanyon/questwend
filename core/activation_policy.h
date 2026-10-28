@@ -43,6 +43,12 @@ public:
 
     double priority(size_t logical_key) const { return priorities_.at(logical_key); }
 
+    // Owner-thread read for the optional dashboard snapshot. Counts are
+    // observations since model load, not a claim that this policy is enabled.
+    uint64_t observed_count(int layer, int expert) const {
+        return counts_.at((size_t) layer * experts_ + expert);
+    }
+
     void save_trace(const std::string & path) const {
         std::ofstream output(path);
         if (!output) throw std::runtime_error("Cannot save activation trace");

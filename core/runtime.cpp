@@ -3,6 +3,7 @@
 #include "model.h"
 #include "ngram_table.h"
 #include "expert_cache.h"
+#include "expert_debug.h"
 #include "prompt_checkpoint_memory.h"
 #include "hybrid_schedule.h"
 #include "qsa_constant_inputs.h"
@@ -1920,6 +1921,10 @@ void Runtime::Impl::init_cache() {
                         n, path.c_str());
         }
     }
+    if (const char * cold_prime = getenv("QWEN_COLD_PRIME")) {
+        if (std::strcmp(cold_prime, "1") == 0)
+            for (auto * cache : all_ecaches()) cache->prime_cold();
+    }
     const char * trace_enabled = getenv("QWEN_DEMAND_TRACE");
     if (trace_enabled && std::strcmp(trace_enabled, "1") == 0) {
         if (multi_gpu() || cache_fast_enabled || resident_decode ||
@@ -3636,6 +3641,7 @@ void Runtime::Impl::generate_mtp(const std::vector<int32_t> & prompt, int max_ne
     // prefix (n_past > 0); prefill bridges the nextn KV across the boundary.
     const int P = (int) prompt.size();
     if (P > 0) prefill(prompt, /*mtp_kv=*/true);
+    ExpertDebug::instance().set_phase(ExpertDebug::Decode);
     std::vector<float> mlog = logits;    // logits of the last prefilled token
     kv_toks.insert(kv_toks.end(), prompt.begin(), prompt.end());
     // prompt fully in KV, nothing generated yet: the state the next request
@@ -4870,6 +4876,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         // is fetched once per chunk regardless of chunk length, so expert traffic
         // is amortized over all T tokens instead of per pool-sized mini-chunk.
         for (int il = 0; il < N; ++il) {
+            ExpertDebug::instance().layer_stage(il, "batch_layer", T);
             for (int tc0 = 0; tc0 < T; tc0 += sega_chunk) {
                 const int tlen = std::min(sega_chunk, T - tc0);
                 ggml_context * ctx = new_ctx();
@@ -4912,8 +4919,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
                 ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
                 build_segB(ctx, gf, il, st0, slen);
                 run(ctx, gf);
+                ExpertDebug::instance().execution(il, "gpu", true,
+                    sel.data() + (size_t) st0 * n_used, n_used * slen);
                 if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                     throw std::runtime_error("decode_cached_batch: seg B compute failed");
+                ExpertDebug::instance().execution(il, "gpu", false,
+                    sel.data() + (size_t) st0 * n_used, n_used * slen);
                 dump_flush("segB");
                 ggml_free(ctx);
             }
@@ -4938,6 +4949,7 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
         ggml_free(ctx);
     }
     for (int il = 0; il < N; ++il) {
+        ExpertDebug::instance().layer_stage(il, T > 1 ? "batch_layer" : "decode_layer", T);
         if (!hp.is_moe_layer(il)) {
             // Dense block: seg A already finished it, so there is no seg B to
             // fuse the next layer's seg A onto -- run that one on its own.
@@ -4969,8 +4981,12 @@ void Runtime::Impl::decode_cached_batch(const int32_t * toks, int n_tokens, bool
             ggml_tensor * nsel = (k == nsl - 1 && il + 1 < N) ? build_segA(ctx, gf, il + 1, 0, T) : nullptr;
             run(ctx, gf);
             set_attn_inputs(gf, 0, T);
+            ExpertDebug::instance().execution(il, "gpu", true,
+                sel.data() + (size_t) st0 * n_used, n_used * slen);
             if (compute_graph(gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached_batch: fused segB/segA compute failed");
+            ExpertDebug::instance().execution(il, "gpu", false,
+                sel.data() + (size_t) st0 * n_used, n_used * slen);
             dump_flush("segBA");
             if (nsel)
                 ggml_backend_tensor_get(nsel, sel.data(), 0, (size_t) n_used * T * sizeof(int32_t));
@@ -5492,6 +5508,7 @@ if (p_ple) {
         };
 
         for (int il = first; il < N; ++il) {
+            ExpertDebug::instance().layer_stage(il, "decode_layer", 1);
             auto t0 = hclk::now();
 
             // ---- seg A ----
@@ -5656,15 +5673,20 @@ if (p_ple) {
                      ids = cids, weights = cw, held = held_cpu_weights]() {
                         const auto started = hclk::now();
                         std::vector<float> output;
+                        ExpertDebug::instance().execution(il, "cpu", true, ids.data(), (int) ids.size());
                         cpu_experts(il, input.data(), ids, weights, output, &held);
+                        ExpertDebug::instance().execution(il, "cpu", false, ids.data(), (int) ids.size());
                         const double duration = std::chrono::duration<double, std::milli>(hclk::now() - started).count();
                         return std::make_pair(std::move(output), duration);
                     });
                 cpu_submit_ms += ms_since(submitting);
             }
             auto cpu_started = hclk::now();
-            if (bounded_cpu_miss && !overlap_bounded_cpu && !cids.empty() && !cpu_future.valid())
+            if (bounded_cpu_miss && !overlap_bounded_cpu && !cids.empty() && !cpu_future.valid()) {
+                ExpertDebug::instance().execution(il, "cpu", true, cids.data(), (int) cids.size());
                 cpu_experts(il, pin_x, cids, cw, corr);
+                ExpertDebug::instance().execution(il, "cpu", false, cids.data(), (int) cids.size());
+            }
             cm_cpu_ms += ms_since(cpu_started);
             if (bounded_cpu_miss) {
                 gsg.resize(gpu_ids.size()); gsu.resize(gpu_ids.size()); gsd.resize(gpu_ids.size());
@@ -5677,6 +5699,7 @@ if (p_ple) {
                 if (ec->resident(ExpertCache::GATE, il, e) && ec->resident(ExpertCache::UP, il, e) &&
                     ec->resident(ExpertCache::DOWN, il, e)) {
                     gsg.push_back(rg[e]); gsu.push_back(ru[e]); gsd.push_back(rd[e]);
+                    gpu_ids.push_back(e);
                     gw.push_back(pin_w[k]);
                     ec->touch(ExpertCache::GATE, il, e);
                     ec->touch(ExpertCache::UP,   il, e);
@@ -5686,6 +5709,7 @@ if (p_ple) {
                     // complete RAM-resident experts are eligible for CPU work.
                     ec->ensure_resident(il, e);
                     gsg.push_back(rg[e]); gsu.push_back(ru[e]); gsd.push_back(rd[e]);
+                    gpu_ids.push_back(e);
                     gw.push_back(pin_w[k]);
                 } else {
                     cids.push_back(e); cw.push_back(pin_w[k]);
@@ -5731,6 +5755,8 @@ if (p_ple) {
                 ggml_backend_tensor_set_async(be, gb->ids[2], pin_ids + 2 * n_used, 0, (size_t) nr * sizeof(int32_t));
                 ggml_backend_tensor_set_async(be, gb->w,      pin_gw,               0, (size_t) nr * sizeof(float));
             }
+            if (nr > 0)
+                ExpertDebug::instance().execution(il, "gpu", true, gpu_ids.data(), (int) gpu_ids.size());
             if (do_B && ggml_backend_graph_compute_async(be, gb->gf) != GGML_STATUS_SUCCESS)
                 throw std::runtime_error("decode_cached: cpu-miss seg B failed");
             cm_b_ms += ms_since(t0);
@@ -5748,10 +5774,14 @@ if (p_ple) {
                     hss_cpu_ms = 0.95 * hss_cpu_ms + 0.05 * per_expert;
                 }
             } else if ((!bounded_cpu_miss || overlap_bounded_cpu) && !cids.empty()) {
+                ExpertDebug::instance().execution(il, "cpu", true, cids.data(), (int) cids.size());
                 cpu_experts(il, pin_x, cids, cw, corr, overlap_bounded_cpu ? &held_cpu_weights : nullptr);
+                ExpertDebug::instance().execution(il, "cpu", false, cids.data(), (int) cids.size());
             }
             auto tw = hclk::now();
             ggml_backend_synchronize(be);
+            if (nr > 0)
+                ExpertDebug::instance().execution(il, "gpu", false, gpu_ids.data(), (int) gpu_ids.size());
             if (!asynchronous_cpu) cm_cpu_ms += std::chrono::duration<double, std::milli>(tw - tc).count();
             cm_wait_ms += ms_since(tw);
             if (tctx) { ggml_free(tctx); tctx = nullptr; }
@@ -5823,7 +5853,9 @@ if (p_ple) {
         ggml_tensor * nsel = fuse ? build_segA(ctx, gf, il + 1) : nullptr;
         run(ctx, gf, p);
         set_attn_inputs(gf);
+        ExpertDebug::instance().execution(il, "gpu", true, sel.data(), n_used);
         compute(gf, p, "fused segB/segA compute failed");
+        ExpertDebug::instance().execution(il, "gpu", false, sel.data(), n_used);
         dump_flush("segBA");
         if (fuse && nsel) {
             const int p1 = pdev_of(il + 1);
@@ -6617,6 +6649,26 @@ void Runtime::reset()        { impl_->n_past = 0; impl_->mtp_past = 0; impl_->mr
 int  Runtime::n_past() const { return impl_->n_past; }
 const std::vector<int32_t> & Runtime::kv_tokens() const { return impl_->kv_toks; }
 bool Runtime::has_expert_cache() const { return impl_->ecache != nullptr; }
+bool Runtime::request_expert_telemetry_layer(int layer) {
+    if (layer < 0 || layer >= static_cast<int>(impl_->model.hparams().n_layer)) return false;
+    ExpertCache * cache = impl_->ec_of(layer);
+    if (!cache) return false;
+    cache->request_telemetry_layer(layer);
+    return true;
+}
+void Runtime::refresh_expert_telemetry(int layer) {
+    if (layer >= 0 && layer < static_cast<int>(impl_->model.hparams().n_layer))
+        if (ExpertCache * cache = impl_->ec_of(layer)) cache->refresh_telemetry(true);
+}
+ExpertTelemetry Runtime::expert_telemetry_snapshot(int layer) const {
+    if (layer < 0 || layer >= static_cast<int>(impl_->model.hparams().n_layer)) return {};
+    const ExpertCache * cache = impl_->ec_of(layer);
+    return cache ? cache->telemetry_snapshot() : ExpertTelemetry{};
+}
+void Runtime::refresh_expert_debug() {
+    for (const auto & cache : impl_->ecaches)
+        if (cache) ExpertDebug::instance().maybe_capture(*cache, true);
+}
 Runtime::CacheStats Runtime::cache_stats() const {
     CacheStats c;
     if (impl_->ecache) {

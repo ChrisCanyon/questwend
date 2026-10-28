@@ -30,7 +30,11 @@
 #include "prefill_cache_policy.h"
 #include "expert_ssd_read_phase.h"
 #include "activation_policy.h"
+#include "expert_telemetry.h"
+#include <atomic>
+#include <chrono>
 #include <future>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -186,10 +190,16 @@ public:
     // Kernel batching and source-prefill cache policy are independent.
     void set_phase_workspace(bool batched, int token_count, bool source_prefill = true);
     bool host_resident(int layer, int expert, bool touch = true);
+    void request_telemetry_layer(int layer);
+    void refresh_telemetry(bool force = false);
+    ExpertTelemetry telemetry_snapshot() const;
+    // Read-only placement probe used only by the optional debug recorder.
+    void debug_placement(std::vector<uint8_t> & gpu, std::vector<uint8_t> & ram) const;
     void activation_lookahead(int current_layer);
     void copy_host_slab(Role role, int layer, int expert, void * destination, size_t bytes);
     std::shared_ptr<const uint8_t[]> borrow_host_slab(Role role, int layer, int expert, size_t bytes);
     size_t load_prefetch(const std::string & path);   // returns # experts prefetched
+    void prime_cold(); // opt-in, deterministic empty-cache fill before the first request
 
 private:
     struct Pool {
@@ -282,6 +292,12 @@ private:
     std::unique_ptr<ExpertAdmission> admission_;
     RamSsdAdmission ram_ssd_admission_;
     std::unique_ptr<ActivationPolicy> activation_;
+    std::atomic<int> telemetry_requested_layer_{-1};
+    std::chrono::steady_clock::time_point telemetry_last_{};
+    mutable std::mutex telemetry_mutex_;
+    ExpertTelemetry telemetry_;
+    uint64_t telemetry_total_microseconds_ = 0;
+    uint64_t telemetry_samples_ = 0;
     bool infinity_policy_ = false;
     bool activation_scores_ = false, activation_prefetch_ = false;
     double gpu_victim_selection_ms_ = 0, activation_observe_ms_ = 0;
@@ -301,6 +317,8 @@ private:
     std::vector<uint8_t> active_demands_;
     bool transient_admission_ = false;
     bool phase_workspace_ = false;
+    bool cold_prefill_workspace_ = false;
+    bool cold_prefill_pending_ = true;
     PrefillCachePolicy prefill_cache_policy_;
     uint64_t transient_role_fills_ = 0, retained_role_fills_ = 0, proactive_promotions_ = 0;
     bool can_retain(int layer, int expert);

@@ -6,6 +6,7 @@
 #include "model.h"
 #include "token_pieces.h"
 #include "runtime.h"
+#include "expert_debug.h"
 #include "sampler.h"
 #include "questwend_bridge.h"
 #include "args.h"
@@ -17,17 +18,20 @@
 #include "json.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <set>
 #include <mutex>
 #include <string>
+#include <stdexcept>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -54,6 +58,14 @@ struct TicketLock {
         ++waiting;
         cv.wait(lk, [&] { return serving == t; });
         --waiting;
+    }
+    // Read-only telemetry may sample an idle runtime, but must never queue
+    // behind an inference request or delay its next scheduled slice.
+    bool try_lock() {
+        std::lock_guard<std::mutex> lk(m);
+        if (next != serving) return false;
+        ++next;
+        return true;
     }
     // Bounded wait: take a ticket, give up after `d`. On timeout the ticket is
     // abandoned (unlock() skips it) and a later retry re-queues at the back —
@@ -1017,6 +1029,112 @@ int main(int argc, char ** argv) {
         res.set_content(j.dump(), "application/json");
     });
 
+    srv.Get("/expert-telemetry", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!rt->has_expert_cache()) {
+            res.status = 404;
+            res.set_content(R"({"status":"unsupported"})", "application/json");
+            return;
+        }
+        int layer = -1;
+        try {
+            const std::string value = req.get_param_value("layer");
+            if (value.empty() || value.size() > 5 ||
+                !std::all_of(value.begin(), value.end(), [](unsigned char c) { return c >= '0' && c <= '9'; }))
+                throw std::invalid_argument("Invalid layer");
+            layer = std::stoi(value);
+        } catch (const std::exception &) {
+            res.status = 400;
+            res.set_content(R"({"error":"layer must be a nonnegative integer"})", "application/json");
+            return;
+        }
+        if (!rt->request_expert_telemetry_layer(layer)) {
+            res.status = 400;
+            res.set_content(R"({"error":"layer has no expert cache"})", "application/json");
+            return;
+        }
+        if (tlock.try_lock()) {
+            rt->refresh_expert_telemetry(layer);
+            tlock.unlock();
+        }
+        const auto view = rt->expert_telemetry_snapshot(layer);
+        if (view.layer != layer || view.sequence == 0) {
+            res.set_content(json{{"status", "warming"}, {"layer", layer},
+                {"layers", model->hparams().n_layer}, {"experts", model->hparams().n_expert}}.dump(),
+                "application/json");
+            return;
+        }
+        res.set_content(json{{"status", "ok"}, {"layer", view.layer},
+            {"layers", view.layers}, {"experts", view.experts},
+            {"sampled_at_unix_ms", view.sampled_at_unix_ms}, {"sequence", view.sequence},
+            {"observations_available", view.observations_available},
+            {"ram_capacity_bytes", view.ram_capacity_bytes},
+            {"ram_resident_bytes", view.ram_resident_bytes},
+            {"capture_microseconds", view.capture_microseconds},
+            {"capture_total_microseconds", view.capture_total_microseconds},
+            {"capture_samples", view.capture_samples},
+            {"gpu_mask", view.gpu_mask}, {"ram_mask", view.ram_mask},
+            {"observations", view.observations}}.dump(), "application/json");
+    });
+
+    // Debug recorder is leased by the operator service. The server itself also
+    // enforces the expiry so a crashed browser cannot leave capture running.
+    srv.Post("/expert-debug/mode", [&](const httplib::Request & req, httplib::Response & res) {
+        try {
+            const json body = json::parse(req.body);
+            const std::string requested = body.at("mode").get<std::string>();
+            const int ttl = body.value("ttl_ms", 30000);
+            if ((requested != "off" && requested != "overview" && requested != "detailed") ||
+                ttl < 0 || ttl > 60000) throw std::invalid_argument("invalid debug mode or TTL");
+            const auto mode = requested == "detailed" ? ExpertDebug::Detailed :
+                              requested == "overview" ? ExpertDebug::Overview : ExpertDebug::Off;
+            ExpertDebug::instance().configure(mode, static_cast<uint64_t>(ttl));
+            res.set_content(json{{"mode", requested}, {"ttl_ms", ttl}}.dump(), "application/json");
+        } catch (const std::exception &) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid debug mode request"})", "application/json");
+        }
+    });
+    srv.Get("/expert-debug/snapshot", [&](const httplib::Request &, httplib::Response & res) {
+        const auto mode = ExpertDebug::instance().mode();
+        if (mode == ExpertDebug::Off) {
+            res.set_content(R"({"status":"off"})", "application/json");
+            return;
+        }
+        if (tlock.try_lock()) {
+            rt->refresh_expert_debug();
+            tlock.unlock();
+        }
+        const auto view = ExpertDebug::instance().snapshot();
+        res.set_content(json{{"status", view.sequence ? "ok" : "warming"},
+            {"mode", mode == ExpertDebug::Detailed ? "detailed" : "overview"},
+            {"layers", view.layers}, {"experts", view.experts},
+            {"sequence", view.sequence}, {"sampled_at_ms", view.sampled_at_ms},
+            {"capture_us", view.capture_us}, {"capture_total_us", view.capture_total_us},
+            {"capture_samples", view.capture_samples}, {"dropped_events", view.dropped_events},
+            {"phase", view.phase},
+            {"gpu", view.gpu}, {"ram", view.ram}, {"observations", view.observations}}
+            .dump(), "application/json");
+    });
+    srv.Get("/expert-debug/events", [&](const httplib::Request & req, httplib::Response & res) {
+        uint64_t since = 0;
+        try {
+            if (req.has_param("since")) since = std::stoull(req.get_param_value("since"));
+        } catch (const std::exception &) {
+            res.status = 400;
+            res.set_content(R"({"error":"invalid event cursor"})", "application/json");
+            return;
+        }
+        uint64_t dropped = 0;
+        json rows = json::array();
+        for (const auto & event : ExpertDebug::instance().events_since(since, dropped))
+            rows.push_back({{"sequence", event.sequence}, {"at_ms", event.at_ms},
+                            {"kind", event.kind}, {"layer", event.layer},
+                            {"count", event.count}, {"values", event.values}});
+        res.set_content(json{{"mode", static_cast<int>(ExpertDebug::instance().mode())},
+                             {"dropped_events", dropped}, {"events", rows}}.dump(),
+                        "application/json");
+    });
+
     srv.Post("/v1/chat/completions", [&](const httplib::Request & req, httplib::Response & res) {
         json body;
         try { body = json::parse(req.body); }
@@ -1166,8 +1284,14 @@ int main(int argc, char ** argv) {
             res.set_chunked_content_provider("text/event-stream",
                 [&, st, id, created, req_mtp, n_draft](size_t, httplib::DataSink & sink) -> bool {
                     if (st->finished) return false;
+                    auto release_runtime = [&]() {
+                        if (!st->holding) return;
+                        ExpertDebug::instance().set_phase(ExpertDebug::Idle);
+                        tlock.unlock();
+                        st->holding = false;
+                    };
                     auto finish = [&]() -> bool {
-                        if (st->holding) { tlock.unlock(); st->holding = false; }
+                        release_runtime();
                         const auto t_end = clk::now();
                         auto ms = [](clk::time_point a, clk::time_point b) {
                             return std::chrono::duration<double, std::milli>(b - a).count();
@@ -1324,6 +1448,8 @@ int main(int argc, char ** argv) {
                             st->slice_used = 0;   // fresh slice on (re)acquisition
                             *cur_prog = st->prog; // progress lines report this request
                         }
+                        ExpertDebug::instance().set_phase(
+                            st->pf_done || st->generated > 0 ? ExpertDebug::Decode : ExpertDebug::Prefill);
 
                         // clip the image-embedding overrides to a prompt chunk
                         // [pos, pos+n), shifting indices to be chunk-relative
@@ -1372,7 +1498,10 @@ int main(int argc, char ** argv) {
                                     fprintf(stderr, "time-slice: state lost (image request), truncating stream\n");
                                     return finish();
                                 }
-                                if (reprefill) rt->prefill(st->my_toks, true);   // exact rebuild incl nextn KV
+                                if (reprefill) {
+                                    ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                                    rt->prefill(st->my_toks, true);   // exact rebuild incl nextn KV
+                                }
                             }
 
                             // ---- preemptible prefill: all but the last chunk; the
@@ -1383,7 +1512,7 @@ int main(int argc, char ** argv) {
                                 if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
                                     fprintf(stderr, "[%s] client gone during prefill (%zu/%zu), aborting\n", clock_hms().c_str(),
                                             st->pf_pos, st->prompt.size());
-                                    st->finished = true; tlock.unlock(); st->holding = false;
+                                    st->finished = true; release_runtime();
                                     return false;
                                 }
                                 st->prog->base = (int) st->pf_pos;   // overall-progress offset
@@ -1398,7 +1527,7 @@ int main(int argc, char ** argv) {
                                     if (getenv("QWEN_CACHE_DEBUG"))
                                         fprintf(stderr, "[%s] time-slice: prefill yield at %zu/%zu (sid=%llu)\n", clock_hms().c_str(),
                                                 st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
-                                    tlock.unlock(); st->holding = false;
+                                    release_runtime();
                                     return true;
                                 }
                             }
@@ -1472,7 +1601,7 @@ int main(int argc, char ** argv) {
                                 if (getenv("QWEN_CACHE_DEBUG"))
                                     fprintf(stderr, "[%s] time-slice: yield at %d tokens (sid=%llu)\n", clock_hms().c_str(),
                                             st->generated, (unsigned long long) st->sid);
-                                tlock.unlock(); st->holding = false;
+                                release_runtime();
                                 return true;                            // resumed on the next call
                             }
                             return finish();
@@ -1493,7 +1622,10 @@ int main(int argc, char ** argv) {
                                 fprintf(stderr, "time-slice: state lost (image request), truncating stream\n");
                                 return finish();
                             }
-                            if (reprefill) st->logits = rt->decode(st->my_toks);
+                            if (reprefill) {
+                                ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                                st->logits = rt->decode(st->my_toks);
+                            }
                         }
                         // preemptible prefill: the last chunk's logits feed sampling
                         while (st->pf_pos < st->prompt.size()) {
@@ -1502,7 +1634,7 @@ int main(int argc, char ** argv) {
                             if (!sink.is_writable() || (hb_on && !sink.write(st->hb.data(), st->hb.size()))) {
                                 fprintf(stderr, "[%s] client gone during prefill (%zu/%zu), aborting\n", clock_hms().c_str(),
                                         st->pf_pos, st->prompt.size());
-                                st->finished = true; tlock.unlock(); st->holding = false;
+                                st->finished = true; release_runtime();
                                 return false;
                             }
                             size_t n = std::min(pf_chunk, st->prompt.size() - st->pf_pos);
@@ -1523,7 +1655,7 @@ int main(int argc, char ** argv) {
                                 if (getenv("QWEN_CACHE_DEBUG"))
                                     fprintf(stderr, "[%s] time-slice: prefill yield at %zu/%zu (sid=%llu)\n", clock_hms().c_str(),
                                             st->pf_pos, st->prompt.size(), (unsigned long long) st->sid);
-                                tlock.unlock(); st->holding = false;
+                                release_runtime();
                                 return true;
                             }
                         }
@@ -1533,12 +1665,13 @@ int main(int argc, char ** argv) {
                             st->t_prefill = clk::now();
                             st->t_first   = st->t_prefill;   // overwritten on the first emitted token
                         }
+                        ExpertDebug::instance().set_phase(ExpertDebug::Decode);
                         int next = st->smp.sample(st->logits);
                         st->smp.accept(next);   // repetition-penalty window
                         // stop on EOS, token budget, or context limit (avoids overflow crash)
                         if (is_stop(next) || st->generated >= st->max_tokens || rt->n_past() + 1 >= n_ctx)
                             return finish();
-                        if (!emit_piece(next)) { st->finished = true; tlock.unlock(); st->holding = false; return false; }
+                        if (!emit_piece(next)) { st->finished = true; release_runtime(); return false; }
                         st->generated++;
                         st->logits = rt->decode({ next });
                         if (time_slice > 0 && ++st->slice_used >= time_slice && yieldable()) {
@@ -1547,7 +1680,7 @@ int main(int argc, char ** argv) {
                             if (getenv("QWEN_CACHE_DEBUG"))
                                 fprintf(stderr, "[%s] time-slice: yield at %d tokens (sid=%llu)\n", clock_hms().c_str(),
                                         st->generated, (unsigned long long) st->sid);
-                            tlock.unlock(); st->holding = false;
+                            release_runtime();
                         }
                         return true;
                     } catch (const std::exception & e) {
@@ -1569,8 +1702,14 @@ int main(int argc, char ** argv) {
         try {
             struct Guard {
                 TicketLock & t;
-                Guard(TicketLock & t_) : t(t_) { t.lock(); }
-                ~Guard() { t.unlock(); }
+                Guard(TicketLock & t_) : t(t_) {
+                    t.lock();
+                    ExpertDebug::instance().set_phase(ExpertDebug::Prefill);
+                }
+                ~Guard() {
+                    ExpertDebug::instance().set_phase(ExpertDebug::Idle);
+                    t.unlock();
+                }
             } lk(tlock);
             auto prog = std::make_shared<Prog>();
             n_cached = prepare_prompt(prompt, ovr, std::move(spans), 0, prog, t_recv);
@@ -1612,6 +1751,7 @@ int main(int argc, char ** argv) {
                 auto logits = rt->decode(prompt);
                 rt->snapshot_ckpt();   // rewind point at prompt end
                 t_prefill = clk::now();
+                ExpertDebug::instance().set_phase(ExpertDebug::Decode);
                 smp.prime(cp.ids);     // repetition-penalty window (prompt tail)
                 clk::time_point glog = clk::now();
                 for (int t = 0; t < max_tokens; ++t) {

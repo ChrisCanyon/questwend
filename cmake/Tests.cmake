@@ -5,6 +5,9 @@ function(qw_native_test name)
     add_executable(${target} "tests/${name}_test.cpp")
     target_include_directories(${target} PRIVATE core tests third_party/ggml/src)
     target_link_libraries(${target} PRIVATE ggml ggml-cpu Threads::Threads)
+    if(name STREQUAL "expert_debug")
+        target_link_libraries(${target} PRIVATE questwend_core)
+    endif()
     if(WIN32)
         target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     endif()
@@ -22,6 +25,7 @@ foreach(name
     direct_pinned_covering
     expert_demand_pipeline
     expert_demand_trace
+    expert_debug
     expert_install_check
     expert_io_targeted_wake
     expert_io_workers

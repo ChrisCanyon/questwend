@@ -59,7 +59,7 @@ endif()
 find_package(Threads REQUIRED)
 add_library(questwend_core STATIC
     core/args.cpp core/gguf_util.cpp core/model.cpp core/token_pieces.cpp
-    core/runtime.cpp core/expert_cache.cpp core/ngram_table.cpp core/sampler.cpp)
+    core/runtime.cpp core/expert_cache.cpp core/expert_debug.cpp core/cold_cache_prime.cpp core/ngram_table.cpp core/sampler.cpp)
 target_include_directories(questwend_core PUBLIC core)
 target_include_directories(questwend_core PRIVATE third_party/ggml/src)
 target_link_libraries(questwend_core PUBLIC ggml Threads::Threads)

@@ -129,6 +129,17 @@ public:
         return entries_.find(key) != entries_.end();
     }
 
+    // Read a consecutive layer/role row under one lock for dashboard telemetry.
+    // It does not touch replacement order or frequency counters.
+    std::vector<uint8_t> presence_range(uint64_t first, size_t count) const {
+        std::vector<uint8_t> present(count, 0);
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (auto item = entries_.lower_bound(first);
+             item != entries_.end() && item->first - first < count; ++item)
+            present[static_cast<size_t>(item->first - first)] = 1;
+        return present;
+    }
+
     // Owner-only source classification for an I/O batch. The immutable lease
     // freezes bytes before concurrent owner admissions can evict their key.
     // Taking removes managed RAM ownership immediately; the existing retired

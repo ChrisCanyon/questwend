@@ -28,6 +28,7 @@ int main() {
 
     PrefillCachePolicy policy;
     policy.set_enabled(true);
+    policy.set_static_placement(true);
     ExpertAdmission admission(32, 1024);
     for (int count = 0; count < 6000; ++count) admission.observe(6);
     for (int count = 0; count < 1500; ++count) admission.observe(7);
@@ -36,6 +37,7 @@ int main() {
           "Initial decode phase is gated");
 
     policy.enter_phase(true);
+    check(!policy.retain_new_gpu_copy(), "Static prefill admitted a retained GPU copy");
     // Shrinking retained capacity would ordinarily age samples immediately.
     // The real set_phase_workspace uses this same gate before set_capacity.
     if (policy.record_decode_frequency()) admission.set_capacity(256);
@@ -58,6 +60,7 @@ int main() {
     check(new_ram_admissions == 0, "Cold prefill copies were admitted");
 
     policy.enter_phase(false);
+    check(policy.retain_new_gpu_copy(), "Decode did not restore GPU admission");
     if (policy.record_decode_frequency()) admission.set_capacity(2048);
     check(policy.record_decode_frequency() && policy.admit_new_ssd_copy(),
           "Decode did not restore normal caching");

@@ -3,7 +3,8 @@
 This personal fork contains the measured single-machine cache/runtime extensions
 used by Open Agents. QuestWend supplies the inference engine and SSD expert
 streaming; llama.cpp supplies chat templates, prompt tokenization and response
-parsing. This branch is a focused production candidate, not an upstream release.
+parsing. The source commit and build receipt identify each runtime; experiment
+work belongs on named branches, not in copied source trees.
 
 ## Source boundaries
 
@@ -11,6 +12,7 @@ parsing. This branch is a focused production candidate, not an upstream release.
 | --- | --- |
 | `core/` | Model execution, GPU/RAM/SSD caches, CPU overlap, MTP, KV and prompt state |
 | `server/` | HTTP/SSE transport and the upstream chat process bridge |
+| `core/expert_debug*`, `server/expert_debug_routes.h` | Opt-in expert visualization; normal builds compile its inference hooks to no-ops |
 | `tests/` | Independent correctness fixtures and explicit diagnostic tools |
 | `cmake/` | Optional tests, diagnostics and matching-backend SDK support |
 | `third_party/ggml/` | Backend plus the separately measured kernel changes |
@@ -31,14 +33,19 @@ the private Runtime implementation. Complete snapshots retain PLE convolution,
 n-gram history, QSA keys and logits. Their existing payload format is preserved.
 Trained MTP is retained; removing unrelated external drafts does not disable it.
 
+Cold expert placement is in `core/cold_cache_prime.cpp`. It runs only when
+`QWEN_COLD_PRIME=1`; the learned layout additionally needs a local order file.
+Normal cache replacement resumes after startup. The retired static-prefill and
+coalesced-read experiments remain in Git history, outside this release line.
+
 ## Build
 
 The native process bridge is currently qualified on Windows. Build the pinned
 helper in Open Agents first, then configure this source with its adapter path:
 
 ```powershell
-python C:/workspace/open-agents/integrations/llama-chat/build.py --source path/to/llama.cpp
-cmake -S . -B build -DQW_CUDA=ON -DQW_CHAT_ADAPTER_DIR=C:/workspace/open-agents/integrations/llama-chat
+python path/to/open-agents/integrations/llama-chat/build.py --source path/to/llama.cpp
+cmake -S . -B build -DQW_CUDA=ON -DQW_CHAT_ADAPTER_DIR=path/to/open-agents/integrations/llama-chat
 cmake --build build --config Release --target qw-server
 ```
 
@@ -50,7 +57,7 @@ commit, build options and binary hashes. Do not package RPC or diagnostic binari
 only the server and required libraries. To build and run regression fixtures:
 
 ```powershell
-cmake -S . -B build-tests -DBUILD_TESTING=ON -DQW_CHAT_ADAPTER_DIR=C:/workspace/open-agents/integrations/llama-chat
+cmake -S . -B build-tests -DBUILD_TESTING=ON -DQW_CHAT_ADAPTER_DIR=path/to/open-agents/integrations/llama-chat
 cmake --build build-tests --config Release
 ctest --test-dir build-tests -C Release --output-on-failure
 ```
@@ -59,6 +66,9 @@ ctest --test-dir build-tests -C Release --output-on-failure
 comparisons. It is not a substitute for checking a source build. Open Agents
 validates both paths; GPU measurements retain the recorded numerical DLL family.
 Diagnostics require `-DQW_BUILD_DIAGNOSTICS=ON`; they never run during a build.
+Expert visualization requires `-DQW_EXPERT_VISUALIZATION=ON` in a separate build;
+the normal build has no per-layer recorder calls or visualization HTTP routes.
+Run `python scripts/check_source_truth.py` before proposing a source change.
 The obsolete multi-platform release workflow was removed rather than publishing
 an unqualified bridge on unsupported platforms.
 

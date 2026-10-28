@@ -183,7 +183,6 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
     }
     n_used_ = n_used;
     l_hits_.assign(n_layer, 0);  l_misses_.assign(n_layer, 0); l_evict_.assign(n_layer, 0);
-    l_want_.assign(n_layer, 0);  l_wmiss_.assign(n_layer, 0);
 
     // Pinned host staging buffer type (CUDA): makes the slab H2D a pinned-DMA copy.
     if (ggml_backend_dev_t dev = ggml_backend_get_device(gpu_backend))
@@ -1538,17 +1537,10 @@ size_t ExpertCache::load_prefetch(const std::string & path) {
     return n_pref;
 }
 
-void ExpertCache::note_want(int layer, bool absent) {
-    l_want_[layer]++;
-    if (absent) l_wmiss_[layer]++;
-}
-
 void ExpertCache::reset_layer_stats() {
     std::fill(l_hits_.begin(),   l_hits_.end(),   0);
     std::fill(l_misses_.begin(), l_misses_.end(), 0);
     std::fill(l_evict_.begin(),  l_evict_.end(),  0);
-    std::fill(l_want_.begin(),   l_want_.end(),   0);
-    std::fill(l_wmiss_.begin(),  l_wmiss_.end(),  0);
 }
 
 void ExpertCache::layer_stats(std::vector<LayerStat> & out) const {
@@ -1559,8 +1551,6 @@ void ExpertCache::layer_stats(std::vector<LayerStat> & out) const {
         ls.hits      = l_hits_[il];
         ls.misses    = l_misses_[il];
         ls.evictions = l_evict_[il];
-        ls.want      = l_want_[il];
-        ls.want_miss = l_wmiss_[il];
         // "resident" = usable by the router: present in all three role pools.
         int n = 0;
         for (int e = 0; e < n_expert_; ++e)
@@ -1579,31 +1569,26 @@ void ExpertCache::dump_layer_stats(const char * tag) const {
     fprintf(stderr, "\n---- per-layer expert cache [%s] (%d layers x %d experts, "
                     "%d slots over %zu pools) ----\n",
             tag, n_layer_, n_expert_, total_slots, pools_.size());
-    fprintf(stderr, "layer  resident   share%%      acc     hit%%    misses   evict"
-                    "   want  wantmiss%%\n");
-    uint64_t th = 0, tm = 0, te = 0, tw = 0, twm = 0; int tr = 0;
+    fprintf(stderr, "layer  resident   share%%      acc     hit%%    misses   evict\n");
+    uint64_t th = 0, tm = 0, te = 0; int tr = 0;
     for (int il = 0; il < n_layer_; ++il) {
         if (!serves(il)) continue;
         const LayerStat & s = ls[il];
         const uint64_t acc = s.hits + s.misses;
-        fprintf(stderr, "%5d  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu  %6llu  %8.1f\n",
+        fprintf(stderr, "%5d  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu\n",
                 il, s.resident,
                 100.0 * (double) s.resident / (double) n_expert_,
                 (unsigned long long) acc,
                 acc ? 100.0 * (double) s.hits / (double) acc : 0.0,
                 (unsigned long long) s.misses,
-                (unsigned long long) s.evictions,
-                (unsigned long long) s.want,
-                s.want ? 100.0 * (double) s.want_miss / (double) s.want : 0.0);
+                (unsigned long long) s.evictions);
         tr += s.resident; th += s.hits; tm += s.misses; te += s.evictions;
-        tw += s.want; twm += s.want_miss;
     }
     const uint64_t ta = th + tm;
-    fprintf(stderr, "  all  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu  %6llu  %8.1f\n",
+    fprintf(stderr, "  all  %8d  %6.2f  %9llu  %6.1f  %8llu  %6llu\n",
             tr, 100.0 * (double) tr / (double) (n_layer_ * n_expert_),
             (unsigned long long) ta, ta ? 100.0 * (double) th / (double) ta : 0.0,
-            (unsigned long long) tm, (unsigned long long) te,
-            (unsigned long long) tw, tw ? 100.0 * (double) twm / (double) tw : 0.0);
+            (unsigned long long) tm, (unsigned long long) te);
     fprintf(stderr, "----\n\n");
 }
 

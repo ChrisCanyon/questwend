@@ -129,15 +129,11 @@ public:
     // what the unmasked router actually wanted.
     struct LayerStat {
         uint64_t hits = 0, misses = 0, evictions = 0;
-        uint64_t want = 0, want_miss = 0;
         int      resident = 0;   // experts resident in all three roles
     };
     void layer_stats(std::vector<LayerStat> & out) const;
     void dump_layer_stats(const char * tag) const;
     void reset_layer_stats();
-    // resident-decode: the unmasked router wanted (layer,expert); absent =
-    // it was not in the resident palette, so the mask routed elsewhere.
-    void note_want(int layer, bool absent);
 
     // ---- per-layer slot quotas (QWEN_LAYER_QUOTA) ----
     // A pool's slots are shared by every layer it serves, and plain global LRU
@@ -340,7 +336,7 @@ private:
 
     Stats stats_;
     // per-layer counters (indexed by layer); see dump_layer_stats()
-    std::vector<uint64_t> l_hits_, l_misses_, l_evict_, l_want_, l_wmiss_;
+    std::vector<uint64_t> l_hits_, l_misses_, l_evict_;
 };
 
 } // namespace questwend

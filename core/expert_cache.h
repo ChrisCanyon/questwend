@@ -178,9 +178,9 @@ public:
     // reads; excludes worker-private bounce buffers and OS/allocator overhead.
     OwnerStagingCapacity owner_staging_capacity() const {
         OwnerStagingCapacity result;
-        result.pinned_requested_bytes = stage_cap_ + coal_stage_cap_ +
+        result.pinned_requested_bytes = stage_cap_ + batch_stage_cap_ +
             (victim_stage_ ? (64ull << 20) : 0);
-        result.pageable_vector_capacity_bytes = stage_.capacity() + coal_buf_.capacity() + abuf_.capacity();
+        result.pageable_vector_capacity_bytes = stage_.capacity() + batch_buf_.capacity() + abuf_.capacity();
         return result;
     }
     void note_demands(int layer, const int32_t * ids, int count);
@@ -267,15 +267,15 @@ private:
 
     uint64_t clock_ = 0;
     std::vector<uint8_t> stage_;   // host staging buffer for fetch (pageable fallback)
-    // Staging for coalesced (range) SSD reads: pinned when available so the
-    // per-slab H2D can be async (the sync pageable copies dominated fetch time).
-    std::vector<uint8_t>  coal_buf_;                    // pageable fallback (4KB-align inside)
-    ggml_backend_buffer_t coal_stage_buf_ = nullptr;    // pinned staging (or null)
-    void *                coal_stage_ptr_ = nullptr;
-    size_t                coal_stage_cap_ = 0;
-    bool                  coal_pinned_ = false;         // coal_host() returned pinned memory
-    bool                  coal_async_pending_ = false;  // async H2D in flight from the staging
-    void * coal_host(size_t nbytes);                    // >= nbytes, 4KB-aligned
+    // Staging for parallel SSD slab reads: pinned when available so the
+    // per-slab H2D can be async (sync pageable copies dominated fetch time).
+    std::vector<uint8_t>  batch_buf_;                    // pageable fallback (4KB-align inside)
+    ggml_backend_buffer_t batch_stage_buf_ = nullptr;    // pinned staging (or null)
+    void *                batch_stage_ptr_ = nullptr;
+    size_t                batch_stage_cap_ = 0;
+    bool                  batch_pinned_ = false;         // batch_host() returned pinned memory
+    bool                  batch_async_pending_ = false;  // async H2D in flight from the staging
+    void * batch_host(size_t nbytes);                    // >= nbytes, 4KB-aligned
 
     // Pinned (page-locked) host staging buffer: the H2D source for a slab upload.
     // Bounded to one slab, so it is always allocatable (unlike pinning all experts)

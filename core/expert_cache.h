@@ -317,8 +317,6 @@ private:
     std::vector<uint8_t> active_demands_;
     bool transient_admission_ = false;
     bool phase_workspace_ = false;
-    bool cold_prefill_workspace_ = false;
-    bool cold_prefill_pending_ = true;
     PrefillCachePolicy prefill_cache_policy_;
     uint64_t transient_role_fills_ = 0, retained_role_fills_ = 0, proactive_promotions_ = 0;
     bool can_retain(int layer, int expert);

@@ -8,15 +8,12 @@ namespace questwend {
 class PrefillCachePolicy {
 public:
     void set_enabled(bool enabled) { enabled_ = enabled; }
-    void set_static_placement(bool enabled) { static_placement_ = enabled; }
     void enter_phase(bool source_prefill) { source_prefill_ = source_prefill; }
     bool record_decode_frequency() const { return !enabled_ || !source_prefill_; }
     bool admit_new_ssd_copy() const { return !enabled_ || !source_prefill_; }
-    bool retain_new_gpu_copy() const { return !static_placement_ || !source_prefill_; }
 
 private:
     bool enabled_ = false;
-    bool static_placement_ = false;
     bool source_prefill_ = false;
 };
 

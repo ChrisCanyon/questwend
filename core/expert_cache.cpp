@@ -141,16 +141,8 @@ ExpertCache::ExpertCache(ggml_backend_t gpu_backend, Model & model,
 
     const char * preserve_decode = getenv("QWEN_PRESERVE_DECODE_CACHE");
     prefill_cache_policy_.set_enabled(preserve_decode && std::string(preserve_decode) != "0");
-    const char * static_prefill = getenv("QWEN_STATIC_PREFILL_CACHE");
-    const bool static_prefill_cache = static_prefill && std::string(static_prefill) == "1";
-    prefill_cache_policy_.set_static_placement(static_prefill_cache);
     transient_admission_ = getenv("QWEN_TINYLFU_ADMISSION") != nullptr;
-    // The opt-in cold workspace preserves the learned placement until the first
-    // decode token. Thereafter the normal small decode workspace is available.
-    cold_prefill_workspace_ = static_prefill_cache && getenv("QWEN_COLD_PREFILL_WORKSPACE") != nullptr;
-    // The older static mode retains its fixed partition for rollback.
-    phase_workspace_ = transient_admission_ && getenv("QWEN_PHASE_WORKSPACE") != nullptr &&
-        (!static_prefill_cache || cold_prefill_workspace_);
+    phase_workspace_ = transient_admission_ && getenv("QWEN_PHASE_WORKSPACE") != nullptr;
     if (transient_admission_ && (!host_cache_ || readthrough_ram_ || getenv("QWEN_FASTCACHE")))
         throw std::runtime_error("Transient admission requires the exclusive RAM tier and exact segmented execution");
     infinity_policy_ = getenv("QWEN_MOE_INFINITY") != nullptr;
@@ -433,10 +425,8 @@ void ExpertCache::set_phase_workspace(bool batched, int token_count, bool source
     ssd_read_phase_.enter_phase(source_prefill);
     // Record both phases even when physical workspace resizing is disabled.
     prefill_cache_policy_.enter_phase(source_prefill);
-    if (!batched && !source_prefill) cold_prefill_pending_ = false;
     if (!phase_workspace_) return;
-    const int scratch = cold_prefill_workspace_ && cold_prefill_pending_ && source_prefill
-        ? n_expert_ : bounded_workspace_scratch(n_expert_, n_used_, batched ? token_count : 1);
+    const int scratch = bounded_workspace_scratch(n_expert_, n_used_, batched ? token_count : 1);
     const auto plan = plan_workspace_partition(pools_, scratch, n_used_);
     if (!plan.changed) return;
     require_workspace_boundary(active_demands_);
@@ -1131,7 +1121,6 @@ void ExpertCache::note_demands(int layer, const int32_t * ids, int count) {
 }
 
 bool ExpertCache::can_retain(int layer, int expert) {
-    if (!prefill_cache_policy_.retain_new_gpu_copy()) return false;
     if (!admission_) return true;
     const size_t candidate = (size_t) layer * n_expert_ + expert;
     for (int role = 0; role < N_ROLE; ++role) {

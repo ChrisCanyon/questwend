@@ -43,7 +43,8 @@ for path in [ROOT / "README.md", *ROOT.glob("core/*.cpp"), *ROOT.glob("server/*"
         ERRORS.append(f"Local absolute path in {path.relative_to(ROOT)}")
 
 for flag in ("QWEN_STATIC_PREFILL_CACHE", "QWEN_COLD_PREFILL_WORKSPACE",
-             "QWEN_COALESCE", "QWEN_COALESCE_GAP"):
+             "QWEN_COALESCE", "QWEN_COALESCE_GAP", "QWEN_RESIDENT_DECODE",
+             "QWEN_RESIDENT_REFILL", "QWEN_RESIDENT_WARMUP", "QWEN_RESIDENT_MIN"):
     for path in (ROOT / "core").glob("*"):
         if path.is_file() and flag in path.read_text(encoding="utf-8", errors="replace"):
             ERRORS.append(f"Retired experiment switch {flag} in {path.relative_to(ROOT)}")

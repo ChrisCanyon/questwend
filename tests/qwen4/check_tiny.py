@@ -229,8 +229,6 @@ def check_qsa_decode():
     cuda_env = dict(os.environ, QWEN_NO_FLASH='1')
     # (label, exe, extra args, env for the per-token reference, candidates)
     #
-    # --resident-decode is lossy on a model whose experts do not all fit in VRAM;
-    # this one's do, so its mask excludes nothing and it must match exactly too.
     groups = [
         ('cpu', QW_CLI, ['--cpu'],
          dict(os.environ, QWEN_NO_REUSE='1'),
@@ -240,8 +238,7 @@ def check_qsa_decode():
         groups.append(
             ('offload', QW_CLI_CUDA, ['--gpus', '0', '--vram-budget', '2', '--experts-ssd'],
              cuda_env,
-             [('fastcache',       dict(cuda_env, QWEN_FASTCACHE='1')),
-              ('resident-decode', dict(cuda_env, QWEN_RESIDENT_DECODE='1'))]))
+             [('fastcache', dict(cuda_env, QWEN_FASTCACHE='1'))]))
 
     failures = []
     for label, exe, extra, ref_env, cands in groups:

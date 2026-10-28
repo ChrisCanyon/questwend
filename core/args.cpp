@@ -103,10 +103,7 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
         }
     }
     // ---- offload tuning: aliases for the QWEN_* env vars ----
-    else if (a == "--resident-decode")    set_knob("QWEN_RESIDENT_DECODE", "1");
     else if (a == "--ssd-direct")         set_knob("QWEN_SSD_DIRECT", "1");
-    else if (a == "--resident-refill" && has_val) set_knob("QWEN_RESIDENT_REFILL", next().c_str());
-    else if (a == "--resident-warmup" && has_val) set_knob("QWEN_RESIDENT_WARMUP", next().c_str());
     else if (a == "--prefill-prune"   && has_val) set_knob("QWEN_PREFILL_PRUNE", next().c_str());
     else if (a == "--batch-chunk"     && has_val) set_knob("QWEN_BATCH_CHUNK", next().c_str());
     else if (a == "--expert-alloc"    && has_val) {
@@ -224,14 +221,10 @@ void print_common_help(FILE * out) {
         "                      goes on the GPU; off skips the module entirely\n"
         "  --ngram-cache <MB>  host cache for --ngram disk (default 256)\n"
         "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
-        "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
-        "                      (lossy; auto-warmup + background refill keep quality)\n"
-        "  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n"
         "  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n"
         "                      lru | quota (per-layer, from the prompt's routing) |\n"
-        "                      auto = quota with --resident-decode, lru without (default)\n"
+        "                      auto = lru (default)\n"
         "                      (prefill always uses the whole pool as one LRU stream)\n"
-        "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
         "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
         "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
         "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");

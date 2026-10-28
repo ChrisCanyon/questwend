@@ -431,25 +431,7 @@ struct Runtime::Impl {
     // miss, restore recurrent state and fall back to the slow decode_cached.
     bool                  cache_fast_build   = false;   // set while building the fast graph
     bool                  cache_fast_enabled = false;    // experimental; opt-in via QWEN_FASTCACHE
-    // Resident-only routing (QWEN_RESIDENT_DECODE): a per-layer bias added to
-    // the router logits (-inf for non-resident experts) makes every selection a
-    // cache hit by construction, so the single fused graph never misses â€” no
-    // verify readback, no state backup, no fallback. Lossy: the router is
-    // restricted to the experts the prefill/profile left resident.
-    bool                  resident_decode = false;
-    ggml_tensor *         resmask_all = nullptr;  // [n_expert, n_layer] f32 (0 / -inf)
-    std::vector<float>    resmask_host;
-    // Background refill: the fused graph also records what the *unmasked*
-    // router would have picked (want_all); wanted-but-absent experts are
-    // fetched off the critical path (budget per token) and join the mask on
-    // the next token, so the frozen palette tracks topic drift.
-    ggml_tensor *         want_all = nullptr;     // [n_used, n_layer] i32 (unmasked top-k)
-    std::vector<int32_t>  want_host;
-    int                   refill_cursor = 0;      // round-robin layer scan position
-    uint64_t              fast_remap_stamp = ~0ull; // residency version the mask/g2s uploads reflect
-    bool                  fast_mask_complete = false;
-    int                   fast_warm_tokens = 0;     // fast-path decode calls so far (warmup deadline)
-    int                   fast_last_floor = -1;     // palette floor the current mask was built with
+    uint64_t              fast_remap_stamp = ~0ull; // residency version of the g2s upload
     ggml_tensor *         g2s_all = nullptr;  // [1, n_expert, 3*n_layer] i32  (host-filled remap)
     ggml_tensor *         sel_all = nullptr;  // [n_used, n_layer]        i32  (selected readback)
     ggml_context *        f_ctx    = nullptr;
@@ -823,7 +805,7 @@ struct Runtime::Impl {
     Route route_experts(ggml_context * ctx, int il, ggml_tensor * logits,
                         ggml_tensor * rm, int n_tokens);
     // The order route_experts ranks in, before any residency mask: what the
-    // router *wants*, for the resident-decode refill hint.
+    // router ranks before any optional mask is applied.
     ggml_tensor * router_rank(ggml_context * ctx, int il, ggml_tensor * logits);
     // Dense SwiGLU FFN (dense models, and the leading dense blocks of a MoE).
     ggml_tensor * build_dense_ffn(ggml_context * ctx, int il, ggml_tensor * x);
@@ -1871,10 +1853,6 @@ void Runtime::Impl::init_cache() {
     cctx = ggml_init(cp);
     g2s_all   = ggml_new_tensor_3d(cctx, GGML_TYPE_I32, 1, hp.n_expert, 3 * hp.n_layer);
     sel_all   = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
-    resmask_all = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, hp.n_expert, hp.n_layer);
-    ggml_set_name(resmask_all, "carry.resmask");
-    want_all = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, n_used, hp.n_layer);
-    ggml_set_name(want_all, "carry.want");
     ggml_set_name(g2s_all, "carry.g2s");
     ggml_set_name(sel_all, "carry.sel");
     cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
@@ -1889,15 +1867,11 @@ void Runtime::Impl::init_cache() {
 
     g2s_host.assign((size_t) 3 * hp.n_layer * hp.n_expert, 0);
     sel_host.assign((size_t) n_used * hp.n_layer, 0);
-    resmask_host.assign((size_t) hp.n_layer * hp.n_expert, 0.0f);
-    want_host.assign((size_t) n_used * hp.n_layer, 0);
-
     // CPU/GPU split decode: needs the experts' host copy (RAM tier, not SSD) and
     // one device (the carries and the CPU result live on the primary).
     setup_cpu_miss();
 
     if (getenv("QWEN_FASTCACHE")) cache_fast_enabled = true;   // experimental single-graph path
-    if (getenv("QWEN_RESIDENT_DECODE")) { cache_fast_enabled = true; resident_decode = true; }
 
 
     init_state_backup();   // GDN rollback buffers (speculative miss / MTP reject)
@@ -1927,7 +1901,7 @@ void Runtime::Impl::init_cache() {
     }
     const char * trace_enabled = getenv("QWEN_DEMAND_TRACE");
     if (trace_enabled && std::strcmp(trace_enabled, "1") == 0) {
-        if (multi_gpu() || cache_fast_enabled || resident_decode ||
+        if (multi_gpu() || cache_fast_enabled ||
             n_main < 1 || n_main > 64 || hp.n_expert > 65535 || n_used > 65535)
             throw std::runtime_error("Demand trace requires single-node segmented exact expert execution");
         std::vector<uint64_t> expert_bytes(static_cast<size_t>(n_main) * 3, 0);
@@ -2774,20 +2748,7 @@ ggml_tensor * Runtime::Impl::build_moe(ggml_context * ctx, ggml_cgraph * gf, int
     const int n_used  = hp.n_expert_used;
 
     ggml_tensor * logits = ggml_mul_mat(ctx, W("blk.%d.ffn_gate_inp.weight", il), x); // [n_exp, n_tokens]
-    ggml_tensor * rm = nullptr;   // resident-only routing mask, when in force
-    if (cache_fast_build && resident_decode) {
-        // record the unmasked router preference so the host can refill
-        // wanted-but-absent experts in the background
-        ggml_tensor * want = ggml_argsort_top_k(ctx, router_rank(ctx, il, logits), n_used); // [n_used, 1]
-        ggml_tensor * want_col = ggml_view_2d(ctx, want_all, n_used, 1,
-                                              want_all->nb[1], (size_t) il * want_all->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, want, want_col));
-        // resident-only routing: bias non-resident experts to -inf before the
-        // gating/top-k so the fused graph can never select a cache miss
-        rm = ggml_view_2d(ctx, resmask_all, n_exp, 1,
-                          resmask_all->nb[1], (size_t) il * resmask_all->nb[1]);
-    }
-    const Route rt = route_experts(ctx, il, logits, rm, n_tokens);
+    const Route rt = route_experts(ctx, il, logits, nullptr, n_tokens);
     ggml_tensor * selected = rt.selected;
     ggml_tensor * weights  = rt.weights;
 
@@ -6190,42 +6151,6 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
             }
         ggml_backend_tensor_set(g2s_all, g2s_host.data(), 0, g2s_host.size() * sizeof(int32_t));
     };
-    // Refresh the router residency mask; true iff every layer is masked. A
-    // layer joins the mask only once it has a decent resident palette
-    // (QWEN_RESIDENT_MIN, default 32) â€” until then it stays unmasked so its
-    // misses keep warming the cache via the fallback path. Layers with
-    // concentrated routing may never reach that palette on a short prompt, so
-    // after QWEN_RESIDENT_WARMUP fast-decode tokens (default 16) the floor
-    // drops to n_used and whatever is resident gets frozen ("warm a few
-    // tokens, then pin" â€” the original design intent).
-    static const int res_min = []{ const char * c = getenv("QWEN_RESIDENT_MIN");
-                                   const int v = c ? atoi(c) : 32; return v < 1 ? 32 : v; }();
-    static const int warm_tok = []{ const char * c = getenv("QWEN_RESIDENT_WARMUP");
-                                    const int v = c ? atoi(c) : 32; return v < 0 ? 32 : v; }();
-    const int floor_res = fast_warm_tokens > warm_tok
-                              ? n_used
-                              : std::max(n_used, std::min(res_min, n_exp));
-    auto fill_resmask = [&]() {
-        bool complete = true;
-        for (int il : moe_il) {
-            float * row = &resmask_host[(size_t) il * n_exp];
-            int n_res = 0;
-            for (int e = 0; e < n_exp; ++e) {
-                const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
-                                 ec_of(il)->resident(ExpertCache::UP,   il, e) &&
-                                 ec_of(il)->resident(ExpertCache::DOWN, il, e);
-                row[e] = res ? 0.0f : -INFINITY;
-                n_res += res;
-            }
-            if (n_res < floor_res) {   // palette too thin: leave the layer unmasked
-                for (int e = 0; e < n_exp; ++e) row[e] = 0.0f;
-                complete = false;
-            }
-        }
-        ggml_backend_tensor_set(resmask_all, resmask_host.data(), 0,
-                                resmask_host.size() * sizeof(float));
-        return complete;
-    };
     // verify residency of every selected expert; returns true if all resident
     auto verify = [&]() {
         ggml_backend_tensor_get(sel_all, sel_host.data(), 0, sel_host.size() * sizeof(int32_t));
@@ -6240,99 +6165,30 @@ const std::vector<float> & Runtime::Impl::decode_cached_fast(int32_t token) {
         return ok;
     };
 
-    // Residency only changes through fetches/evictions, so the mask and remap
-    // uploads are versioned by the miss+eviction count (and the warmup floor)
-    // and skipped while stale-free â€” steady-state resident decode uploads
-    // nothing but token/pos/mask.
-    ++fast_warm_tokens;
+    // The exact fused path remains speculative: every token verifies the
+    // selected experts. A miss rolls back recurrent state and uses the regular
+    // per-layer path, preserving the model's original router decisions.
     const uint64_t stamp = ec_stats_sum().misses + ec_stats_sum().evictions;
-    if (stamp != fast_remap_stamp || floor_res != fast_last_floor) {
-        fast_mask_complete = resident_decode && fill_resmask();
+    if (stamp != fast_remap_stamp) {
         fill_g2s();
         fast_remap_stamp = stamp;
-        fast_last_floor  = floor_res;
     }
-    // Resident-only routing with a complete mask cannot miss: the run is not
-    // speculative, so state backup, the sel_all verify readback and the
-    // fallback are all skipped â€” one graph submit + one logits readback.
-    const bool masked = resident_decode && fast_mask_complete;
-
-    if (!masked) backup_states();   // so a speculative miss can be rolled back
-    // must run on the graph's own scheduler (see the allocation above)
+    backup_states();
     const ggml_status f_st = multi_gpu() ? ggml_backend_sched_graph_compute(f_sched, f_gf)
                                          : ggml_backend_graph_compute(backend, f_gf);
     if (f_st != GGML_STATUS_SUCCESS)
         throw std::runtime_error("decode_cached_fast: compute failed");
-
-    if (!masked) {
-        // On a miss the speculative result is wrong: roll back recurrent state,
-        // warm the cache, and recompute correctly via the slow per-layer path.
-        if (!verify()) {
-            restore_states();
-            return decode_cached(token);
-        }
-
-        // accept: bump LRU/frequency for the resident accesses, then read logits
-        for (int il : moe_il)
-            for (int k = 0; k < n_used; ++k) {
-                const int e = sel_host[(size_t) il * n_used + k];
-                ec_of(il)->touch(ExpertCache::GATE, il, e);
-                ec_of(il)->touch(ExpertCache::UP,   il, e);
-                ec_of(il)->touch(ExpertCache::DOWN, il, e);
-            }
-    } else {
-        // ---- background refill: keep the frozen palette tracking the input ----
-        // The graph recorded what the unmasked router wanted (want_all). Fetch
-        // wanted-but-absent experts within a per-token budget (they join the
-        // mask next token via the stamp), and touch the actually-used experts
-        // so the refill's LRU evictions land on stale entries, not hot ones.
-        // per-token fetch budget, shared across all layers (see the round-robin
-        // scan below). One default for both tiers: the SSD tier reads
-        // synchronously and used to default lower (4), but that starves the
-        // palette after a mid-generation domain shift (docs/resident_decode.md)
-        static const int refill_budget = []{ const char * c = getenv("QWEN_RESIDENT_REFILL");
-                                             const int v = c ? atoi(c) : 8;
-                                             return v < 0 ? 0 : v; }();
-        if (refill_budget > 0) {
-            ggml_backend_tensor_get(sel_all,  sel_host.data(),  0, sel_host.size()  * sizeof(int32_t));
-            ggml_backend_tensor_get(want_all, want_host.data(), 0, want_host.size() * sizeof(int32_t));
-            for (int il : moe_il)
-                for (int k = 0; k < n_used; ++k) {
-                    const int e = sel_host[(size_t) il * n_used + k];
-                    ec_of(il)->touch(ExpertCache::GATE, il, e);
-                    ec_of(il)->touch(ExpertCache::UP,   il, e);
-                    ec_of(il)->touch(ExpertCache::DOWN, il, e);
-                }
-            // Instrumentation: how often the layer's frozen palette failed to
-            // hold what the *unmasked* router wanted. This is the quality cost
-            // of the layer's slot share (masked decode never stalls on a miss).
-            static const bool lstats = getenv("QWEN_LAYER_STATS") != nullptr;
-            if (lstats) {
-                for (int il : moe_il)
-                    for (int k = 0; k < n_used; ++k) {
-                        const int e = want_host[(size_t) il * n_used + k];
-                        const bool res = ec_of(il)->resident(ExpertCache::GATE, il, e) &&
-                                         ec_of(il)->resident(ExpertCache::UP,   il, e) &&
-                                         ec_of(il)->resident(ExpertCache::DOWN, il, e);
-                        ec_of(il)->note_want(il, !res);
-                    }
-            }
-            int budget = refill_budget;
-            for (int step = 0; step < n_layer && budget > 0; ++step) {
-                const int il = (refill_cursor + step) % n_layer;
-                if (!hp.is_moe_layer(il)) continue;
-                for (int k = 0; k < n_used && budget > 0; ++k) {
-                    const int e = want_host[(size_t) il * n_used + k];
-                    if (ec_of(il)->resident(ExpertCache::GATE, il, e) &&
-                        ec_of(il)->resident(ExpertCache::UP,   il, e) &&
-                        ec_of(il)->resident(ExpertCache::DOWN, il, e)) continue;
-                    ec_of(il)->ensure_resident(il, e);   // async H2D (RAM tier); joins mask next token
-                    --budget;
-                }
-            }
-            refill_cursor = (refill_cursor + 1) % n_layer;
-        }
+    if (!verify()) {
+        restore_states();
+        return decode_cached(token);
     }
+    for (int il : moe_il)
+        for (int k = 0; k < n_used; ++k) {
+            const int e = sel_host[(size_t) il * n_used + k];
+            ec_of(il)->touch(ExpertCache::GATE, il, e);
+            ec_of(il)->touch(ExpertCache::UP,   il, e);
+            ec_of(il)->touch(ExpertCache::DOWN, il, e);
+        }
 
     ggml_tensor * logits_t = ggml_graph_get_tensor(f_gf, "logits");
     const int n_vocab = (int) logits_t->ne[0];
@@ -6440,7 +6296,7 @@ const std::vector<float> & Runtime::Impl::decode(const std::vector<int32_t> & to
                             "(expected lru, quota or auto); using auto\n", c);
             return 0;
         }();
-        if (alloc_mode == 2 || (alloc_mode == 0 && resident_decode)) {
+        if (alloc_mode == 2) {
             const char * c = getenv("QWEN_QUOTA_PREFETCH");
             const long long v = c ? atoll(c) : 0;
             // Each device rebalances its own pools over its own layers.

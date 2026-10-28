@@ -7,8 +7,9 @@ parsing. The source commit and build receipt identify each runtime; experiment
 work belongs on named branches, not in copied source trees.
 
 `scripts/check_source_truth.py` runs in CI and before each production build. It
-checks the compiled source list against `production-layout.json`, rejects
-retired files and switches, and catches machine-specific paths. When an
+checks the compiled source list and the complete `core/` and `server/` file
+inventory against `production-layout.json`, rejects retired files and switches,
+and catches machine-specific paths. When an
 experiment is retired, add its source path or switch to that manifest/check
 before merging; keep the old implementation in Git history rather than as a
 second active file. A release build must come from a clean, committed tree and

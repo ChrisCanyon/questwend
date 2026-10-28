@@ -31,6 +31,16 @@ if actual != declared:
     ERRORS.append(f"Core source mismatch: undeclared={sorted(actual-declared)}, "
                   f"missing={sorted(declared-actual)}")
 
+# Every production source/header must be deliberately declared. This catches
+# forgotten copy-of, old-version and scratch files even when CMake ignores them.
+for directory, key in (("core", "core_files"), ("server", "server_files")):
+    expected = set(LAYOUT[key])
+    found = {p.relative_to(ROOT).as_posix() for p in (ROOT / directory).iterdir()
+             if p.is_file()}
+    if found != expected:
+        ERRORS.append(f"{directory} file inventory mismatch: "
+                      f"undeclared={sorted(found-expected)}, missing={sorted(expected-found)}")
+
 for relative in LAYOUT["retired_sources"]:
     if (ROOT / relative).exists():
         ERRORS.append(f"Retired source returned: {relative}")
@@ -52,5 +62,6 @@ for flag in ("QWEN_STATIC_PREFILL_CACHE", "QWEN_COLD_PREFILL_WORKSPACE",
 if ERRORS:
     print("Source boundary check failed:\n" + "\n".join(f"- {e}" for e in ERRORS), file=sys.stderr)
     sys.exit(1)
-print(f"Source boundary check passed: {len(declared)} core files, "
+print(f"Source boundary check passed: {len(declared)} compiled core files, "
+      f"{len(LAYOUT['core_files'])} total core files, "
       f"{len(LAYOUT['retired_sources'])} retired paths excluded")

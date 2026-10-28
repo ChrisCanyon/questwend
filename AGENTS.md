@@ -24,3 +24,8 @@ Keep `main` and release branches limited to reviewed, verified changes.
   experiment branch.
 - After promotion, confirm the destination branch and worktree are clean and a
   rollback commit or runtime is available.
+- When cleanup reveals a dangling implementation, remove it from the active
+  tree, preserve it in Git history or a named experiment branch, and extend
+  `production-layout.json` or `scripts/check_source_truth.py` so CI rejects
+  its return. New `core/` and `server/` files require a deliberate inventory
+  update in the same commit. Run the source check before every build or review.

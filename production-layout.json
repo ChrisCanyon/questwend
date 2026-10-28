@@ -12,6 +12,9 @@
     "core/token_pieces.cpp",
     "core/runtime.cpp",
     "core/expert_cache.cpp",
+    "core/expert_debug.cpp",
+    "core/expert_debug_cache.cpp",
+    "core/cold_cache_prime.cpp",
     "core/ngram_table.cpp",
     "core/sampler.cpp"
   ],

@@ -70,6 +70,8 @@ static Arch arch_from_string(const std::string & s) {
            name.find("ffn_down_exps") != std::string::npos;
 }
 
+
+
 bool Model::has_expert_tensors() const {
     for (auto & kv : tensors_) {
         if (is_expert_tensor(kv.first)) return true;
@@ -837,17 +839,11 @@ void Model::load_qwen4exp_hparams(const std::string & arch) {
 }
 
 void Model::load_vocab() {
-    vocab_.model         = gguf_str(gguf_, "tokenizer.ggml.model", "gpt2");
     vocab_.tokens        = gguf_str_array(gguf_, "tokenizer.ggml.tokens");
-    vocab_.token_types   = gguf_i32_array(gguf_, "tokenizer.ggml.token_type");
-    vocab_.merges        = gguf_str_array(gguf_, "tokenizer.ggml.merges");
     vocab_.bos_id        = gguf_i32(gguf_, "tokenizer.ggml.bos_token_id", 151643);
     vocab_.eos_id        = gguf_i32(gguf_, "tokenizer.ggml.eos_token_id", 151645);
     vocab_.pad_id        = gguf_i32(gguf_, "tokenizer.ggml.padding_token_id", -1);
-    vocab_.pre           = gguf_str(gguf_, "tokenizer.ggml.pre", "");
     // Absent key: llama.cpp's per-pre-tokenizer default (lfm2 adds BOS).
-    vocab_.add_bos       = gguf_bool(gguf_, "tokenizer.ggml.add_bos_token", vocab_.pre == "lfm2");
-    vocab_.chat_template = gguf_str(gguf_, "tokenizer.chat_template", "");
     if (hp_.n_vocab == 0) hp_.n_vocab = (uint32_t) vocab_.tokens.size();
 }
 

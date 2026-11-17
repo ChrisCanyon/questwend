@@ -24,8 +24,27 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
 
     if      (a == "-m"        && has_val) o.model_path = next();
     else if (a == "--n-ctx"   && has_val) o.n_ctx = std::stoi(next());
+    else if (a == "--kv-cache-type" && has_val) {
+        const std::string value = next();
+        if (value != "f16" && value != "q8_0") {
+            fprintf(stderr, "error: --kv-cache-type takes f16 or q8_0\n");
+            return ArgResult::Error;
+        }
+        o.kv_cache_type = value;
+    }
     else if (a == "--cpu")                o.force_cpu = true;
-    else if (a == "--mmproj"  && has_val) o.mmproj_path = next();
+    else if (a == "--expert-ram-cache" && has_val) {
+        const size_t mib = parse_vram_budget_mb(next());
+        if (mib > 1024ull * 1024ull) {
+            fprintf(stderr, "error: expert RAM cache budget exceeds the supported bound\n");
+            return ArgResult::Error;
+        }
+        set_knob("QWEN_EXPERT_RAM_CACHE_MB", std::to_string(mib).c_str());
+    }
+    else if (a == "--mmproj") {
+        fprintf(stderr, "error: this production runtime supports text input only\n");
+        return ArgResult::Error;
+    }
     else if (a == "--cache-profile" && has_val) o.cache_profile = next();
     else if (a == "--ngram"   && has_val) o.ngram_mode = next();
     else if (a == "--ngram-cache" && has_val) o.ngram_cache_mb = (size_t) std::stoul(next());
@@ -49,6 +68,7 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
             return ArgResult::Error;
         }
     }
+
     else if (a == "--gpus" && has_val) {
         const std::string v = next();
         if (!parse_gpu_list(v, o.gpu_ids)) {
@@ -83,10 +103,7 @@ ArgResult parse_common_arg(int argc, char ** argv, int & i, CommonOptions & o) {
         }
     }
     // ---- offload tuning: aliases for the QWEN_* env vars ----
-    else if (a == "--resident-decode")    set_knob("QWEN_RESIDENT_DECODE", "1");
     else if (a == "--ssd-direct")         set_knob("QWEN_SSD_DIRECT", "1");
-    else if (a == "--resident-refill" && has_val) set_knob("QWEN_RESIDENT_REFILL", next().c_str());
-    else if (a == "--resident-warmup" && has_val) set_knob("QWEN_RESIDENT_WARMUP", next().c_str());
     else if (a == "--prefill-prune"   && has_val) set_knob("QWEN_PREFILL_PRUNE", next().c_str());
     else if (a == "--batch-chunk"     && has_val) set_knob("QWEN_BATCH_CHUNK", next().c_str());
     else if (a == "--expert-alloc"    && has_val) {
@@ -131,18 +148,10 @@ bool validate_common_options(const CommonOptions & o) {
     return true;
 }
 
-void reserve_vision_tower_vram(CommonOptions & o, size_t tower_bytes) {
-    if (o.vram_list.empty()) return;              // auto budget: measured after the tower
-    size_t & primary = o.vram_list[0];
-    if (primary == VRAM_BUDGET_AUTO) return;      // same, for the primary device
-    const size_t vmb = (tower_bytes + 1024 * 1024 - 1) / (1024 * 1024);
-    const size_t cut = std::min(primary, vmb);
-    fprintf(stderr, "vision tower: %zu MB GPU; primary VRAM budget %zu -> %zu MB\n",
-            vmb, primary, primary - cut);
-    primary -= cut;
-}
+
 
 bool apply_common_options(const CommonOptions & o, RuntimeConfig & cfg) {
+    cfg.kv_cache_type = o.kv_cache_type;
     cfg.n_ctx    = o.n_ctx;
     cfg.use_cuda = !o.force_cpu;
     if (!build_gpu_plan(o.gpu_ids, o.gpu_split, o.gpu_split_given, o.vram_list, cfg.gpus))
@@ -166,12 +175,13 @@ void print_common_help(FILE * out) {
         "model and runtime:\n"
         "  -m <file>           model .gguf (required)\n"
         "  --n-ctx <N>         context length (default: the model's trained length)\n"
+        "  --kv-cache-type <f16|q8_0>  attention K/V storage (default f16); Q8 requires CUDA flash attention\n"
         "  --reasoning <on|off>  thinking mode (default on)\n"
         "  --repeat-penalty <f>  repetition penalty over the recent tokens (default 1 = off)\n"
-        "  --mmproj <gguf>     vision tower for image input (default: mmproj-*.gguf next to the model)\n"
         "  --mtp               MTP self-speculative decode (models with a nextn block)\n"
         "  --draft <N>         MTP draft length (default 1)\n"
         "  --embd-q8           use Q8_0 (not F16) for the embedding fallback (saves ~45%% VRAM)\n"
+        "  --expert-ram-cache <GB>  bounded RAM victim cache below local GPU pools (default off)\n"
         "  --cpu               force CPU backend\n"
         "GPU memory:\n"
         "  --vram-budget <GB>  VRAM the model may use (default: what the device has free)\n"
@@ -211,14 +221,10 @@ void print_common_help(FILE * out) {
         "                      goes on the GPU; off skips the module entirely\n"
         "  --ngram-cache <MB>  host cache for --ngram disk (default 256)\n"
         "offload tuning (equivalent to the QWEN_* env vars; flag wins):\n"
-        "  --resident-decode   resident-only routing decode: fused graph, no per-token miss\n"
-        "                      (lossy; auto-warmup + background refill keep quality)\n"
-        "  --resident-refill <N>  refilled experts per token while masked, all layers combined (default 8; 0 = frozen)\n"
         "  --expert-alloc <m>  how decode splits the VRAM expert pool across layers:\n"
         "                      lru | quota (per-layer, from the prompt's routing) |\n"
-        "                      auto = quota with --resident-decode, lru without (default)\n"
+        "                      auto = lru (default)\n"
         "                      (prefill always uses the whole pool as one LRU stream)\n"
-        "  --resident-warmup <N>  decode tokens before the mask locks in (default 32)\n"
         "  --prefill-prune <eps>  skip fetching low-router-mass experts in prefill (lossy; e.g. 0.05)\n"
         "  --batch-chunk <N>   prefill chunk length in tokens (default 4096)\n"
         "  --ssd-direct        unbuffered SSD reads (bypass the OS page cache; with --experts-ssd)\n");

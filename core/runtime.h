@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "expert_telemetry.h"
 
 typedef struct ggml_backend_device * ggml_backend_dev_t;
 
@@ -51,6 +52,7 @@ struct GpuPlan {
 enum class ExpertTier { Ssd, Ram, Auto };
 
 struct RuntimeConfig {
+    std::string kv_cache_type = "f16"; // f16 or q8_0 attention K/V; QSA index remains F32
     int    n_ctx          = 4096;
     int    n_threads      = 0;       // 0 = auto
     bool   use_cuda       = true;    // try a GPU device first, fall back to CPU
@@ -130,6 +132,7 @@ public:
     Runtime(Model & model, const RuntimeConfig & cfg);
     ~Runtime();
 
+
     // Run a forward pass over `tokens` placed at the current position, advancing
     // the KV cache. Returns the logits (size n_vocab) for the LAST token.
     const std::vector<float> & decode(const std::vector<int32_t> & tokens);
@@ -179,7 +182,12 @@ public:
     // offload cache). The server snapshots before/after a request for hit rate.
     struct CacheStats { uint64_t hits = 0, misses = 0; double fetch_ms = 0; uint64_t fetch_bytes = 0; };
     CacheStats cache_stats() const;
+    void save_expert_profile(const std::string & prefix) const;
     bool has_expert_cache() const;
+    bool request_expert_telemetry_layer(int layer);
+    void refresh_expert_telemetry(int layer);
+    ExpertTelemetry expert_telemetry_snapshot(int layer) const;
+    void refresh_expert_debug();
 
     // Progress callback invoked once per prefill chunk (offload path only;
     // resident prefill is a single fast pass): (tokens_done, tokens_total).
@@ -214,6 +222,10 @@ public:
     // bookkeeping. Opaque format: feed load_state exactly the bytes produced
     // by save_state on the same model + n_ctx (validated by a header; throws
     // std::runtime_error on mismatch or truncation).
+    // Complete prompt slots also retain PLE, n-gram history, QSA keys and logits.
+    void save_complete_state(const std::function<void(const void *, size_t)> & sink) const;
+    void load_complete_state(const std::function<void(void *, size_t)> & source);
+
     size_t state_bytes() const;   // size save_state() will produce right now
     void save_state(const std::function<void(const void *, size_t)> & sink) const;
     void load_state(const std::function<void(void *, size_t)> & src);

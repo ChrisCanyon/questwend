@@ -201,14 +201,7 @@ struct TensorInfo {
 
 struct Vocab {
     std::vector<std::string> tokens;
-    std::vector<int32_t>     token_types;
-    std::vector<std::string> merges;
-    std::string              model;          // "gpt2" for Qwen
     int32_t bos_id = -1, eos_id = -1, pad_id = -1;
-    // tokenizer.ggml.add_bos_token: the Qwen models say false, step35 says true.
-    bool                     add_bos = false;
-    std::string              pre;            // tokenizer.ggml.pre ("qwen2", "deepseek-v3", "lfm2", ...)
-    std::string              chat_template;
 };
 
 class Model {
@@ -311,7 +304,6 @@ public:
     // Use Q8_0 instead of F16 for the get_rows embedding fallback (saves ~45% VRAM
     // vs F16, but introduces additional quantization error). Set before load_weights_*.
     void set_embd_q8(bool v) { embd_q8_ = v; }
-
     std::string summary() const;
     std::string debug_dump() const;
 

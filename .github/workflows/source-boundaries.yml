@@ -1,0 +1,11 @@
+name: Source boundaries
+on:
+  pull_request:
+  push:
+    branches: [main, 'consolidation/**', 'experiment/**']
+jobs:
+  source-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_source_truth.py

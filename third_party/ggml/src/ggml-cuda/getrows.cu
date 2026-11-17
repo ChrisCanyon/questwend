@@ -1,6 +1,8 @@
 #include "getrows.cuh"
 #include "dequantize.cuh"
 #include "convert.cuh"
+#include <cstdlib>
+#include <cstring>
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
@@ -101,6 +103,28 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// Scalar F32 rows: one lane copies one independently indexed row. The old
+// generic kernel spends a whole256-thread block on that one scalar value.
+static __global__ void k_get_rows_f32_scalar_rows(
+        const float * src0, const int32_t * src1, float * dst,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t i10 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i10 >= ne10) return;
+    for (int64_t z = blockIdx.z; z < ne11 * static_cast<int64_t>(ne12_fdv.z); z += gridDim.z) {
+        const uint2 dm = fast_div_modulo(static_cast<uint32_t>(z), ne12_fdv);
+        const int i11 = dm.x, i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const float * source = reinterpret_cast<const float *>(
+            reinterpret_cast<const char *>(src0) + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i10*s1 + i11*s2 + i12*s3] = source[0];
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -126,6 +150,34 @@ static __global__ void k_get_rows_float_vec(
         for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
             dst_row[i] = src0_row[i];
         }
+    }
+}
+
+// Exact F32 width128 gather: eight independent rows, one warp per row.
+// Every lane copies one aligned int4; no conversion, reduction or arithmetic
+// on the copied float bits. The dispatcher retains the old can_vec guards.
+static __global__ void k_get_rows_f32_vec_rows8(
+        const float * src0, const int32_t * src1, float * dst,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int lane = threadIdx.x & 31;
+    const int row_in_block = threadIdx.x >> 5;
+    const int64_t i10 = static_cast<int64_t>(blockIdx.x) * 8 + row_in_block;
+    // PDL synchronization above is reached by the entire block, including the
+    // unused whole warps in the last block when ne10 is not divisible by8.
+    if (i10 >= ne10) return;
+    for (int64_t z = blockIdx.z; z < ne11 * static_cast<int64_t>(ne12_fdv.z); z += gridDim.z) {
+        const uint2 dm = fast_div_modulo(static_cast<uint32_t>(z), ne12_fdv);
+        const int i11 = dm.x, i12 = dm.y;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const int4 * GGML_CUDA_RESTRICT source = reinterpret_cast<const int4 *>(
+            reinterpret_cast<const char *>(src0) + i01*nb01 + i11*nb02 + i12*nb03);
+        int4 * GGML_CUDA_RESTRICT destination = reinterpret_cast<int4 *>(dst + i10*s1 + i11*s2 + i12*s3);
+        destination[lane] = source[lane];
     }
 }
 
@@ -254,6 +306,22 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
+    if constexpr (std::is_same<src0_t, float>::value && std::is_same<dst_t, float>::value) {
+        static const bool scalar_rows_enabled = [] {
+            const char * value = std::getenv("QWEN_CUDA_SCALAR_GET_ROWS");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (scalar_rows_enabled && ne00 == 1 && ne10 > 0) {
+            const dim3 scalar_grid((ne10 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE,
+                                   1, MIN(ne11 * ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch{scalar_grid, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_f32_scalar_rows, launch,
+                src0_d, src1_d, dst_d, ne10, ne11, ne12_fdv,
+                s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+            return;
+        }
+    }
+
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
         const int64_t ne00v = ne00 / VEC;
@@ -266,6 +334,23 @@ static void get_rows_cuda_float(
             (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
 
         if (can_vec) {
+            if constexpr (std::is_same<dst_t, float>::value) {
+                static const bool packed_rows_enabled = [] {
+                    const char * value = std::getenv("QWEN_CUDA_VECTOR_GET_ROWS");
+                    return value && std::strcmp(value, "1") == 0;
+                }();
+                // The original can_vec predicate already proves same types,
+                // 16-byte pointers/strides and enough work. Width128 F32 is
+                // exactly32 int4 copies: one warp per independent output row.
+                if (packed_rows_enabled && ne00v == 32 && ne10 >= 8) {
+                    const dim3 packed_grid((ne10 + 7) / 8, 1, MIN(ne11*ne12, UINT16_MAX));
+                    const ggml_cuda_kernel_launch_params packed_launch{packed_grid, block_dims, 0, stream};
+                    ggml_cuda_kernel_launch(k_get_rows_f32_vec_rows8, packed_launch,
+                        src0_d, src1_d, dst_d, ne10, ne11, ne12_fdv,
+                        s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+                    return;
+                }
+            }
             const int block_num_y = vec_block_num_y;
             const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};

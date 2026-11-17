@@ -1,14 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 project(questwend LANGUAGES C CXX)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
-
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
-
+option(BUILD_TESTING "Build native regression tests" OFF)
+option(QW_BUILD_DIAGNOSTICS "Build standalone calibration and GPU probes" OFF)
+option(QW_EXPERT_VISUALIZATION "Compile expert placement/event capture hooks and HTTP routes" OFF)
+set(QW_CHAT_ADAPTER_DIR "" CACHE PATH "Pinned upstream chat adapter directory")
+if(NOT EXISTS "${QW_CHAT_ADAPTER_DIR}/questwend_bridge.h")
+    message(FATAL_ERROR "The production server requires the pinned upstream chat adapter")
+endif()
+if(GGML_RPC)
+    message(FATAL_ERROR "Private RPC is retired from the production core")
+endif()
+set(GGML_RPC OFF CACHE BOOL "" FORCE)
 # ---- options ----
 option(QW_CUDA   "Enable CUDA backend"            OFF)
 option(QW_HIP    "Enable HIP (AMD ROCm) backend"  OFF)
@@ -41,57 +49,37 @@ if(QW_VULKAN)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 endif()
 
-# ---- vendored ggml (self-contained, see third_party/ggml/GGML_VERSION) ----
-add_subdirectory(third_party/ggml)
 
-# ---- core engine library ----
-add_library(questwend_core STATIC
-    core/args.cpp
-    core/gguf_util.cpp
-    core/model.cpp
-    core/tokenizer.cpp
-    core/runtime.cpp
-    core/expert_cache.cpp
-    core/ngram_table.cpp
-    core/sampler.cpp
-    core/chat.cpp
-    core/vision.cpp
-)
-target_include_directories(questwend_core PUBLIC core)
-target_include_directories(questwend_core PRIVATE third_party/stb)
-target_link_libraries(questwend_core PUBLIC ggml)
-
-# ---- CLI ----
-add_executable(qw-cli cli/main.cpp)
-target_link_libraries(qw-cli PRIVATE questwend_core)
-
-# ---- tokenizer cross-check tool (tests/tokenize_main.cpp) ----
-add_executable(qw-tokenize tests/tokenize_main.cpp)
-target_link_libraries(qw-tokenize PRIVATE questwend_core)
-
-# ---- Server (OpenAI-compatible) ----
-add_executable(qw-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
-target_include_directories(qw-server PRIVATE
-    third_party/cpp-httplib
-    third_party/nlohmann
-)
-target_link_libraries(qw-server PRIVATE questwend_core)
+# Optional matching backend SDK permits host-only refactoring validation.
+set(QW_BACKEND_BUILD "" CACHE PATH "Optional matching ggml build SDK")
+if(QW_BACKEND_BUILD)
+    include(cmake/ImportedBackend.cmake)
+else()
+    add_subdirectory(third_party/ggml)
+endif()
 find_package(Threads REQUIRED)
-target_link_libraries(qw-server PRIVATE Threads::Threads)
+add_library(questwend_core STATIC
+    core/args.cpp core/gguf_util.cpp core/model.cpp core/token_pieces.cpp
+    core/runtime.cpp core/expert_cache.cpp core/expert_debug.cpp core/expert_debug_cache.cpp
+    core/cold_cache_prime.cpp core/ngram_table.cpp core/sampler.cpp)
+target_include_directories(questwend_core PUBLIC core)
+target_include_directories(questwend_core PRIVATE third_party/ggml/src)
+target_link_libraries(questwend_core PUBLIC ggml Threads::Threads)
+target_compile_definitions(questwend_core PUBLIC QW_EXPERT_VISUALIZATION=$<BOOL:${QW_EXPERT_VISUALIZATION}>)
+add_executable(qw-server server/main.cpp third_party/cpp-httplib/httplib.cpp)
+target_include_directories(qw-server PRIVATE third_party/cpp-httplib third_party/nlohmann "${QW_CHAT_ADAPTER_DIR}")
+target_link_libraries(qw-server PRIVATE questwend_core Threads::Threads)
 if(WIN32)
     target_link_libraries(qw-server PRIVATE ws2_32)
+    add_custom_command(TARGET qw-server POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_RUNTIME_DLLS:qw-server> $<TARGET_FILE_DIR:qw-server>
+        COMMAND_EXPAND_LISTS)
 endif()
-
-# ---- keep the ggml DLLs next to the executables (Windows) ----
-# ggml builds its DLLs into build/bin/<config> while the executables land in
-# build/<config>, so Windows resolves them from the exe directory instead --
-# a stale copy there silently shadows a freshly built ggml. Copy them after
-# every link so the two can never drift apart.
-if(WIN32)
-    foreach(tgt qw-cli qw-server qw-tokenize)
-        add_custom_command(TARGET ${tgt} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    $<TARGET_RUNTIME_DLLS:${tgt}> $<TARGET_FILE_DIR:${tgt}>
-            COMMAND_EXPAND_LISTS)
-    endforeach()
+include(CTest)
+if(BUILD_TESTING)
+    include(cmake/Tests.cmake)
+endif()
+if(QW_BUILD_DIAGNOSTICS)
+    include(cmake/Diagnostics.cmake)
 endif()

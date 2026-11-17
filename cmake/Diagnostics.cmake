@@ -1,0 +1,10 @@
+# Explicit calibration/profiling tools; none runs during the build.
+foreach(name expert_calibrate expert_costs scalar_get_rows_probe vector_get_rows_probe qsa_pool4_probe)
+    string(REPLACE "_" "-" suffix "${name}")
+    add_executable(qw-${suffix} "tests/${name}.cpp")
+    target_include_directories(qw-${suffix} PRIVATE core tests third_party/nlohmann third_party/ggml/src)
+    target_link_libraries(qw-${suffix} PRIVATE ggml ggml-cpu Threads::Threads)
+    if(WIN32)
+        target_compile_definitions(qw-${suffix} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    endif()
+endforeach()

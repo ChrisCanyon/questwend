@@ -1,4 +1,31 @@
 #include "pool2d.cuh"
+#include <cstdlib>
+#include <cstring>
+
+// Only the explicitly tagged QSA node uses this path. Generic AVG is kept
+// unchanged: it scales each input before summation and is not bit-equivalent.
+static __global__ void qsa_pool4_left_scale_f32(
+        const float * src, float * dst, const int64_t outputs,
+        const float scale, const float bias) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    const int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    constexpr int width = 128; // Guarded fixed shape; division lowers to shifts.
+    for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < outputs; index += step) {
+        const int64_t block = index / width;
+        const int column = static_cast<int>(index % width);
+        const int64_t base = block * (4 * width) + column;
+        // Separate rounded additions reproduce three GGML ADD outputs.
+        const float sum01 = __fadd_rn(src[base], src[base + width]);
+        const float sum012 = __fadd_rn(sum01, src[base + 2 * width]);
+        const float sum = __fadd_rn(sum012, src[base + 3 * width]);
+        // Same expression and runtime arguments as scale_f32<float>.
+        // Do not turn this into sum*.25 alone: bias/FMA/FTZ affect edge bits.
+        dst[index] = scale * sum + bias;
+    }
+}
+
 
 template <typename Ti, typename To>
 static  __global__ void pool2d_nchw_kernel(
@@ -145,6 +172,32 @@ void ggml_cuda_op_pool2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int s1 = opts[4];
     const int p0 = opts[5];
     const int p1 = opts[6];
+
+    constexpr char exact_prefix[] = "qsa_pool4_exact_";
+    const bool exact_node = std::strncmp(dst->name, exact_prefix, sizeof(exact_prefix) - 1) == 0;
+    if (exact_node) {
+        static const bool enabled = [] {
+            const char * value = std::getenv("GGML_CUDA_QSA_POOL4_EXACT");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        // An exact-tagged node must never silently fall back to generic AVG.
+        GGML_ASSERT(enabled && "Exact QSA pool requires the matched opt-in CUDA backend");
+        GGML_ASSERT(op == GGML_OP_POOL_AVG && k0 == 1 && k1 == 4 &&
+            s0 == 1 && s1 == 4 && p0 == 0 && p1 == 0);
+        GGML_ASSERT(src0->ne[0] == 128 && src0->ne[1] >= 4 && src0->ne[1] % 4 == 0 &&
+            src0->ne[2] == 1 && src0->ne[3] == 1 &&
+            dst->ne[0] == 128 && dst->ne[1] == src0->ne[1] / 4 &&
+            dst->ne[2] == 1 && dst->ne[3] == 1 &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        const int64_t outputs = ggml_nelements(dst);
+        const int64_t blocks = (outputs + CUDA_POOL2D_BLOCK_SIZE - 1) / CUDA_POOL2D_BLOCK_SIZE;
+        GGML_ASSERT(blocks > 0 && blocks <= 0x7fffffff);
+        const ggml_cuda_kernel_launch_params launch = {
+            dim3(static_cast<unsigned>(blocks)), dim3(CUDA_POOL2D_BLOCK_SIZE), 0, stream};
+        ggml_cuda_kernel_launch(qsa_pool4_left_scale_f32, launch,
+            src0_d, dst_d, outputs, 0.25f, 0.0f);
+        return;
+    }
 
     const int64_t IH = src0->ne[1];
     const int64_t IW = src0->ne[0];
